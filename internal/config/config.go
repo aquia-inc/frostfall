@@ -149,15 +149,43 @@ type Test struct {
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
 // field is set.
 type Step struct {
-	Click   string            `yaml:"click"`
-	Fill    map[string]string `yaml:"fill"`
-	Press   string            `yaml:"press"`
-	Hover   string            `yaml:"hover"`
-	Select  map[string]string `yaml:"select"`
-	WaitFor string            `yaml:"waitFor"`
-	Wait    Duration          `yaml:"wait"`
-	Scan    *ScanStep         `yaml:"scan"`
-	Goto    string            `yaml:"goto"`
+	Click   string    `yaml:"click"`
+	Fill    Fields    `yaml:"fill"`
+	Press   string    `yaml:"press"`
+	Hover   string    `yaml:"hover"`
+	Select  Fields    `yaml:"select"`
+	WaitFor string    `yaml:"waitFor"`
+	Wait    Duration  `yaml:"wait"`
+	Scan    *ScanStep `yaml:"scan"`
+	Goto    string    `yaml:"goto"`
+}
+
+// Field is one selector/value pair of a fill or select step.
+type Field struct {
+	Selector string
+	Value    string
+}
+
+// Fields preserves the config's document order. The YAML syntax is an
+// ordinary mapping; decoding into a Go map would randomize execution order,
+// making dependent fields (a select that repopulates another) flaky.
+type Fields []Field
+
+func (f *Fields) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: expected a mapping of selector: value", node.Line)
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		var sel, val string
+		if err := node.Content[i].Decode(&sel); err != nil {
+			return err
+		}
+		if err := node.Content[i+1].Decode(&val); err != nil {
+			return err
+		}
+		*f = append(*f, Field{Selector: sel, Value: val})
+	}
+	return nil
 }
 
 // ScanStep supports both bare `- scan` / `scan: {}` and the full form.
