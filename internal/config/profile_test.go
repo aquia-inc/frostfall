@@ -150,6 +150,25 @@ tests:
 	}
 }
 
+func TestFillRejectsMergeKeys(t *testing.T) {
+	_, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+shared: &shared
+  "#a": one
+tests:
+  - id: form
+    path: /
+    steps:
+      - fill:
+          <<: *shared
+          "#b": two
+`), "")
+	if err == nil || !strings.Contains(err.Error(), "merge keys") {
+		t.Errorf("merge key should be rejected with a message naming it, got: %v", err)
+	}
+}
+
 func TestProfileCannotCarryTests(t *testing.T) {
 	bad := strings.Replace(profileConfig, "    server:\n      serve: ./dist",
 		"    tests:\n      - id: sneaky\n        path: /x", 1)

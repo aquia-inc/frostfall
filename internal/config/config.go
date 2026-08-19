@@ -176,6 +176,13 @@ func (f *Fields) UnmarshalYAML(node *yaml.Node) error {
 		return fmt.Errorf("line %d: expected a mapping of selector: value", node.Line)
 	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
+		// Merge keys are rejected deliberately: merge-in-place and ordered
+		// execution conflict (does a merged duplicate re-run or replace?),
+		// and letting one through would either produce a confusing decode
+		// error or a literal "<<" CSS selector at runtime.
+		if key := node.Content[i]; key.Tag == "!!merge" || key.Value == "<<" {
+			return fmt.Errorf("line %d: merge keys (<<) are not supported in fill/select; list the fields explicitly", key.Line)
+		}
 		var sel, val string
 		if err := node.Content[i].Decode(&sel); err != nil {
 			return err
