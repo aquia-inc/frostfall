@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.0.2](https://github.com/aquia-inc/frostfall/compare/v1.0.1...v1.0.2) (2026-08-19)
+
+### Bug Fixes
+
+* execute fill and select fields in document order ([#32](https://github.com/aquia-inc/frostfall/issues/32)) ([90c4509](https://github.com/aquia-inc/frostfall/commit/90c4509b16d6d1416dad17d2c7e086f8f7dcbcd6)), closes [#3](https://github.com/aquia-inc/frostfall/issues/3)
+
 ## [1.0.1](https://github.com/aquia-inc/frostfall/compare/v1.0.0...v1.0.1) (2026-08-19)
 
 ### Bug Fixes
