@@ -70,13 +70,15 @@ func TestSARIFOutput(t *testing.T) {
 				RuleID              string            `json:"ruleId"`
 				RuleIndex           int               `json:"ruleIndex"`
 				Level               string            `json:"level"`
-				BaselineState       string            `json:"baselineState"`
 				PartialFingerprints map[string]string `json:"partialFingerprints"`
 				Locations           []struct {
 					PhysicalLocation struct {
 						ArtifactLocation struct {
 							URI string `json:"uri"`
 						} `json:"artifactLocation"`
+						Region struct {
+							StartLine int `json:"startLine"`
+						} `json:"region"`
 					} `json:"physicalLocation"`
 				} `json:"locations"`
 			} `json:"results"`
@@ -94,8 +96,10 @@ func TestSARIFOutput(t *testing.T) {
 	if len(r.Tool.Driver.Rules) != 2 {
 		t.Errorf("want 2 deduped rules, got %d", len(r.Tool.Driver.Rules))
 	}
-	if len(r.Results) != 3 {
-		t.Fatalf("want 3 results, got %d", len(r.Results))
+	// Baselined results are omitted: GitHub ignores baselineState, so known
+	// debt must not open alerts, and its absence closes existing ones.
+	if len(r.Results) != 2 {
+		t.Fatalf("want 2 results (baselined omitted), got %d", len(r.Results))
 	}
 	// ruleIndex must point at the right rule.
 	for _, res := range r.Results {
@@ -103,18 +107,23 @@ func TestSARIFOutput(t *testing.T) {
 			t.Errorf("ruleIndex mismatch for %s", res.RuleID)
 		}
 	}
-	if r.Results[0].BaselineState != "new" || r.Results[1].BaselineState != "unchanged" {
-		t.Errorf("baselineState wrong: %s / %s", r.Results[0].BaselineState, r.Results[1].BaselineState)
+	// Flagged minor is promoted to error.
+	if r.Results[0].Level != "error" || r.Results[1].Level != "error" {
+		t.Errorf("levels wrong: critical=%s, flagged minor=%s", r.Results[0].Level, r.Results[1].Level)
 	}
-	// Baselined critical stays error-level; flagged minor is promoted to error.
-	if r.Results[1].Level != "error" || r.Results[2].Level != "error" {
-		t.Errorf("levels wrong: baselined critical=%s, flagged minor=%s", r.Results[1].Level, r.Results[2].Level)
+	// primaryLocationLineHash is the only key GitHub uses for alert identity;
+	// it must carry the frostfall fingerprint.
+	if r.Results[0].PartialFingerprints["primaryLocationLineHash"] != "aaaa" {
+		t.Errorf("primaryLocationLineHash missing/wrong: %v", r.Results[0].PartialFingerprints)
 	}
-	if r.Results[0].PartialFingerprints["frostfallFingerprint/v1"] != "aaaa" {
-		t.Errorf("fingerprint missing from partialFingerprints")
+	// Locations are stable synthetic relative paths with a region - absolute
+	// http URIs are rejected at upload, and startLine is required to render.
+	loc := r.Results[0].Locations[0].PhysicalLocation
+	if loc.ArtifactLocation.URI != "frostfall/home" {
+		t.Errorf("location uri = %s", loc.ArtifactLocation.URI)
 	}
-	if got := r.Results[1].Locations[0].PhysicalLocation.ArtifactLocation.URI; got != "http://localhost:5173/#/about" {
-		t.Errorf("location uri = %s", got)
+	if loc.Region.StartLine != 1 {
+		t.Errorf("region.startLine = %d", loc.Region.StartLine)
 	}
 }
 

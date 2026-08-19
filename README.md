@@ -441,10 +441,14 @@ For code scanning alerts, run a second step with `format: sarif` and upload:
     sarif_file: frostfall.sarif
 ```
 
-Violations land in the Security tab as alerts, deduplicated across uploads by
-the violation fingerprint; baselined violations upload as `unchanged` so known
-debt never opens new alerts. In report mode the check stays green; add an
-`expect` block (or a `ci` profile) when you want red builds.
+Violations land in the **Security tab** as code scanning alerts (scanning
+rendered pages, there is no source line to annotate, so no inline PR
+annotations - the alert carries the page URL and selector). Alert identity is
+the violation fingerprint, so alerts stay stable across runs instead of
+churning. Baselined violations are omitted from the upload: known debt opens
+no alerts, and baselining an existing violation closes its alert on the next
+upload. In report mode the check stays green; add an `expect` block (or a
+`ci` profile) when you want red builds.
 
 Pin `@v1`. The action version is the tool version - there is no separate
 version input to drift. `@v1` resolves to the newest release under that major

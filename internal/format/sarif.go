@@ -9,10 +9,24 @@ import (
 )
 
 // SARIF 2.1.0 output for GitHub code scanning: one reportingDescriptor per
-// axe rule, results located by page URL with the DOM selector as the logical
-// location, the frostfall fingerprint as a partial fingerprint (stable alert
-// identity across uploads), and baselined violations marked "unchanged" so
-// known debt never opens new alerts.
+// axe rule, results located at stable synthetic repo-relative paths
+// (frostfall/<testId>) with the DOM selector as the logical location and the
+// page URL in the message.
+//
+// The location choices are load-bearing for GitHub ingestion:
+//   - Absolute http(s) URIs are REJECTED at upload (scheme mismatch with the
+//     file:// source root codeql-action always sends), and host:port paths
+//     would churn on ephemeral --serve ports. Synthetic relative paths are
+//     accepted; alerts appear in the Security tab (no inline PR annotations -
+//     the honest ceiling for scanning rendered pages rather than source).
+//   - region.startLine is required for an alert to render.
+//   - primaryLocationLineHash is the only fingerprint key GitHub uses for
+//     alert identity, and codeql-action cannot synthesize it for paths not on
+//     disk - so it carries the frostfall fingerprint, making alert identity
+//     exactly the violation's baseline identity.
+//   - baselineState is ignored by GitHub, so baselined violations are OMITTED
+//     instead: known debt opens no alerts, and baselining an existing
+//     violation closes its alert on the next upload (absent = fixed).
 
 type sarifLog struct {
 	Schema  string     `json:"$schema"`
@@ -54,7 +68,6 @@ type sarifResult struct {
 	Message             sarifMessage      `json:"message"`
 	Locations           []sarifLocation   `json:"locations"`
 	PartialFingerprints map[string]string `json:"partialFingerprints,omitempty"`
-	BaselineState       string            `json:"baselineState,omitempty"`
 	Properties          map[string]any    `json:"properties,omitempty"`
 }
 
@@ -65,6 +78,11 @@ type sarifLocation struct {
 
 type sarifPhysical struct {
 	ArtifactLocation sarifArtifact `json:"artifactLocation"`
+	Region           sarifRegion   `json:"region"`
+}
+
+type sarifRegion struct {
+	StartLine int `json:"startLine"`
 }
 
 type sarifArtifact struct {
@@ -98,6 +116,9 @@ func SARIF(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Resul
 	results := make([]sarifResult, 0, len(run.Results))
 
 	for _, res := range run.Results {
+		if res.Baselined {
+			continue
+		}
 		idx, seen := ruleIndex[res.RuleID]
 		if !seen {
 			idx = len(rules)
@@ -109,32 +130,30 @@ func SARIF(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Resul
 			})
 		}
 
-		baselineState := "new"
-		if res.Baselined {
-			baselineState = "unchanged"
-		}
-		uri := res.PageURL
-		if uri == "" {
-			uri = res.TestID
-		}
 		results = append(results, sarifResult{
 			RuleID:    res.RuleID,
 			RuleIndex: idx,
 			Level:     sarifLevel(res.Impact, flagged(res)),
 			Message: sarifMessage{
-				Text: res.Summary + " (test " + res.TestID + ", scan " + res.ScanLabel + ", at " + res.StableTarget + ")",
+				Text: res.Summary + " (page " + res.PageURL + ", test " + res.TestID + ", scan " + res.ScanLabel + ", at " + res.StableTarget + ")",
 			},
 			Locations: []sarifLocation{{
-				PhysicalLocation: sarifPhysical{ArtifactLocation: sarifArtifact{URI: uri}},
+				PhysicalLocation: sarifPhysical{
+					ArtifactLocation: sarifArtifact{URI: "frostfall/" + res.TestID},
+					Region:           sarifRegion{StartLine: 1},
+				},
 				LogicalLocations: []sarifLogical{{
 					FullyQualifiedName: res.StableTarget,
 					Kind:               "element",
 				}},
 			}},
-			PartialFingerprints: map[string]string{"frostfallFingerprint/v1": res.Fingerprint},
-			BaselineState:       baselineState,
+			PartialFingerprints: map[string]string{
+				"primaryLocationLineHash": res.Fingerprint,
+				"frostfallFingerprint/v1": res.Fingerprint,
+			},
 			Properties: map[string]any{
 				"impact":    res.Impact.String(),
+				"pageUrl":   res.PageURL,
 				"testId":    res.TestID,
 				"scanLabel": res.ScanLabel,
 			},
