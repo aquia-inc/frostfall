@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.1.0](https://github.com/aquia-inc/frostfall/compare/v1.0.3...v1.1.0) (2026-08-19)
+
+### Features
+
+* SARIF 2.1.0 output for GitHub code scanning ([#34](https://github.com/aquia-inc/frostfall/issues/34)) ([88b1677](https://github.com/aquia-inc/frostfall/commit/88b1677e88f7afae04fd7da22b9ce57b796e8b4c)), closes [#14](https://github.com/aquia-inc/frostfall/issues/14)
+
 ## [1.0.3](https://github.com/aquia-inc/frostfall/compare/v1.0.2...v1.0.3) (2026-08-19)
 
 ### Bug Fixes
