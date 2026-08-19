@@ -114,10 +114,7 @@ func (e *Engine) Audit(ctx context.Context, page engine.Page, opts engine.ScanOp
 
 	var out []engine.Violation
 	for _, v := range res.Violations {
-		impact, ok := engine.ParseImpact(v.Impact)
-		if !ok {
-			impact = engine.Moderate
-		}
+		impact := impactOrDefault(v.Impact)
 		for _, n := range v.Nodes {
 			out = append(out, engine.Violation{
 				RuleID:  v.ID,
@@ -130,6 +127,17 @@ func (e *Engine) Audit(ctx context.Context, page engine.Page, opts engine.ScanOp
 		}
 	}
 	return out, nil
+}
+
+// impactOrDefault maps an axe impact string to the normalized scale. An
+// unknown or null impact defaults to Serious, never below the default
+// enforcement floor: if the parser and axe ever disagree, violations must
+// fail loud rather than silently slip under the gate.
+func impactOrDefault(s string) engine.Impact {
+	if impact, ok := engine.ParseImpact(s); ok {
+		return impact
+	}
+	return engine.Serious
 }
 
 // flattenTarget joins axe's target array (selectors, possibly nested for
