@@ -42,17 +42,6 @@ type Run struct {
 	Scanned map[string]bool
 }
 
-// NewViolations counts non-baselined results at or above the severity floor.
-func (r *Run) NewViolations(minImpact engine.Impact) int {
-	n := 0
-	for _, res := range r.Results {
-		if !res.Baselined && res.Impact >= minImpact {
-			n++
-		}
-	}
-	return n
-}
-
 // Failing reports whether a single result breaks the expect contract, judged
 // against its test's effective expect: a per-test override that enforces
 // anything replaces the default wholesale; otherwise the default applies. A

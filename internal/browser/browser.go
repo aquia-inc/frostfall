@@ -157,16 +157,23 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 				return fmt.Errorf("select %q: %w", sel, err)
 			}
 			// Match the option's value attribute first (what a config most
-			// plausibly specifies), falling back to the visible label. Probe
-			// via JS so a value miss doesn't burn the wait timeout.
-			hasValue, err := el.Eval(`(v) => [...this.options].some(o => o.value === v)`, val)
+			// plausibly specifies), falling back to the visible label. The
+			// probe checks getAttribute, not the value property: the property
+			// falls back to the option's text when the attribute is absent,
+			// which would make the probe and the CSS [value=...] selector
+			// disagree on <option>Alaska</option>. Probe via JS so a miss
+			// doesn't burn the wait timeout, and fall back to label matching
+			// if the CSS select still finds nothing.
+			hasValue, err := el.Eval(`(v) => [...this.options].some(o => o.getAttribute('value') === v)`, val)
 			if err == nil && hasValue.Value.Bool() {
 				err = el.Select([]string{fmt.Sprintf(`[value=%q]`, val)}, true, rod.SelectorTypeCSSSector)
 			} else {
-				err = el.Select([]string{val}, true, rod.SelectorTypeText)
+				err = fmt.Errorf("no value match")
 			}
 			if err != nil {
-				return fmt.Errorf("select %q: %w", sel, err)
+				if err = el.Select([]string{val}, true, rod.SelectorTypeText); err != nil {
+					return fmt.Errorf("select %q: %w", sel, err)
+				}
 			}
 		}
 		return nil

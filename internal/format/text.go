@@ -45,7 +45,7 @@ func badge(i engine.Impact) string {
 // same predicate the exit code uses (severity floor plus enforced rules), so
 // the summary count and the exit code can never disagree; enforcing tells
 // the summary whether flagged violations fail the build or are report-only.
-func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, enforcing bool) {
+func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, label string, enforcing bool) {
 	type key struct{ test, scan string }
 	groups := map[key][]runner.Result{}
 	var order []key
@@ -96,10 +96,6 @@ func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, enforc
 		}
 	}
 
-	label := "flagged (serious or worse)"
-	if enforcing {
-		label = "breaking the expect contract"
-	}
 	fmt.Fprintf(w, "\n%s\n", styleTotals.Render(fmt.Sprintf(
 		"%d tests, %d new violation(s) %s, %d baselined",
 		run.TestsRun, newTotal, label, baselinedTotal)))

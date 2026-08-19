@@ -136,15 +136,24 @@ func run(args []string) int {
 	}
 	// Same default on the read path as --update-baseline uses on the write
 	// path: a config without baseline: must still read back the file that a
-	// bare --update-baseline run wrote, or the baseline silently never applies.
+	// bare --update-baseline run wrote, or the baseline silently never
+	// applies. The default pickup is announced (a stale file must not
+	// suppress violations invisibly), and --baseline none opts out.
+	defaulted := false
 	if bp == "" {
-		bp = ".frostfall-baseline.json"
+		bp, defaulted = ".frostfall-baseline.json", true
+	}
+	if bp == "none" {
+		bp = ""
 	}
 	var bl *baseline.File
 	if bp != "" {
 		if bl, err = baseline.Load(bp); err != nil {
 			fmt.Fprintln(os.Stderr, "baseline error:", err)
 			return exitBadConfig
+		}
+		if defaulted && len(bl.Violations) > 0 {
+			fmt.Fprintf(os.Stderr, "using baseline %s (default path; pass --baseline none to ignore it)\n", bp)
 		}
 	}
 
@@ -217,19 +226,28 @@ func run(args []string) int {
 			enforcing = enforcing || t.Expect.Enforcing()
 		}
 	}
-	// The report marks serious+ violations even in report-only mode; an
-	// explicit expect contract moves the marker. Exit code and every report
-	// share this one predicate so they can never disagree.
-	minImpact := engine.Serious
-	if m, ok := engine.ParseImpact(exp.Severity); ok {
-		minImpact = m
-	}
+	// The report marks serious+ violations even when the default expect is
+	// report-only; an explicit default contract replaces that floor. Keyed on
+	// the DEFAULT expect (not per-test enforcement) so tests without an
+	// override keep their informational serious+ markers.
 	reportDef := exp
-	if !enforcing {
-		reportDef = config.Expect{Severity: minImpact.String()}
+	if !exp.Enforcing() {
+		reportDef = config.Expect{Severity: engine.Serious.String()}
 	}
 	flagged := func(v runner.Result) bool { return runner.Failing(v, reportDef, perTest) }
-	format.Text(os.Stdout, res, flagged, enforcing)
+
+	// The summary label only claims contract breakage when the flagged set is
+	// exactly the contract set (the default expect enforces). With per-test
+	// contracts layered on a report-only default, the count includes
+	// informational serious+ rows, so the label must not overclaim.
+	label := "flagged (serious or worse)"
+	if exp.Enforcing() {
+		label = "breaking the expect contract"
+		if exp.MaxViolations != nil && *exp.MaxViolations > 0 {
+			label += fmt.Sprintf(" (up to %d tolerated)", *exp.MaxViolations)
+		}
+	}
+	format.Text(os.Stdout, res, flagged, label, enforcing)
 
 	switch *formatName {
 	case "text": // already written above
@@ -248,8 +266,7 @@ func run(args []string) int {
 				Profile:     activeProfileName(profileReq, cfg),
 				ToolVersion: version,
 				AxeVersion:  eng.Version(),
-				Enforcing:   enforcing,
-				MinImpact:   minImpact,
+				Mode:        modeLabel(exp, enforcing),
 			}, flagged)
 			f.Close()
 		}
@@ -361,6 +378,25 @@ func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) 
 		fmt.Println("gh-issues:", a)
 	}
 	return err
+}
+
+// modeLabel describes the enforcement posture for report headers, derived
+// from the same inputs as the flagged predicate so it cannot mislabel a
+// rules-only or per-test contract as a severity floor.
+func modeLabel(def config.Expect, enforcing bool) string {
+	if !enforcing {
+		return "report only"
+	}
+	switch {
+	case def.Severity != "" && len(def.Rules) > 0:
+		return fmt.Sprintf("enforcing (%s+ and %d rule(s))", def.Severity, len(def.Rules))
+	case def.Severity != "":
+		return "enforcing (" + def.Severity + "+)"
+	case len(def.Rules) > 0:
+		return "enforcing (rules)"
+	default:
+		return "enforcing (per-test contracts)"
+	}
 }
 
 // activeProfileName resolves what profile actually applied, for report
