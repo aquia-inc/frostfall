@@ -134,6 +134,12 @@ func run(args []string) int {
 	if *baselinePath != "" {
 		bp = *baselinePath
 	}
+	// Same default on the read path as --update-baseline uses on the write
+	// path: a config without baseline: must still read back the file that a
+	// bare --update-baseline run wrote, or the baseline silently never applies.
+	if bp == "" {
+		bp = ".frostfall-baseline.json"
+	}
 	var bl *baseline.File
 	if bp != "" {
 		if bl, err = baseline.Load(bp); err != nil {
@@ -203,13 +209,27 @@ func run(args []string) int {
 	}
 
 	exp := cfg.Defaults.Expect
+	perTest := map[string]config.Expect{}
+	enforcing := exp.Enforcing()
+	for _, t := range tests {
+		if t.Expect != nil {
+			perTest[t.ID] = *t.Expect
+			enforcing = enforcing || t.Expect.Enforcing()
+		}
+	}
 	// The report marks serious+ violations even in report-only mode; an
-	// explicit severity floor moves the marker.
+	// explicit expect contract moves the marker. Exit code and every report
+	// share this one predicate so they can never disagree.
 	minImpact := engine.Serious
 	if m, ok := engine.ParseImpact(exp.Severity); ok {
 		minImpact = m
 	}
-	format.Text(os.Stdout, res, minImpact, exp.Enforcing())
+	reportDef := exp
+	if !enforcing {
+		reportDef = config.Expect{Severity: minImpact.String()}
+	}
+	flagged := func(v runner.Result) bool { return runner.Failing(v, reportDef, perTest) }
+	format.Text(os.Stdout, res, flagged, enforcing)
 
 	switch *formatName {
 	case "text": // already written above
@@ -228,9 +248,9 @@ func run(args []string) int {
 				Profile:     activeProfileName(profileReq, cfg),
 				ToolVersion: version,
 				AxeVersion:  eng.Version(),
-				Enforcing:   exp.Enforcing(),
+				Enforcing:   enforcing,
 				MinImpact:   minImpact,
-			})
+			}, flagged)
 			f.Close()
 		}
 		if ferr != nil {
@@ -243,19 +263,10 @@ func run(args []string) int {
 		return exitBadConfig
 	}
 
-	perTest := map[string]config.Expect{}
-	enforcing := exp.Enforcing()
-	for _, t := range tests {
-		if t.Expect != nil {
-			perTest[t.ID] = *t.Expect
-			enforcing = enforcing || t.Expect.Enforcing()
-		}
-	}
-
-	writeGitHubOutputs(res, minImpact, *formatName, *outputPath)
+	writeGitHubOutputs(res, flagged, *formatName, *outputPath)
 
 	if *ghIssues || *ghIssuesDry {
-		if err := syncIssues(res, minImpact, exp, *ghIssuesDry); err != nil {
+		if err := syncIssues(res, flagged, *ghIssuesDry); err != nil {
 			// Issue filing must never break the scan; report and move on.
 			fmt.Fprintln(os.Stderr, "gh-issues warning:", err)
 		}
@@ -275,7 +286,7 @@ func run(args []string) int {
 
 // writeGitHubOutputs exposes run counts as job outputs when running in
 // Actions, so downstream steps can gate without parsing the report.
-func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, outputPath string) {
+func writeGitHubOutputs(res *runner.Run, flagged func(runner.Result) bool, formatName, outputPath string) {
 	path := os.Getenv("GITHUB_OUTPUT")
 	if path == "" {
 		return
@@ -285,13 +296,15 @@ func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, ou
 		return
 	}
 	defer f.Close()
-	baselined := 0
+	baselined, flaggedCount := 0, 0
 	for _, r := range res.Results {
 		if r.Baselined {
 			baselined++
+		} else if flagged(r) {
+			flaggedCount++
 		}
 	}
-	fmt.Fprintf(f, "new-violations=%d\n", res.NewViolations(minImpact))
+	fmt.Fprintf(f, "new-violations=%d\n", flaggedCount)
 	fmt.Fprintf(f, "baselined-violations=%d\n", baselined)
 	fmt.Fprintf(f, "stale-baseline-entries=%d\n", len(res.Stale))
 	fmt.Fprintf(f, "tests-run=%d\n", res.TestsRun)
@@ -303,19 +316,15 @@ func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, ou
 	}
 }
 
-// syncIssues reconciles GitHub issues against this run's failing violations:
-// the same set that would fail an enforcing build (severity floor plus
-// enforced rules; the default serious floor in report-only mode). Close
-// scoping uses the tests that actually executed a scan — a configured test
-// whose scan never ran must not close its issues as "fixed".
-func syncIssues(res *runner.Run, minImpact engine.Impact, exp config.Expect, dryRun bool) error {
-	enforcedRules := map[string]bool{}
-	for _, id := range exp.Rules {
-		enforcedRules[id] = true
-	}
+// syncIssues reconciles GitHub issues against this run's failing violations —
+// the shared enforcement predicate, so filed issues always match what the
+// exit code and reports flag. Close scoping uses the tests that actually
+// executed a scan — a configured test whose scan never ran must not close its
+// issues as "fixed".
+func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) error {
 	var failing []runner.Result
 	for _, r := range res.Results {
-		if !r.Baselined && (r.Impact >= minImpact || enforcedRules[r.RuleID]) {
+		if flagged(r) {
 			failing = append(failing, r)
 		}
 	}

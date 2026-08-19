@@ -53,27 +53,32 @@ func (r *Run) NewViolations(minImpact engine.Impact) int {
 	return n
 }
 
+// Failing reports whether a single result breaks the expect contract, judged
+// against its test's effective expect: a per-test override that enforces
+// anything replaces the default wholesale; otherwise the default applies. A
+// violation fails when it is at or above the severity floor, or matches an
+// enforced rule id at any impact. This is THE enforcement predicate — the
+// exit code and every report must share it so a run can never exit 1 while
+// its summary reads clean.
+func Failing(res Result, def config.Expect, perTest map[string]config.Expect) bool {
+	if res.Baselined {
+		return false
+	}
+	exp := def
+	if o, ok := perTest[res.TestID]; ok && o.Enforcing() {
+		exp = o
+	}
+	if minImpact, hasFloor := engine.ParseImpact(exp.Severity); hasFloor && res.Impact >= minImpact {
+		return true
+	}
+	return slices.Contains(exp.Rules, res.RuleID)
+}
+
 // EnforcedFailures counts new violations that break the expect contract.
-// Each result is judged against its test's effective expect: a per-test
-// override that enforces anything replaces the default wholesale; otherwise
-// the default applies. A violation fails when it is at or above the severity
-// floor, or matches an enforced rule id at any impact.
 func (r *Run) EnforcedFailures(def config.Expect, perTest map[string]config.Expect) int {
 	n := 0
 	for _, res := range r.Results {
-		if res.Baselined {
-			continue
-		}
-		exp := def
-		if o, ok := perTest[res.TestID]; ok && o.Enforcing() {
-			exp = o
-		}
-		minImpact, hasFloor := engine.ParseImpact(exp.Severity)
-		if hasFloor && res.Impact >= minImpact {
-			n++
-			continue
-		}
-		if slices.Contains(exp.Rules, res.RuleID) {
+		if Failing(res, def, perTest) {
 			n++
 		}
 	}

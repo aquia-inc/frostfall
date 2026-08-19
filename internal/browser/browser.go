@@ -139,7 +139,11 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		}
 		return nil
 	case st.Press != "":
-		return s.page.Keyboard.Press(keyFor(st.Press))
+		key, err := keyFor(st.Press)
+		if err != nil {
+			return err
+		}
+		return s.page.Keyboard.Press(key)
 	case st.Hover != "":
 		el, err := s.page.Element(st.Hover)
 		if err != nil {
@@ -152,7 +156,16 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 			if err != nil {
 				return fmt.Errorf("select %q: %w", sel, err)
 			}
-			if err := el.Select([]string{val}, true, rod.SelectorTypeText); err != nil {
+			// Match the option's value attribute first (what a config most
+			// plausibly specifies), falling back to the visible label. Probe
+			// via JS so a value miss doesn't burn the wait timeout.
+			hasValue, err := el.Eval(`(v) => [...this.options].some(o => o.value === v)`, val)
+			if err == nil && hasValue.Value.Bool() {
+				err = el.Select([]string{fmt.Sprintf(`[value=%q]`, val)}, true, rod.SelectorTypeCSSSector)
+			} else {
+				err = el.Select([]string{val}, true, rod.SelectorTypeText)
+			}
+			if err != nil {
 				return fmt.Errorf("select %q: %w", sel, err)
 			}
 		}

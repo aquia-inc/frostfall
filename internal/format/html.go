@@ -58,8 +58,9 @@ type htmlReport struct {
 
 // HTML writes a self-contained single-file report: one triage table, styling
 // inline, screenshots embedded as data URIs — made to be attached to a ticket
-// or handed to a reviewer with nothing else.
-func HTML(w io.Writer, run *runner.Run, meta RunMeta) error {
+// or handed to a reviewer with nothing else. flagged is the same enforcement
+// predicate the exit code uses.
+func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result) bool) error {
 	rep := htmlReport{
 		Meta:       meta,
 		DateHuman:  meta.Date.Format("January 2, 2006 15:04 MST"),
@@ -89,7 +90,7 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta) error {
 			Target:    res.StableTarget,
 			HelpURL:   res.HelpURL,
 			Baselined: res.Baselined,
-			Failing:   !res.Baselined && res.Impact >= meta.MinImpact,
+			Failing:   flagged(res),
 		}
 		if res.Baselined {
 			rep.Baselined++
