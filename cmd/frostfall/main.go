@@ -65,7 +65,7 @@ func run(args []string) int {
 		ghIssues       = fs.Bool("gh-issues", false, "file/maintain GitHub issues for failing violations (needs GITHUB_TOKEN and GITHUB_REPOSITORY)")
 		ghIssuesDry    = fs.Bool("gh-issues-dry-run", false, "print the issue actions a --gh-issues run would take, without calling GitHub")
 	)
-	formatName := fs.String("format", "text", "output format: text|html (json, sarif, junit planned)")
+	formatName := fs.String("format", "text", "output format: text|html|sarif (json, junit planned)")
 	outputPath := fs.String("output", "", "write the formatted report here (default for html: frostfall-report.html)")
 	fs.Bool("watch", false, "rescan on change, print only new violations")
 	discoverFlag := fs.Bool("discover", false, "crawl same-origin paths from the root and scan discovered pages")
@@ -79,8 +79,8 @@ func run(args []string) int {
 	// Fail fast on flag mistakes: a bad --format must not burn a full scan
 	// before erroring, and a filtered --update-baseline would silently wipe
 	// baseline entries for every test the filter excluded.
-	if *formatName != "text" && *formatName != "html" {
-		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html)\n", *formatName)
+	if *formatName != "text" && *formatName != "html" && *formatName != "sarif" {
+		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html, sarif)\n", *formatName)
 		return exitBadConfig
 	}
 	if fs.Lookup("watch").Value.String() == "true" {
@@ -251,6 +251,26 @@ func run(args []string) int {
 
 	switch *formatName {
 	case "text": // already written above
+	case "sarif":
+		out := *outputPath
+		if out == "" {
+			out = "frostfall.sarif"
+		}
+		f, ferr := os.Create(out)
+		if ferr == nil {
+			ferr = format.SARIF(f, res, format.RunMeta{
+				ToolVersion: version,
+				AxeVersion:  eng.Version(),
+				Standard:    cfg.Defaults.Standard,
+				Mode:        modeLabel(exp, enforcing),
+			}, flagged)
+			f.Close()
+		}
+		if ferr != nil {
+			fmt.Fprintln(os.Stderr, "report error:", ferr)
+			return exitEnvironment
+		}
+		fmt.Printf("report written to %s\n", out)
 	case "html":
 		out := *outputPath
 		if out == "" {
@@ -325,9 +345,9 @@ func writeGitHubOutputs(res *runner.Run, flagged func(runner.Result) bool, forma
 	fmt.Fprintf(f, "baselined-violations=%d\n", baselined)
 	fmt.Fprintf(f, "stale-baseline-entries=%d\n", len(res.Stale))
 	fmt.Fprintf(f, "tests-run=%d\n", res.TestsRun)
-	if formatName == "html" {
+	if formatName == "html" || formatName == "sarif" {
 		if outputPath == "" {
-			outputPath = "frostfall-report.html"
+			outputPath = map[string]string{"html": "frostfall-report.html", "sarif": "frostfall.sarif"}[formatName]
 		}
 		fmt.Fprintf(f, "report-file=%s\n", outputPath)
 	}

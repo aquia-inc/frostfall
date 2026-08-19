@@ -29,6 +29,8 @@ type Result struct {
 	// ScreenshotPath is set when an element screenshot was captured for this
 	// violation ("" when capture is off or the element couldn't be shot).
 	ScreenshotPath string
+	// PageURL is the URL the scan ran against, for report locations.
+	PageURL string
 }
 
 // Run holds a full run's outcome.
@@ -142,7 +144,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 
 	scanInitial := t.Scan == nil || *t.Scan
 	if scanInitial {
-		res, err := r.scan(ctx, session, t, "initial", config.ScanStep{})
+		res, err := r.scan(ctx, session, t, url, "initial", config.ScanStep{})
 		if err != nil {
 			return nil, false, err
 		}
@@ -156,7 +158,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			if label == "" {
 				label = "step-" + strconv.Itoa(i)
 			}
-			res, err := r.scan(ctx, session, t, label, *step.Scan)
+			res, err := r.scan(ctx, session, t, url, label, *step.Scan)
 			if err != nil {
 				return nil, false, err
 			}
@@ -172,7 +174,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	return results, scanned, nil
 }
 
-func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Test, label string, s config.ScanStep) ([]Result, error) {
+func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Test, url, label string, s config.ScanStep) ([]Result, error) {
 	rules := map[string]bool{}
 	maps.Copy(rules, r.Config.Defaults.Rules)
 	maps.Copy(rules, t.Rules)
@@ -194,6 +196,7 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 			Violation:    v,
 			TestID:       t.ID,
 			ScanLabel:    label,
+			PageURL:      url,
 			Fingerprint:  fingerprint.Fingerprint(t.ID, label, v.RuleID, v.Target),
 			StableTarget: fingerprint.StableTarget(v.Target),
 		}

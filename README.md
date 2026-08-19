@@ -276,16 +276,16 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
 | `--browser-path PATH` | auto-detect | use this Chrome/Chromium binary instead of detection |
-| `--format NAME` | `text` | report format: `text` (terminal) or `html` (single-file report; see below) |
-| `--output PATH` | `frostfall-report.html` for html | where to write the formatted report |
+| `--format NAME` | `text` | report format: `text` (terminal), `html` (single-file report), or `sarif` (GitHub code scanning) |
+| `--output PATH` | `frostfall-report.html` / `frostfall.sarif` | where to write the formatted report |
 | `--gh-issues` | off | file/maintain GitHub issues for failing violations (CI; needs `GITHUB_TOKEN`, `GITHUB_REPOSITORY`) |
 | `--gh-issues-dry-run` | off | print the issue actions without calling GitHub |
 | `--validate` | off | check the config and exit (0 = valid, 2 = invalid) |
 | `--verbose` | off | log page loads, steps, and scans to stderr |
 | `--version` | - | print the frostfall and embedded axe-core versions |
 
-In development, not yet functional: json, sarif, and junit formats, and
-`--watch` (rescan on change).
+In development, not yet functional: json and junit formats, and `--watch`
+(rescan on change).
 
 The regex filters make the common CI split easy: a fast subset on pre-push or
 PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
@@ -427,9 +427,24 @@ The action writes the HTML report by default and exposes job outputs
   run: echo "::warning::${{ steps.a11y.outputs.new-violations }} new a11y violations"
 ```
 
-In report mode the check stays green; add an `expect` block (or a `ci`
-profile) when you want red builds. SARIF output with inline PR annotations is
-planned.
+For code scanning alerts, run a second step with `format: sarif` and upload:
+
+```yaml
+- uses: aquia-inc/frostfall@v1
+  with:
+    serve: ./dist
+    format: sarif
+    output: frostfall.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with:
+    sarif_file: frostfall.sarif
+```
+
+Violations land in the Security tab as alerts, deduplicated across uploads by
+the violation fingerprint; baselined violations upload as `unchanged` so known
+debt never opens new alerts. In report mode the check stays green; add an
+`expect` block (or a `ci` profile) when you want red builds.
 
 Pin `@v1`. The action version is the tool version - there is no separate
 version input to drift. `@v1` resolves to the newest release under that major
