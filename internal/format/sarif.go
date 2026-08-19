@@ -126,15 +126,24 @@ func SARIF(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Resul
 			idx = len(rules)
 			ruleIndex[res.RuleID] = idx
 			// GitHub's required-properties table demands non-empty
-			// fullDescription.text and help.text on every rule.
-			help := res.HelpURL
+			// shortDescription.text, fullDescription.text, and help.text on
+			// every rule. The rule id is the only always-present field, so
+			// every fallback chain bottoms out there.
+			desc := res.Summary
+			if desc == "" {
+				desc = res.RuleID
+			}
+			help := res.Help // axe's human remediation text
 			if help == "" {
-				help = res.Summary
+				help = res.HelpURL
+			}
+			if help == "" {
+				help = desc
 			}
 			rules = append(rules, sarifRule{
 				ID:               res.RuleID,
-				ShortDescription: sarifMessage{Text: res.Summary},
-				FullDescription:  sarifMessage{Text: res.Summary},
+				ShortDescription: sarifMessage{Text: desc},
+				FullDescription:  sarifMessage{Text: desc},
 				Help:             sarifMessage{Text: help},
 				HelpURI:          res.HelpURL,
 			})

@@ -51,11 +51,14 @@ type ScanOptions struct {
 // Violation is one engine finding, normalized across engines.
 type Violation struct {
 	// RuleID is engine-namespaced when the engine is not axe ("equal-access/...").
-	RuleID  string
-	Impact  Impact
+	RuleID string
+	Impact Impact
 	// Target is the raw selector from the engine; the fingerprinter normalizes it.
 	Target  string
 	Summary string
+	// Help is the engine's short human remediation text ("Images must have
+	// alternative text"), distinct from the Summary description.
+	Help    string
 	HelpURL string
 	// HTML is the offending node snippet, for reports only. Never fingerprinted.
 	HTML string

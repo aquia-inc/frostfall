@@ -61,8 +61,14 @@ func TestSARIFOutput(t *testing.T) {
 				Driver struct {
 					Name  string `json:"name"`
 					Rules []struct {
-						ID      string `json:"id"`
-						HelpURI string `json:"helpUri"`
+						ID               string `json:"id"`
+						HelpURI          string `json:"helpUri"`
+						FullDescription  struct {
+							Text string `json:"text"`
+						} `json:"fullDescription"`
+						Help struct {
+							Text string `json:"text"`
+						} `json:"help"`
 					} `json:"rules"`
 				} `json:"driver"`
 			} `json:"tool"`
@@ -95,6 +101,12 @@ func TestSARIFOutput(t *testing.T) {
 	// Rules dedupe: image-alt appears twice in results, once in rules.
 	if len(r.Tool.Driver.Rules) != 2 {
 		t.Errorf("want 2 deduped rules, got %d", len(r.Tool.Driver.Rules))
+	}
+	// GitHub rejects empty fullDescription.text / help.text.
+	for _, rule := range r.Tool.Driver.Rules {
+		if rule.FullDescription.Text == "" || rule.Help.Text == "" {
+			t.Errorf("rule %s missing required description fields: %+v", rule.ID, rule)
+		}
 	}
 	// Baselined results are omitted: GitHub ignores baselineState, so known
 	// debt must not open alerts, and its absence closes existing ones.
