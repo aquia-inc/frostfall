@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.0.3](https://github.com/aquia-inc/frostfall/compare/v1.0.2...v1.0.3) (2026-08-19)
+
+### Bug Fixes
+
+* subscribe idle monitor before navigation and make profile overlays precise ([#33](https://github.com/aquia-inc/frostfall/issues/33)) ([c515789](https://github.com/aquia-inc/frostfall/commit/c515789c43ac7b7a9a4bd3861dfffd4419530791))
+
 ## [1.0.2](https://github.com/aquia-inc/frostfall/compare/v1.0.1...v1.0.2) (2026-08-19)
 
 ### Bug Fixes
