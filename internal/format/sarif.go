@@ -54,6 +54,8 @@ type sarifDriver struct {
 type sarifRule struct {
 	ID               string       `json:"id"`
 	ShortDescription sarifMessage `json:"shortDescription"`
+	FullDescription  sarifMessage `json:"fullDescription"`
+	Help             sarifMessage `json:"help"`
 	HelpURI          string       `json:"helpUri,omitempty"`
 }
 
@@ -123,9 +125,17 @@ func SARIF(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Resul
 		if !seen {
 			idx = len(rules)
 			ruleIndex[res.RuleID] = idx
+			// GitHub's required-properties table demands non-empty
+			// fullDescription.text and help.text on every rule.
+			help := res.HelpURL
+			if help == "" {
+				help = res.Summary
+			}
 			rules = append(rules, sarifRule{
 				ID:               res.RuleID,
 				ShortDescription: sarifMessage{Text: res.Summary},
+				FullDescription:  sarifMessage{Text: res.Summary},
+				Help:             sarifMessage{Text: help},
 				HelpURI:          res.HelpURL,
 			})
 		}
