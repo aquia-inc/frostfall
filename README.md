@@ -17,6 +17,46 @@ By default Frostfall **reports** violations without failing your build. Enforcem
 is opt-in, and a baseline file means adopting it on a codebase with existing
 violations doesn't nuke your CI on day one.
 
+## Why Frostfall exists
+
+If you build software for the federal government, accessibility is not a
+nice-to-have. Section 508 makes it a legal requirement, agencies audit against
+it, and a failed review can block your release. But when a developer sits down
+to actually deal with it, the tooling landscape is genuinely confusing: a dozen
+overlapping tools, most of them Node packages with different engines and
+different opinions, browser extensions that only check the page you're looking
+at, and Lighthouse scores that say 100 while a reviewer files findings against
+the exact same page. Knowing *what to run, when, and what the output means for
+your compliance posture* is a real problem, and most teams solve it with a
+spreadsheet and somebody's memory.
+
+Frostfall is our attempt to narrow that down to one tool with one workflow:
+
+- **One binary, one config, no ecosystem to assemble.** No Node toolchain, no
+  plugin matrix, no "which of the six axe wrappers do we use." Install it,
+  point it at your app, get findings.
+- **It tests what reviewers actually test.** Real rendered pages, including
+  the states behind clicks - open modals, expanded menus, forms after a
+  validation error. Most automated findings that surprise teams in a 508
+  review live in those states, not on page load.
+- **The output maps to how compliance work actually happens.** Existing
+  violations get baselined as known debt instead of failing every build on
+  day one. New violations fail loud. Fixed ones get pruned. The HTML report
+  is something you can hand to a reviewer or attach to a POA&M without
+  editing.
+- **It fits both moments where accessibility work happens**: locally while
+  you build, and in CI where it becomes a gate. Same config, same results.
+
+What it deliberately does not claim: automated scanning covers roughly a third
+to half of WCAG. No tool can verify that alt text is meaningful, that a screen
+reader announces your flow sensibly, or that a human can complete your forms
+with assistive technology. Frostfall exists to catch everything automation
+*can* catch, continuously and early, so your manual testing time and your
+reviewer's attention go to the problems that actually need a human.
+
+We built it because we needed it on our own federal work, and Emberfall showed
+us the shape a tool like this should take.
+
 ## Install
 
 Homebrew:
