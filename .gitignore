@@ -1,0 +1,6 @@
+/frostfall
+/dist/
+*.sarif
+frostfall-report.html
+frostfall-artifacts/
+temp.txt

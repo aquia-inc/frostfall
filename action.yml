@@ -1,0 +1,80 @@
+name: Frostfall
+description: Accessibility testing for rendered web apps. Scans real DOM with axe-core, baselines existing debt, fails only on new violations.
+author: Aquia
+
+branding:
+  icon: cloud-snow
+  color: blue
+
+inputs:
+  config:
+    description: Path to the Frostfall config file.
+    default: .frostfall.yml
+  serve:
+    description: "Static mode override: serve this build directory."
+    default: ""
+  base-url:
+    description: "Attach mode override: scan an already-running server."
+    default: ""
+  baseline:
+    description: Path to the baseline file.
+    default: ""
+  format:
+    description: Report format (text, html).
+    default: html
+  output:
+    description: Path to write the formatted report.
+    default: frostfall-report.html
+  gh-issues:
+    description: Set "true" to file/maintain GitHub issues for failing violations (workflow needs issues write permission).
+    default: "false"
+
+outputs:
+  new-violations:
+    description: Count of new (non-baselined) violations at or above the marker severity.
+    value: ${{ steps.run.outputs.new-violations }}
+  baselined-violations:
+    description: Count of violations matched by the baseline.
+    value: ${{ steps.run.outputs.baselined-violations }}
+  stale-baseline-entries:
+    description: Baselined violations that no longer occur (fixable debt).
+    value: ${{ steps.run.outputs.stale-baseline-entries }}
+  tests-run:
+    description: Number of tests executed.
+    value: ${{ steps.run.outputs.tests-run }}
+  report-file:
+    description: Path of the written report (html format).
+    value: ${{ steps.run.outputs.report-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install frostfall
+      shell: bash
+      # The action version IS the tool version: this ref-pinned script resolves
+      # the release matching the action's own tag, so @v1 can never drift.
+      run: ${{ github.action_path }}/scripts/install.sh
+      env:
+        FROSTFALL_ACTION_REF: ${{ github.action_ref }}
+
+    - name: Run frostfall
+      id: run
+      shell: bash
+      # Inputs pass through env, never interpolated into the script body:
+      # a crafted input must not be able to execute in the caller's runner.
+      env:
+        FF_CONFIG: ${{ inputs.config }}
+        FF_SERVE: ${{ inputs.serve }}
+        FF_BASE_URL: ${{ inputs.base-url }}
+        FF_BASELINE: ${{ inputs.baseline }}
+        FF_FORMAT: ${{ inputs.format }}
+        FF_OUTPUT: ${{ inputs.output }}
+        FF_GH_ISSUES: ${{ inputs.gh-issues }}
+      run: |
+        ARGS=(--config "$FF_CONFIG" --format "$FF_FORMAT")
+        [ -n "$FF_SERVE" ]    && ARGS+=(--serve "$FF_SERVE")
+        [ -n "$FF_BASE_URL" ] && ARGS+=(--base-url "$FF_BASE_URL")
+        [ -n "$FF_BASELINE" ] && ARGS+=(--baseline "$FF_BASELINE")
+        [ -n "$FF_OUTPUT" ]   && ARGS+=(--output "$FF_OUTPUT")
+        [ "$FF_GH_ISSUES" = "true" ] && ARGS+=(--gh-issues)
+        frostfall "${ARGS[@]}"

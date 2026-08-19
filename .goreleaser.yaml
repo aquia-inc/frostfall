@@ -1,0 +1,43 @@
+version: 2
+
+project_name: frostfall
+
+builds:
+  - main: ./cmd/frostfall
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+# Asset naming matches Emberfall's uname-style scheme
+# (frostfall_{Darwin,Linux}_{arm64,x86_64}.tar.gz) so the team's existing
+# checksum-verified `make install-emberfall` pattern transfers verbatim.
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+brews:
+  - repository:
+      owner: aquia-inc
+      name: homebrew-frostfall
+    homepage: https://github.com/aquia-inc/frostfall
+    description: "Accessibility testing made easy"
+    license: Apache-2.0
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native

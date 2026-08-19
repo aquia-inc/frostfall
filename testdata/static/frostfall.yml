@@ -1,0 +1,24 @@
+version: 1
+
+server:
+  serve: testdata/static
+
+defaults:
+  standard: wcag21aa
+  expect:
+    severity: serious
+    maxViolations: 0
+
+tests:
+  - id: fixture-initial
+    path: /
+
+  - id: fixture-dialog
+    path: /
+    scan: false
+    steps:
+      - click: "#open-dialog"
+      - waitFor: "#dialog"
+      - scan:
+          label: dialog-open
+          scope: "#dialog"

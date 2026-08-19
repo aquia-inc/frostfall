@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Frostfall fixture: planted violations</title>
+</head>
+<body>
+  <main id="app">
+    <h1>Fixture page</h1>
+
+    <!-- planted: image-alt (critical) -->
+    <img src="logo.png">
+
+    <!-- planted: label (critical) -->
+    <input type="text" id="unlabeled">
+
+    <!-- planted: color-contrast (serious) -->
+    <p style="color:#999;background:#fff;">Low contrast text that fails WCAG AA.</p>
+
+    <!-- planted: button-name (critical), revealed state for the modal test -->
+    <button id="open-dialog" aria-label="Open dialog">Open</button>
+    <div id="dialog" role="dialog" aria-label="Example dialog" hidden>
+      <button></button>
+      <p>Dialog content.</p>
+    </div>
+
+    <script>
+      document.getElementById('open-dialog').addEventListener('click', () => {
+        document.getElementById('dialog').hidden = false;
+      });
+    </script>
+  </main>
+</body>
+</html>
