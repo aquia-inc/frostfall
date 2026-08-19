@@ -10,7 +10,7 @@ Everything else is guidance the implementer may adapt.
 
 Not yet implemented (config for these is rejected or flagged, never silently ignored):
 server spawn mode (`server.command`), `auth:`, `--watch`, `--parallel`, and the
-json/sarif/junit formatters.
+json/junit formatters.
 
 ---
 
@@ -400,10 +400,13 @@ violations collapsed to a count, summary block last (new / baselined / stale-bas
 **json**: complete structured results — every violation with fingerprint, baselined flag, raw target,
 snippet, help URL, plus run metadata (frostfall version, axe version, base URL, timing).
 
-**sarif** (2.1.0): one rule per axe rule with `helpUri`; results carry the page URL as the artifact
-location and the DOM selector in `logicalLocations`; baselined violations map to
-`"baselineState": "unchanged"`, new ones `"new"`. This is the flagship CI format — uploaded to GitHub
-code scanning it renders violations as PR annotations, which almost nothing in the a11y space does.
+**sarif** (2.1.0): one rule per axe rule with `helpUri`; results locate at stable synthetic
+repo-relative paths (`frostfall/<testId>`, startLine 1 — GitHub rejects absolute http URIs and
+requires a region), the DOM selector in `logicalLocations`, and the page URL in the message. The
+violation fingerprint is written to `primaryLocationLineHash`, the only key GitHub uses for alert
+identity, so alerts track baseline identity exactly. Baselined violations are omitted (GitHub
+ignores `baselineState`): known debt opens no alerts and baselining closes the alert on the next
+upload. Alerts render in the Security tab; scanning rendered pages means no inline PR annotations.
 
 **junit**: one test case per (test × scan point), violations as failure text — for CI dashboards
 that speak nothing else.

@@ -20,7 +20,7 @@ inputs:
     description: Path to the baseline file.
     default: ""
   format:
-    description: Report format (text, html).
+    description: Report format (text, html, sarif).
     default: html
   output:
     description: Path to write the formatted report.
