@@ -41,9 +41,11 @@ func badge(i engine.Impact) string {
 }
 
 // Text writes the human-readable report: grouped by test and scan point,
-// impact-sorted, baselined violations collapsed to a count. enforcing tells
-// the summary whether these violations fail the build or are report-only.
-func Text(w io.Writer, run *runner.Run, minImpact engine.Impact, enforcing bool) {
+// impact-sorted, baselined violations collapsed to a count. flagged is the
+// same predicate the exit code uses (severity floor plus enforced rules), so
+// the summary count and the exit code can never disagree; enforcing tells
+// the summary whether flagged violations fail the build or are report-only.
+func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, label string, enforcing bool) {
 	type key struct{ test, scan string }
 	groups := map[key][]runner.Result{}
 	var order []key
@@ -75,7 +77,7 @@ func Text(w io.Writer, run *runner.Run, minImpact engine.Impact, enforcing bool)
 		sort.SliceStable(fresh, func(i, j int) bool { return fresh[i].Impact > fresh[j].Impact })
 		for _, res := range fresh {
 			marker := "  "
-			if res.Impact >= minImpact {
+			if flagged(res) {
 				marker = styleMarker.Render("✗") + " "
 				newTotal++
 			}
@@ -95,8 +97,8 @@ func Text(w io.Writer, run *runner.Run, minImpact engine.Impact, enforcing bool)
 	}
 
 	fmt.Fprintf(w, "\n%s\n", styleTotals.Render(fmt.Sprintf(
-		"%d tests, %d new violation(s) at or above %s, %d baselined",
-		run.TestsRun, newTotal, minImpact, baselinedTotal)))
+		"%d tests, %d new violation(s) %s, %d baselined",
+		run.TestsRun, newTotal, label, baselinedTotal)))
 	if len(run.Stale) > 0 {
 		fmt.Fprintf(w, "%s\n", styleGood.Render(fmt.Sprintf(
 			"%d baselined violation(s) no longer occur — run --update-baseline to prune", len(run.Stale))))

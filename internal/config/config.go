@@ -104,6 +104,20 @@ func (e Expect) Enforcing() bool {
 	return e.Severity != "" || e.MaxViolations != nil || len(e.Rules) > 0
 }
 
+// normalizeExpect fills the implied fields of an enforcing expect: severity
+// with no maxViolations means zero tolerance, and maxViolations with neither
+// severity nor rules implies the serious floor — otherwise nothing would ever
+// count against the limit and the config would enforce vacuously.
+func normalizeExpect(e *Expect) {
+	if e.MaxViolations != nil && e.Severity == "" && len(e.Rules) == 0 {
+		e.Severity = "serious"
+	}
+	if e.Severity != "" && e.MaxViolations == nil {
+		zero := 0
+		e.MaxViolations = &zero
+	}
+}
+
 type Auth struct {
 	Setup        *AuthSetup `yaml:"setup"`
 	Reuse        *bool      `yaml:"reuse"`
@@ -309,9 +323,11 @@ func (c *Config) applyDefaults() {
 	}
 	// No expect defaults: an absent expect block means report-only. A set
 	// severity with no maxViolations means zero tolerance at that severity.
-	if d.Expect.Severity != "" && d.Expect.MaxViolations == nil {
-		zero := 0
-		d.Expect.MaxViolations = &zero
+	normalizeExpect(&d.Expect)
+	for i := range c.Tests {
+		if c.Tests[i].Expect != nil {
+			normalizeExpect(c.Tests[i].Expect)
+		}
 	}
 	if c.Server != nil {
 		s := c.Server

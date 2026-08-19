@@ -9,7 +9,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/runner"
 )
 
@@ -28,8 +27,10 @@ type RunMeta struct {
 	Profile     string
 	ToolVersion string
 	AxeVersion  string
-	Enforcing   bool
-	MinImpact   engine.Impact
+	// Mode is the human description of the enforcement posture, e.g.
+	// "report only" or "enforcing (serious+)" — computed by the caller from
+	// the same inputs as the flagged predicate so the header cannot mislabel.
+	Mode string
 }
 
 type htmlRow struct {
@@ -58,8 +59,9 @@ type htmlReport struct {
 
 // HTML writes a self-contained single-file report: one triage table, styling
 // inline, screenshots embedded as data URIs — made to be attached to a ticket
-// or handed to a reviewer with nothing else.
-func HTML(w io.Writer, run *runner.Run, meta RunMeta) error {
+// or handed to a reviewer with nothing else. flagged is the same enforcement
+// predicate the exit code uses.
+func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result) bool) error {
 	rep := htmlReport{
 		Meta:       meta,
 		DateHuman:  meta.Date.Format("January 2, 2006 15:04 MST"),
@@ -89,7 +91,7 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta) error {
 			Target:    res.StableTarget,
 			HelpURL:   res.HelpURL,
 			Baselined: res.Baselined,
-			Failing:   !res.Baselined && res.Impact >= meta.MinImpact,
+			Failing:   flagged(res),
 		}
 		if res.Baselined {
 			rep.Baselined++
@@ -178,7 +180,7 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
     {{if .Meta.BaseURL}}<span>Target <b>{{.Meta.BaseURL}}</b></span>{{end}}
     <span>Standard <b>{{.Meta.Standard}}</b></span>
     {{if .Meta.Profile}}<span>Profile <b>{{.Meta.Profile}}</b></span>{{end}}
-    <span>Mode <b>{{if .Meta.Enforcing}}enforcing ({{.Meta.MinImpact}}+){{else}}report only{{end}}</b></span>
+    <span>Mode <b>{{.Meta.Mode}}</b></span>
     <span>frostfall <b>{{.Meta.ToolVersion}}</b></span>
     <span>axe-core <b>{{.Meta.AxeVersion}}</b></span>
   </div>

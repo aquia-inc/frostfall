@@ -134,11 +134,26 @@ func run(args []string) int {
 	if *baselinePath != "" {
 		bp = *baselinePath
 	}
+	// Same default on the read path as --update-baseline uses on the write
+	// path: a config without baseline: must still read back the file that a
+	// bare --update-baseline run wrote, or the baseline silently never
+	// applies. The default pickup is announced (a stale file must not
+	// suppress violations invisibly), and --baseline none opts out.
+	defaulted := false
+	if bp == "" {
+		bp, defaulted = ".frostfall-baseline.json", true
+	}
+	if bp == "none" {
+		bp = ""
+	}
 	var bl *baseline.File
 	if bp != "" {
 		if bl, err = baseline.Load(bp); err != nil {
 			fmt.Fprintln(os.Stderr, "baseline error:", err)
 			return exitBadConfig
+		}
+		if defaulted && len(bl.Violations) > 0 {
+			fmt.Fprintf(os.Stderr, "using baseline %s (default path; pass --baseline none to ignore it)\n", bp)
 		}
 	}
 
@@ -203,13 +218,36 @@ func run(args []string) int {
 	}
 
 	exp := cfg.Defaults.Expect
-	// The report marks serious+ violations even in report-only mode; an
-	// explicit severity floor moves the marker.
-	minImpact := engine.Serious
-	if m, ok := engine.ParseImpact(exp.Severity); ok {
-		minImpact = m
+	perTest := map[string]config.Expect{}
+	enforcing := exp.Enforcing()
+	for _, t := range tests {
+		if t.Expect != nil {
+			perTest[t.ID] = *t.Expect
+			enforcing = enforcing || t.Expect.Enforcing()
+		}
 	}
-	format.Text(os.Stdout, res, minImpact, exp.Enforcing())
+	// The report marks serious+ violations even when the default expect is
+	// report-only; an explicit default contract replaces that floor. Keyed on
+	// the DEFAULT expect (not per-test enforcement) so tests without an
+	// override keep their informational serious+ markers.
+	reportDef := exp
+	if !exp.Enforcing() {
+		reportDef = config.Expect{Severity: engine.Serious.String()}
+	}
+	flagged := func(v runner.Result) bool { return runner.Failing(v, reportDef, perTest) }
+
+	// The summary label only claims contract breakage when the flagged set is
+	// exactly the contract set (the default expect enforces). With per-test
+	// contracts layered on a report-only default, the count includes
+	// informational serious+ rows, so the label must not overclaim.
+	label := "flagged (serious or worse)"
+	if exp.Enforcing() {
+		label = "breaking the expect contract"
+		if exp.MaxViolations != nil && *exp.MaxViolations > 0 {
+			label += fmt.Sprintf(" (up to %d tolerated)", *exp.MaxViolations)
+		}
+	}
+	format.Text(os.Stdout, res, flagged, label, enforcing)
 
 	switch *formatName {
 	case "text": // already written above
@@ -228,9 +266,8 @@ func run(args []string) int {
 				Profile:     activeProfileName(profileReq, cfg),
 				ToolVersion: version,
 				AxeVersion:  eng.Version(),
-				Enforcing:   exp.Enforcing(),
-				MinImpact:   minImpact,
-			})
+				Mode:        modeLabel(exp, enforcing),
+			}, flagged)
 			f.Close()
 		}
 		if ferr != nil {
@@ -243,19 +280,10 @@ func run(args []string) int {
 		return exitBadConfig
 	}
 
-	perTest := map[string]config.Expect{}
-	enforcing := exp.Enforcing()
-	for _, t := range tests {
-		if t.Expect != nil {
-			perTest[t.ID] = *t.Expect
-			enforcing = enforcing || t.Expect.Enforcing()
-		}
-	}
-
-	writeGitHubOutputs(res, minImpact, *formatName, *outputPath)
+	writeGitHubOutputs(res, flagged, *formatName, *outputPath)
 
 	if *ghIssues || *ghIssuesDry {
-		if err := syncIssues(res, minImpact, exp, *ghIssuesDry); err != nil {
+		if err := syncIssues(res, flagged, *ghIssuesDry); err != nil {
 			// Issue filing must never break the scan; report and move on.
 			fmt.Fprintln(os.Stderr, "gh-issues warning:", err)
 		}
@@ -275,7 +303,7 @@ func run(args []string) int {
 
 // writeGitHubOutputs exposes run counts as job outputs when running in
 // Actions, so downstream steps can gate without parsing the report.
-func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, outputPath string) {
+func writeGitHubOutputs(res *runner.Run, flagged func(runner.Result) bool, formatName, outputPath string) {
 	path := os.Getenv("GITHUB_OUTPUT")
 	if path == "" {
 		return
@@ -285,13 +313,15 @@ func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, ou
 		return
 	}
 	defer f.Close()
-	baselined := 0
+	baselined, flaggedCount := 0, 0
 	for _, r := range res.Results {
 		if r.Baselined {
 			baselined++
+		} else if flagged(r) {
+			flaggedCount++
 		}
 	}
-	fmt.Fprintf(f, "new-violations=%d\n", res.NewViolations(minImpact))
+	fmt.Fprintf(f, "new-violations=%d\n", flaggedCount)
 	fmt.Fprintf(f, "baselined-violations=%d\n", baselined)
 	fmt.Fprintf(f, "stale-baseline-entries=%d\n", len(res.Stale))
 	fmt.Fprintf(f, "tests-run=%d\n", res.TestsRun)
@@ -303,19 +333,15 @@ func writeGitHubOutputs(res *runner.Run, minImpact engine.Impact, formatName, ou
 	}
 }
 
-// syncIssues reconciles GitHub issues against this run's failing violations:
-// the same set that would fail an enforcing build (severity floor plus
-// enforced rules; the default serious floor in report-only mode). Close
-// scoping uses the tests that actually executed a scan — a configured test
-// whose scan never ran must not close its issues as "fixed".
-func syncIssues(res *runner.Run, minImpact engine.Impact, exp config.Expect, dryRun bool) error {
-	enforcedRules := map[string]bool{}
-	for _, id := range exp.Rules {
-		enforcedRules[id] = true
-	}
+// syncIssues reconciles GitHub issues against this run's failing violations —
+// the shared enforcement predicate, so filed issues always match what the
+// exit code and reports flag. Close scoping uses the tests that actually
+// executed a scan — a configured test whose scan never ran must not close its
+// issues as "fixed".
+func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) error {
 	var failing []runner.Result
 	for _, r := range res.Results {
-		if !r.Baselined && (r.Impact >= minImpact || enforcedRules[r.RuleID]) {
+		if flagged(r) {
 			failing = append(failing, r)
 		}
 	}
@@ -352,6 +378,25 @@ func syncIssues(res *runner.Run, minImpact engine.Impact, exp config.Expect, dry
 		fmt.Println("gh-issues:", a)
 	}
 	return err
+}
+
+// modeLabel describes the enforcement posture for report headers, derived
+// from the same inputs as the flagged predicate so it cannot mislabel a
+// rules-only or per-test contract as a severity floor.
+func modeLabel(def config.Expect, enforcing bool) string {
+	if !enforcing {
+		return "report only"
+	}
+	switch {
+	case def.Severity != "" && len(def.Rules) > 0:
+		return fmt.Sprintf("enforcing (%s+ and %d rule(s))", def.Severity, len(def.Rules))
+	case def.Severity != "":
+		return "enforcing (" + def.Severity + "+)"
+	case len(def.Rules) > 0:
+		return "enforcing (rules)"
+	default:
+		return "enforcing (per-test contracts)"
+	}
 }
 
 // activeProfileName resolves what profile actually applied, for report

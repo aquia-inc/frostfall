@@ -87,6 +87,27 @@ func TestProfileAutoNoopWithoutCIProfile(t *testing.T) {
 	}
 }
 
+func TestMaxViolationsOnlyImpliesSeriousFloor(t *testing.T) {
+	// An expect with only maxViolations would otherwise enforce vacuously:
+	// nothing would ever count against the limit.
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+defaults:
+  expect:
+    maxViolations: 5
+tests:
+  - id: home
+    path: /
+`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Defaults.Expect.Severity != "serious" {
+		t.Errorf("maxViolations-only expect should imply the serious floor, got %q", cfg.Defaults.Expect.Severity)
+	}
+}
+
 func TestUnknownProfileErrors(t *testing.T) {
 	if _, err := Load(writeConfig(t, profileConfig), "staging"); err == nil {
 		t.Errorf("unknown profile name did not error")
