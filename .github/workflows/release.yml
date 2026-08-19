@@ -23,10 +23,11 @@ jobs:
       - name: Check release credentials
         id: creds
         env:
-          APP_ID: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          CLIENT_ID: ${{ vars.SEMANTIC_RELEASE_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.SEMANTIC_RELEASE_APP_PRIVATE_KEY }}
         run: |
-          if [ -z "$APP_ID" ]; then
-            echo "::notice::SEMANTIC_RELEASE_APP_ID not configured; skipping release. Install aquia-semantic-release-bot and add its secrets to enable automated releases."
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ] || [ "$PRIVATE_KEY" = "REPLACE_ME" ]; then
+            echo "::notice::Release credentials not populated (SEMANTIC_RELEASE_APP_CLIENT_ID variable + SEMANTIC_RELEASE_APP_PRIVATE_KEY secret); skipping release."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -35,14 +36,16 @@ jobs:
       - name: Generate GitHub App token
         if: steps.creds.outputs.configured == 'true'
         id: generate-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          # client-id replaces the deprecated app-id input; it is public app
+          # metadata, so it lives in a repo variable rather than a secret.
+          client-id: ${{ vars.SEMANTIC_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.SEMANTIC_RELEASE_APP_PRIVATE_KEY }}
 
       - name: Checkout
         if: steps.creds.outputs.configured == 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ steps.generate-token.outputs.token }}
@@ -56,7 +59,7 @@ jobs:
       - name: Run semantic-release
         if: steps.creds.outputs.configured == 'true'
         id: semantic
-        uses: cycjimmy/semantic-release-action@v4
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
         with:
           extra_plugins: |
             @semantic-release/changelog
@@ -73,18 +76,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ needs.release.outputs.tag }}
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       # release.mode keep-existing in .goreleaser.yaml attaches binaries to
       # the release semantic-release created, preserving its notes.
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
@@ -109,7 +112,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -118,8 +121,8 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::notice::ANTHROPIC_API_KEY not configured; keeping semantic-release notes."
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ "$ANTHROPIC_API_KEY" = "REPLACE_ME" ]; then
+            echo "::notice::ANTHROPIC_API_KEY not populated; keeping semantic-release notes."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -151,7 +154,7 @@ jobs:
         id: notes
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL || 'claude-opus-4-7' }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL || 'claude-opus-5' }}
           ORIGINAL_NOTES: ${{ steps.context.outputs.notes }}
           COMMIT_MESSAGES: ${{ steps.context.outputs.commits }}
           DIFF_CONTENT: ${{ steps.context.outputs.diff }}
