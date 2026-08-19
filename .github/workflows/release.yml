@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
+      tag: ${{ steps.semantic.outputs.new_release_git_tag }}
+    steps:
+      - name: Check release credentials
+        id: creds
+        env:
+          APP_ID: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+        run: |
+          if [ -z "$APP_ID" ]; then
+            echo "::notice::SEMANTIC_RELEASE_APP_ID not configured; skipping release. Install aquia-semantic-release-bot and add its secrets to enable automated releases."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate GitHub App token
+        if: steps.creds.outputs.configured == 'true'
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        if: steps.creds.outputs.configured == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Configure Git
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          git config user.name "aquia-semantic-release-bot[bot]"
+          git config user.email "aquia-semantic-release-bot[bot]@users.noreply.github.com"
+
+      - name: Run semantic-release
+        if: steps.creds.outputs.configured == 'true'
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/changelog
+            @semantic-release/git
+            conventional-changelog-conventionalcommits
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+  build:
+    name: Build and Publish Binaries
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # release.mode keep-existing in .goreleaser.yaml attaches binaries to
+      # the release semantic-release created, preserving its notes.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move major version tag
+        # Users pin @v1; the major tag follows every release under its major.
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          MAJOR="${TAG%%.*}"
+          git tag -f "$MAJOR" "$TAG"
+          git push -f origin "$MAJOR"
+
+  enhance-notes:
+    name: Enhance Release Notes
+    needs: [release, build]
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check for API key
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::notice::ANTHROPIC_API_KEY not configured; keeping semantic-release notes."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release context
+        if: steps.key.outputs.present == 'true'
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURR_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 2p)
+          [ -z "$PREV_TAG" ] && PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          {
+            echo "notes<<EOF"
+            gh release view "$CURR_TAG" --json body --jq .body
+            echo "EOF"
+            echo "commits<<EOF"
+            git log "$PREV_TAG..$CURR_TAG" --format="### %s%n%b%n---" | head -c 10000
+            echo "EOF"
+            echo "diff<<EOF"
+            git diff "$PREV_TAG..$CURR_TAG" -- '*.go' '*.md' '*.yml' '*.yaml' '*.json' ':!*.min.js' | head -c 40000
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate enhanced release notes
+        if: steps.key.outputs.present == 'true'
+        id: notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL || 'claude-opus-4-7' }}
+          ORIGINAL_NOTES: ${{ steps.context.outputs.notes }}
+          COMMIT_MESSAGES: ${{ steps.context.outputs.commits }}
+          DIFF_CONTENT: ${{ steps.context.outputs.diff }}
+        run: |
+          PROMPT="Enhance these semantic-release notes with better context.
+
+          ORIGINAL NOTES (preserve ALL links):
+          ${ORIGINAL_NOTES}
+
+          FULL COMMIT MESSAGES (with bodies for context):
+          ${COMMIT_MESSAGES}
+
+          GIT DIFF (for technical details):
+          ${DIFF_CONTENT:0:20000}
+
+          TASK: Rewrite these notes for TWO audiences in one document. Start with a short, plain-language summary for non-technical readers, then full technical detail for engineers.
+
+          REQUIREMENTS:
+          1. PRESERVE ALL LINKS in the detailed sections: PR numbers, commit hashes, issue refs
+          2. Pull context from commit message bodies, not just subject lines
+          3. Group related changes by user-facing capability, not one bullet per PR
+          4. Explain WHY each change matters, in terms the reader cares about
+
+          FORMAT (these sections, in this order):
+
+          ## What's new
+          - Plain-language highlights for a non-technical teammate. 3 to 5 short bullets.
+          - Say what a person can now do and why it helps. No function names, flags, file paths, or PR numbers here.
+          - One tasteful emoji per bullet is allowed here. Nowhere else.
+
+          ## Added / ## Fixed / ## Changed
+          - Each change with links, user impact, and root cause or migration notes where relevant.
+
+          ## Technical Notes
+          - Dependencies, contract changes (exit codes, fingerprint scheme, config schema), safe-to-adopt reasoning.
+
+          RULES:
+          - Never use an em dash.
+          - Plain human prose. No marketing language, no AI-tell filler (delve, seamless, robust, leverage, unlock, empower, streamline).
+          - Detailed sections read like a senior engineer documenting changes: WHY, not just WHAT."
+
+          REQUEST_BODY=$(jq -n --arg model "$RELEASE_NOTES_MODEL" --arg prompt "$PROMPT" \
+            '{model: $model, max_tokens: 16000, messages: [{role: "user", content: $prompt}]}')
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$REQUEST_BODY")
+
+          NOTES=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")')
+          if [ -z "$NOTES" ]; then
+            echo "::warning::No text returned; release keeps the semantic-release notes."
+            echo "Full API response (first 500): ${RESPONSE:0:500}"
+            exit 0
+          fi
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update release with enhanced notes
+        if: steps.key.outputs.present == 'true' && steps.notes.outputs.notes != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
+        run: gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES"

@@ -28,6 +28,11 @@ archives:
       - goos: windows
         formats: [zip]
 
+# semantic-release creates the tag and the GitHub release (with notes);
+# goreleaser attaches binaries to that release rather than replacing it.
+release:
+  mode: keep-existing
+
 brews:
   - repository:
       owner: aquia-inc
@@ -35,6 +40,9 @@ brews:
     homepage: https://github.com/aquia-inc/frostfall
     description: "Accessibility testing made easy"
     license: Apache-2.0
+    # Formula generation runs, but pushing to the tap is disabled until the
+    # repo goes public and homebrew-frostfall exists.
+    skip_upload: true
 
 checksum:
   name_template: checksums.txt
