@@ -125,16 +125,16 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		}
 		return el.Click(proto.InputMouseButtonLeft, 1)
 	case len(st.Fill) > 0:
-		for sel, val := range st.Fill {
-			el, err := s.page.Element(sel)
+		for _, fv := range st.Fill {
+			el, err := s.page.Element(fv.Selector)
 			if err != nil {
-				return fmt.Errorf("fill %q: %w", sel, err)
+				return fmt.Errorf("fill %q: %w", fv.Selector, err)
 			}
 			if err := el.SelectAllText(); err != nil {
 				return err
 			}
-			if err := el.Input(val); err != nil {
-				return fmt.Errorf("fill %q: %w", sel, err)
+			if err := el.Input(fv.Value); err != nil {
+				return fmt.Errorf("fill %q: %w", fv.Selector, err)
 			}
 		}
 		return nil
@@ -151,7 +151,8 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		}
 		return el.Hover()
 	case len(st.Select) > 0:
-		for sel, val := range st.Select {
+		for _, fv := range st.Select {
+			sel, val := fv.Selector, fv.Value
 			el, err := s.page.Element(sel)
 			if err != nil {
 				return fmt.Errorf("select %q: %w", sel, err)

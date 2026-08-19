@@ -114,6 +114,61 @@ func TestUnknownProfileErrors(t *testing.T) {
 	}
 }
 
+func TestFillFieldsPreserveDocumentOrder(t *testing.T) {
+	// Steps with dependent fields need document-order execution; a Go map
+	// would randomize it (issue #3). Syntax is unchanged - plain YAML
+	// mappings - only decoding is ordered.
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+tests:
+  - id: form
+    path: /
+    steps:
+      - fill:
+          "#one": a
+          "#two": b
+          "#three": c
+          "#four": d
+          "#five": e
+`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Tests[0].Steps[0].Fill
+	want := []string{"#one", "#two", "#three", "#four", "#five"}
+	if len(got) != len(want) {
+		t.Fatalf("want %d fields, got %d", len(want), len(got))
+	}
+	for i, sel := range want {
+		if got[i].Selector != sel {
+			t.Fatalf("field %d: want %s, got %s (order not preserved)", i, sel, got[i].Selector)
+		}
+	}
+	if got[2].Value != "c" {
+		t.Errorf("value pairing broken: %+v", got[2])
+	}
+}
+
+func TestFillRejectsMergeKeys(t *testing.T) {
+	_, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+shared: &shared
+  "#a": one
+tests:
+  - id: form
+    path: /
+    steps:
+      - fill:
+          <<: *shared
+          "#b": two
+`), "")
+	if err == nil || !strings.Contains(err.Error(), "merge keys") {
+		t.Errorf("merge key should be rejected with a message naming it, got: %v", err)
+	}
+}
+
 func TestProfileCannotCarryTests(t *testing.T) {
 	bad := strings.Replace(profileConfig, "    server:\n      serve: ./dist",
 		"    tests:\n      - id: sneaky\n        path: /x", 1)

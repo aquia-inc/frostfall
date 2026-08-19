@@ -239,7 +239,7 @@ scanning, not a general E2E framework.
 | step | example | what it does |
 |------|---------|--------------|
 | `click` | `click: "#open-modal"` | wait for the selector, click it |
-| `fill` | `fill: { "#email": "${TEST_EMAIL}" }` | focus, clear, type (fires input events) |
+| `fill` | `fill: { "#email": "${TEST_EMAIL}" }` | focus, clear, type (fires input events); multiple fields run in document order |
 | `press` | `press: Tab` | send a keyboard key (`Tab`, `Enter`, `Escape`, arrows...) - useful for testing keyboard reachability |
 | `hover` | `hover: ".menu-trigger"` | mouse over (tooltips, hover menus) |
 | `select` | `select: { "#country": "Canada" }` | choose an option in a `<select>` |
