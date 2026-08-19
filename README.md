@@ -4,6 +4,9 @@
 
 # Frostfall
 
+[![Release](https://img.shields.io/github/v/release/aquia-inc/frostfall)](https://github.com/aquia-inc/frostfall/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 Accessibility testing for rendered web apps. Frostfall drives a headless browser,
 runs [axe-core](https://github.com/dequelabs/axe-core) against your actual pages -
 including the states behind clicks, like open modals and expanded menus - and
@@ -455,6 +458,10 @@ version input to drift. `@v1` resolves to the newest release under that major
 only, and every downloaded binary is sha256-verified against the release
 checksums.
 
+The action supports Linux and macOS runners. Windows binaries ship with every
+release for local use, but the action's install step does not support Windows
+runners yet.
+
 ## GitHub issues from CI
 
 ```bash
@@ -473,6 +480,26 @@ without the marker are never touched, so hand-filed accessibility issues are
 safe. Only violations that would fail an enforcing build are filed; baselined
 debt is not. The workflow needs `issues: write` permission. Filing failures
 are warnings - they never break the scan.
+
+## How it compares
+
+| | Frostfall | pa11y / pa11y-ci | Lighthouse CI | axe CLI |
+|---|---|---|---|---|
+| Engine | axe-core | HTML_CodeSniffer (axe optional) | axe-core (curated subset) | axe-core |
+| Runtime | single Go binary | Node + Puppeteer Chromium download | Node + Chrome | Node + WebDriver |
+| Interaction states | steps with labeled, scoped scans per journey | per-URL action scripts, one scan per URL | none (page load only) | none |
+| Regression model | fingerprint baseline: grandfather existing, fail on new, prune fixed | threshold counts | score budgets | none |
+| SPA discovery | hash-router aware crawl, route-shape dedup | none | none | none |
+| Reports | terminal, self-contained HTML with screenshots, SARIF | CLI, JSON, CSV, HTML | HTML, JSON | CLI, JSON |
+| GitHub integration | code scanning alerts with stable identity, issue filing with lifecycle | via custom glue | status checks | via custom glue |
+
+Where the others are ahead: pa11y has a decade of production use, a dashboard
+project, and HTML_CodeSniffer's per-WCAG-criterion output that some auditors
+prefer; Lighthouse CI tracks performance and SEO alongside accessibility and
+has first-class score budgets. If your need is a performance-plus-a11y score
+trend, run Lighthouse CI next to Frostfall - the tools coexist cleanly, and
+Frostfall's accessibility coverage is a strict superset of Lighthouse's
+(which runs a curated subset of the same engine).
 
 ## What this does and doesn't cover
 

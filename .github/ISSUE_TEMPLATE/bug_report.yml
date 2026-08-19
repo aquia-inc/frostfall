@@ -1,0 +1,36 @@
+name: Bug report
+description: Something behaved incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you run, what did you expect, what did you get?
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: Your .frostfall.yml (redact URLs/secrets as needed) and the command line used.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: page
+    attributes:
+      label: Target page
+      description: A URL, HTML snippet, or description of the page being scanned. Bugs with a reproducible page get fixed fastest.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `frostfall --version`
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Relevant terminal output (use --verbose if the failure is in page readiness or steps).
