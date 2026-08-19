@@ -64,6 +64,7 @@ type axeResult struct {
 		ID          string `json:"id"`
 		Impact      string `json:"impact"`
 		Description string `json:"description"`
+		Help        string `json:"help"`
 		HelpURL     string `json:"helpUrl"`
 		Nodes       []struct {
 			Target []json.RawMessage `json:"target"`
@@ -121,6 +122,7 @@ func (e *Engine) Audit(ctx context.Context, page engine.Page, opts engine.ScanOp
 				Impact:  impact,
 				Target:  flattenTarget(n.Target),
 				Summary: v.Description,
+				Help:    v.Help,
 				HelpURL: v.HelpURL,
 				HTML:    n.HTML,
 			})
