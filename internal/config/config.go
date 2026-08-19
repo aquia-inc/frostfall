@@ -51,10 +51,24 @@ type Config struct {
 // coverage can never silently fork between local runs and CI. A profile
 // carrying a tests key fails strict decoding.
 type Profile struct {
-	Server   *Server   `yaml:"server"`
-	Defaults *Defaults `yaml:"defaults"`
-	Baseline string    `yaml:"baseline"`
-	Discover *Discover `yaml:"discover"`
+	Server   *Server          `yaml:"server"`
+	Defaults *ProfileDefaults `yaml:"defaults"`
+	Baseline string           `yaml:"baseline"`
+	Discover *Discover        `yaml:"discover"`
+}
+
+// ProfileDefaults mirrors Defaults with pointer fields so an overlay can
+// distinguish "absent" from "zero": a profile can now RELAX enforcement
+// (expect: {} clears the base contract) and override any single default,
+// which value-typed fields keyed on zero checks could not express.
+type ProfileDefaults struct {
+	Standard   *string         `yaml:"standard"`
+	Viewport   *Viewport       `yaml:"viewport"`
+	WaitFor    *string         `yaml:"waitFor"`
+	SettleTime *Duration       `yaml:"settleTime"`
+	Timeout    *Duration       `yaml:"timeout"`
+	Rules      map[string]bool `yaml:"rules"`
+	Expect     *Expect         `yaml:"expect"`
 }
 
 type Server struct {
@@ -290,26 +304,29 @@ func (c *Config) applyProfile(profile string) error {
 		c.Discover = p.Discover
 	}
 	if d := p.Defaults; d != nil {
-		if d.Standard != "" {
-			c.Defaults.Standard = d.Standard
+		if d.Standard != nil {
+			c.Defaults.Standard = *d.Standard
 		}
-		if d.Viewport.Width != 0 {
-			c.Defaults.Viewport = d.Viewport
+		if d.Viewport != nil {
+			c.Defaults.Viewport = *d.Viewport
 		}
-		if d.WaitFor != "" {
-			c.Defaults.WaitFor = d.WaitFor
+		if d.WaitFor != nil {
+			c.Defaults.WaitFor = *d.WaitFor
 		}
-		if d.SettleTime != 0 {
-			c.Defaults.SettleTime = d.SettleTime
+		if d.SettleTime != nil {
+			c.Defaults.SettleTime = *d.SettleTime
 		}
-		if d.Timeout != 0 {
-			c.Defaults.Timeout = d.Timeout
+		if d.Timeout != nil {
+			c.Defaults.Timeout = *d.Timeout
 		}
 		if d.Rules != nil {
 			c.Defaults.Rules = d.Rules
 		}
-		if d.Expect.Enforcing() {
-			c.Defaults.Expect = d.Expect
+		// A present expect replaces the base wholesale — including an empty
+		// one, which is how a profile relaxes an enforcing base to
+		// report-only (e.g. a "local" profile under an enforcing default).
+		if d.Expect != nil {
+			c.Defaults.Expect = *d.Expect
 		}
 	}
 	return nil
@@ -344,7 +361,7 @@ func (c *Config) applyDefaults() {
 	if d.Standard == "" {
 		d.Standard = "wcag21aa"
 	}
-	if d.Viewport.Width == 0 {
+	if d.Viewport.Width == 0 && d.Viewport.Height == 0 {
 		d.Viewport = Viewport{Width: 1280, Height: 800}
 	}
 	if d.WaitFor == "" {
@@ -415,6 +432,11 @@ func (c *Config) validate() error {
 	}
 	if !validStandards[c.Defaults.Standard] {
 		return fmt.Errorf("defaults.standard: unknown standard %q", c.Defaults.Standard)
+	}
+	// Half-set viewports were previously clobbered back to the default
+	// silently; refuse them instead.
+	if (c.Defaults.Viewport.Width == 0) != (c.Defaults.Viewport.Height == 0) {
+		return fmt.Errorf("defaults.viewport: width and height must both be set")
 	}
 	// Silently ignoring an auth block would mean scanning a login redirect
 	// and passing — the worst failure mode for this tool. Refuse until auth

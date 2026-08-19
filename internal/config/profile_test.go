@@ -87,6 +87,69 @@ func TestProfileAutoNoopWithoutCIProfile(t *testing.T) {
 	}
 }
 
+func TestProfileCanRelaxEnforcement(t *testing.T) {
+	// Issue #10: a "local" profile under an enforcing base must be able to
+	// turn enforcement off; expect: {} replaces the contract wholesale.
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+defaults:
+  expect:
+    severity: serious
+profiles:
+  local:
+    defaults:
+      expect: {}
+tests:
+  - id: home
+    path: /
+`), "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Defaults.Expect.Enforcing() {
+		t.Errorf("local profile should relax to report-only, got %+v", cfg.Defaults.Expect)
+	}
+}
+
+func TestProfilePartialDefaultsKeepBase(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+defaults:
+  standard: section508
+  waitFor: "#app"
+profiles:
+  ci:
+    defaults:
+      waitFor: networkIdle
+tests:
+  - id: home
+    path: /
+`), "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Defaults.WaitFor != "networkIdle" || cfg.Defaults.Standard != "section508" {
+		t.Errorf("pointer overlay merge wrong: %+v", cfg.Defaults)
+	}
+}
+
+func TestHalfSetViewportRejected(t *testing.T) {
+	_, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://localhost:1
+defaults:
+  viewport: { height: 600 }
+tests:
+  - id: home
+    path: /
+`), "")
+	if err == nil {
+		t.Errorf("height-only viewport should be a config error, not silently clobbered")
+	}
+}
+
 func TestMaxViolationsOnlyImpliesSeriousFloor(t *testing.T) {
 	// An expect with only maxViolations would otherwise enforce vacuously:
 	// nothing would ever count against the limit.
