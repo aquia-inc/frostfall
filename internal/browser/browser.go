@@ -84,21 +84,43 @@ func (b *Browser) NewSession(url string, vp config.Viewport, waitFor string, set
 func (s *Session) Close() { s.page.CancelTimeout().Close() }
 
 func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
+	// For networkIdle readiness the idle monitor must subscribe BEFORE
+	// navigation: requests already in flight at the load event (an SPA's
+	// initial data fetches, streamed SSR chunks) are invisible to a monitor
+	// that subscribes afterwards, which lets a scan run against skeleton DOM.
+	var idle func()
+	if waitFor == "" || waitFor == "networkIdle" {
+		idle = s.page.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
+	}
 	if err := s.page.Navigate(url); err != nil {
 		return fmt.Errorf("navigating to %s: %w", url, err)
+	}
+	if idle != nil {
+		if err := s.page.WaitLoad(); err != nil {
+			return fmt.Errorf("waiting for load: %w", err)
+		}
+		idle()
+		if settle > 0 {
+			time.Sleep(settle)
+		}
+		return nil
 	}
 	return s.WaitReady(waitFor, settle)
 }
 
 // WaitReady applies the readiness strategy: networkIdle (no in-flight
-// requests for 500ms), load, or a CSS selector.
+// requests for 500ms), load, or a CSS selector. When called after an action
+// (a waitFor step), the idle monitor can only observe requests still open or
+// started after this call — page loads go through navigate, which subscribes
+// before navigation.
 func (s *Session) WaitReady(waitFor string, settle time.Duration) error {
 	switch waitFor {
 	case "", "networkIdle":
+		idle := s.page.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
 		if err := s.page.WaitLoad(); err != nil {
 			return fmt.Errorf("waiting for load: %w", err)
 		}
-		s.page.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)()
+		idle()
 	case "load":
 		if err := s.page.WaitLoad(); err != nil {
 			return fmt.Errorf("waiting for load: %w", err)

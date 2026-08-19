@@ -326,7 +326,9 @@ to test it locally or `--profile none` to suppress it in CI. Any other name
 (`staging`, `nightly`) is available via `--profile NAME`.
 
 A profile may override `server`, `defaults`, `baseline`, and `discover` -
-**never `tests`**. That restriction is the point: a second config file lets the
+**never `tests`**. Overrides work in both directions: a profile can add
+enforcement for CI, and a `local` profile under an enforcing base can relax
+back to report-only with `expect: {}`. That restriction is the point: a second config file lets the
 test list drift until CI silently covers less than local. With profiles, one
 test list serves every environment by construction. Precedence is base config,
 then profile, then command-line flags.
