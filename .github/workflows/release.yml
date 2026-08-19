@@ -61,10 +61,16 @@ jobs:
         id: semantic
         uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
         with:
+          # Majors pinned for compatibility with the semantic-release the
+          # action bundles (^25, whose release-notes-generator 14.x pins
+          # conventional-changelog-writer@^8): conventionalcommits@9 needs
+          # writer 9 and fails generateNotes with "Missing helper".
+          # Move conventionalcommits to @9 when the action ships
+          # release-notes-generator 15 (brings writer 9).
           extra_plugins: |
-            @semantic-release/changelog
-            @semantic-release/git
-            conventional-changelog-conventionalcommits
+            @semantic-release/changelog@6
+            @semantic-release/git@10
+            conventional-changelog-conventionalcommits@8
         env:
           GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
 
