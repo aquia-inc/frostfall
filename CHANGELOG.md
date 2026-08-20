@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.3.1](https://github.com/aquia-inc/frostfall/compare/v1.3.0...v1.3.1) (2026-08-20)
+
+### Bug Fixes
+
+* add a screenshots opt-out and upload CI scan evidence ([#47](https://github.com/aquia-inc/frostfall/issues/47)) ([a99f3f4](https://github.com/aquia-inc/frostfall/commit/a99f3f4700bebeeb047324d5881aa138c07ee1cb))
+
 ## [1.3.0](https://github.com/aquia-inc/frostfall/compare/v1.2.0...v1.3.0) (2026-08-20)
 
 ### Features
