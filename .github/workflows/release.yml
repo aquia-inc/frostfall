@@ -91,6 +91,21 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # goreleaser needs write access to BOTH repos: release assets on
+      # frostfall and the formula push to homebrew-frostfall. The default
+      # GITHUB_TOKEN is scoped to this repo only, so mint an app token
+      # covering both (the app is installed on both).
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SEMANTIC_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_APP_PRIVATE_KEY }}
+          owner: aquia-inc
+          repositories: |
+            frostfall
+            homebrew-frostfall
+
       # release.mode keep-existing in .goreleaser.yaml attaches binaries to
       # the release semantic-release created, preserving its notes.
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
@@ -99,7 +114,7 @@ jobs:
           version: "~> v2"
           args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Move major version tag
         # Users pin @v1; the major tag follows every release under its major.
