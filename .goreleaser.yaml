@@ -33,6 +33,24 @@ archives:
 release:
   mode: keep-existing
 
+# Container image: the binary plus a pinned Chromium, for CI users who prefer
+# docker run over a binary install. The source label ties the ghcr package to
+# this repo so it inherits repo visibility.
+dockers:
+  - image_templates:
+      - ghcr.io/aquia-inc/frostfall:{{ .Version }}
+      - ghcr.io/aquia-inc/frostfall:v{{ .Major }}
+      - ghcr.io/aquia-inc/frostfall:latest
+    dockerfile: Dockerfile
+    goos: linux
+    goarch: amd64
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.source=https://github.com/aquia-inc/frostfall
+      - --label=org.opencontainers.image.description=Accessibility testing for rendered web apps
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+      - --label=org.opencontainers.image.version={{ .Version }}
+
 brews:
   - repository:
       owner: aquia-inc

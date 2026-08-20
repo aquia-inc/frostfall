@@ -77,6 +77,14 @@ go install github.com/aquia-inc/frostfall/cmd/frostfall@latest
 
 Or download a release binary from the [releases page](https://github.com/aquia-inc/frostfall/releases).
 
+Docker (the image bundles a pinned Chromium, so nothing else is needed):
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/aquia-inc/frostfall:v1 --serve dist
+# attach mode against a server on your host needs host networking:
+docker run --rm --network host -v "$PWD:/work" ghcr.io/aquia-inc/frostfall:v1 --base-url http://localhost:5173
+```
+
 Frostfall needs a Chrome or Chromium. It finds your system install automatically
 (GitHub Actions runners have one preinstalled); if none exists it downloads a
 managed Chromium on first run. Override with `--browser-path`.
