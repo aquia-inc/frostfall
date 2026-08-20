@@ -420,7 +420,7 @@ embeds a different axe version, Frostfall warns instead of reporting phantom
 
 ```yaml
 - uses: aquia-inc/frostfall@v1
-  id: a11y
+  id: frostfall
   with:
     serve: ./dist
     baseline: .frostfall-baseline.json
@@ -438,8 +438,8 @@ The action writes the HTML report by default and exposes job outputs
 `tests-run`, `report-file`) so downstream steps can gate:
 
 ```yaml
-- if: steps.a11y.outputs.new-violations != '0'
-  run: echo "::warning::${{ steps.a11y.outputs.new-violations }} new a11y violations"
+- if: steps.frostfall.outputs.new-violations != '0'
+  run: echo "::warning::${{ steps.frostfall.outputs.new-violations }} new accessibility violations"
 ```
 
 For code scanning alerts, run a second step with `format: sarif` and upload:
@@ -508,7 +508,7 @@ are warnings - they never break the scan.
 Where the others are ahead: pa11y has a decade of production use, a dashboard
 project, and HTML_CodeSniffer's per-WCAG-criterion output that some auditors
 prefer; Lighthouse CI tracks performance and SEO alongside accessibility and
-has first-class score budgets. If your need is a performance-plus-a11y score
+has first-class score budgets. If your need is a performance-plus-accessibility score
 trend, run Lighthouse CI next to Frostfall - the tools coexist cleanly.
 Both run axe-core; Lighthouse enables a curated subset of its rules (including
 some best-practice rules), while Frostfall runs the full ruleset for the WCAG
@@ -517,7 +517,7 @@ standard you configure, with per-rule control on top.
 ## What this does and doesn't cover
 
 Frostfall automates the automatable part of accessibility conformance. axe-core
-is the same engine behind Lighthouse's accessibility score and most a11y tooling,
+is the same engine behind Lighthouse's accessibility score and most accessibility tooling,
 and running it against real rendered states - including keyboard-driven ones -
 catches far more than static analysis. But no automated tool verifies that alt
 text is meaningful, that a screen reader announces things sensibly, or that a
