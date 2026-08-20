@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.3.0](https://github.com/aquia-inc/frostfall/compare/v1.2.0...v1.3.0) (2026-08-20)
+
+### Features
+
+* publish container image to ghcr on release ([#40](https://github.com/aquia-inc/frostfall/issues/40)) ([2376796](https://github.com/aquia-inc/frostfall/commit/23767961df2310ad52ce4aac9dbdab8ae70dd32b)), closes [#25](https://github.com/aquia-inc/frostfall/issues/25)
+
 ## [1.2.0](https://github.com/aquia-inc/frostfall/compare/v1.1.3...v1.2.0) (2026-08-20)
 
 ### Features
