@@ -57,6 +57,7 @@ func run(args []string) int {
 		pathFilter     = fs.String("path", "", "filter tests by path (Go regex)")
 		browserPath    = fs.String("browser-path", "", "Chrome/Chromium binary to use")
 		screenshots    = fs.Bool("screenshots", false, "capture element screenshots of new violations")
+		noScreenshots  = fs.Bool("no-screenshots", false, "disable screenshots even where they default on (CI)")
 		screenshotDir  = fs.String("screenshot-dir", "frostfall-artifacts", "directory for violation screenshots")
 		verbose        = fs.Bool("verbose", false, "per-step logging")
 		showVersion    = fs.Bool("version", false, "print version and exit")
@@ -171,10 +172,11 @@ func run(args []string) int {
 	}
 	defer b.Close()
 
-	// Screenshots default on in CI (evidence artifacts), off locally (speed);
-	// the flag forces them on either way.
+	// Screenshots default on in CI (evidence artifacts), off locally (speed).
+	// --screenshots forces on, --no-screenshots wins over everything: the CI
+	// default previously had no opt-out at all.
 	shotDir := ""
-	if *screenshots || os.Getenv("GITHUB_ACTIONS") == "true" {
+	if (*screenshots || os.Getenv("GITHUB_ACTIONS") == "true") && !*noScreenshots {
 		shotDir = *screenshotDir
 	}
 	r := &runner.Runner{
