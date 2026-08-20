@@ -31,6 +31,6 @@ are in scope for reports:
 - The GitHub issue-filing client mishandling tokens
 
 Scanning a malicious page with Frostfall runs that page's JavaScript in the
-sandboxed browser, exactly as visiting it would; that alone is not a
-vulnerability, but a malicious page escaping into the frostfall process or the
-filesystem would be.
+browser, exactly as visiting it would (note that the browser may run without
+its OS sandbox in containerized CI); that alone is not a vulnerability, but a
+malicious page escaping into the frostfall process or the filesystem would be.

@@ -486,7 +486,7 @@ are warnings - they never break the scan.
 | | Frostfall | pa11y / pa11y-ci | Lighthouse CI | axe CLI |
 |---|---|---|---|---|
 | Engine | axe-core | HTML_CodeSniffer (axe optional) | axe-core (curated subset) | axe-core |
-| Runtime | single Go binary | Node + Puppeteer Chromium download | Node + Chrome | Node + WebDriver |
+| Runtime | Go binary + system Chrome (managed download fallback) | Node + Puppeteer Chromium download | Node + Chrome | Node + WebDriver |
 | Interaction states | steps with labeled, scoped scans per journey | per-URL action scripts, one scan per URL | none (page load only) | none |
 | Regression model | fingerprint baseline: grandfather existing, fail on new, prune fixed | threshold counts | score budgets | none |
 | SPA discovery | hash-router aware crawl, route-shape dedup | none | none | none |
@@ -497,9 +497,10 @@ Where the others are ahead: pa11y has a decade of production use, a dashboard
 project, and HTML_CodeSniffer's per-WCAG-criterion output that some auditors
 prefer; Lighthouse CI tracks performance and SEO alongside accessibility and
 has first-class score budgets. If your need is a performance-plus-a11y score
-trend, run Lighthouse CI next to Frostfall - the tools coexist cleanly, and
-Frostfall's accessibility coverage is a strict superset of Lighthouse's
-(which runs a curated subset of the same engine).
+trend, run Lighthouse CI next to Frostfall - the tools coexist cleanly.
+Both run axe-core; Lighthouse enables a curated subset of its rules (including
+some best-practice rules), while Frostfall runs the full ruleset for the WCAG
+standard you configure, with per-rule control on top.
 
 ## What this does and doesn't cover
 
