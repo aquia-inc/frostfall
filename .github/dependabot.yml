@@ -1,6 +1,9 @@
 # Dependency update automation. Commit-message prefixes are chosen to fit the
-# conventional-commit release rules: Go module bumps ship in the binary, so
-# they release a patch (fix); action pins and the Docker base do not release.
+# conventional-commit release rules: Go module bumps ship in the binary and
+# Docker base bumps ship in the image (usually security-motivated), so both
+# release a patch (fix); action pins do not release. Not covered here: the
+# semantic-release extra_plugins pins in release.yml (npm packages with no
+# manifest) - those stay a manual watch, see the comment there.
 version: 2
 updates:
   - package-ecosystem: "gomod"
@@ -30,5 +33,8 @@ updates:
     schedule:
       interval: "weekly"
     commit-message:
-      prefix: "chore"
+      prefix: "fix"
       include: "scope"
+    groups:
+      docker-base:
+        patterns: ["*"]
