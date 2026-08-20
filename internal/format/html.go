@@ -6,11 +6,22 @@ import (
 	"html/template"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/runner"
 )
+
+// rowShapeRe strips the per-instance parts of a selector for report-row
+// grouping: quoted numbers in attribute values (data-rowindex="7") and
+// :nth-child indexes. Deliberately conservative - only digits in those two
+// positions - so unrelated selectors do not merge.
+var rowShapeRe = regexp.MustCompile(`"(\d+)"|:nth-child\(\d+\)`)
+
+func rowShape(target string) string {
+	return rowShapeRe.ReplaceAllString(target, "#")
+}
 
 // logoPNG is a downscaled copy of assets/frostfall_no_bg_logo.png, embedded
 // so the HTML report is self-contained anywhere the binary runs.
@@ -44,6 +55,11 @@ type htmlRow struct {
 	Baselined  bool
 	Failing    bool
 	Screenshot template.URL // data: URI, empty when no capture
+	// MoreTargets holds the selectors of same-shaped sibling violations
+	// collapsed into this row (a data grid failing one rule on every row is
+	// one bug, not N table rows). Presentation only - counts and fingerprints
+	// stay per-violation, and the screenshot shown is the first member's.
+	MoreTargets []string
 }
 
 type htmlReport struct {
@@ -81,7 +97,22 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result
 		return results[i].Impact > results[j].Impact
 	})
 
+	// Same-shaped violations of one rule on one page collapse into a single
+	// row with an expandable element list.
+	rowIndex := map[string]int{}
 	for _, res := range results {
+		if res.Baselined {
+			rep.Baselined++
+		} else if flagged(res) {
+			rep.NewCount++
+		}
+		key := res.RuleID + "\x00" + res.TestID + "\x00" + res.ScanLabel + "\x00" +
+			boolKey(res.Baselined) + "\x00" + rowShape(res.StableTarget)
+		if i, ok := rowIndex[key]; ok {
+			rep.Rows[i].MoreTargets = append(rep.Rows[i].MoreTargets, res.StableTarget)
+			rep.Rows[i].Failing = rep.Rows[i].Failing || flagged(res)
+			continue
+		}
 		row := htmlRow{
 			Impact:    res.Impact.String(),
 			Rule:      res.RuleID,
@@ -93,20 +124,23 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result
 			Baselined: res.Baselined,
 			Failing:   flagged(res),
 		}
-		if res.Baselined {
-			rep.Baselined++
-		} else if row.Failing {
-			rep.NewCount++
-		}
 		if res.ScreenshotPath != "" {
 			if raw, err := os.ReadFile(res.ScreenshotPath); err == nil {
 				row.Screenshot = template.URL("data:image/png;base64," + base64.StdEncoding.EncodeToString(raw))
 			}
 		}
+		rowIndex[key] = len(rep.Rows)
 		rep.Rows = append(rep.Rows, row)
 	}
 
 	return htmlTmpl.Execute(w, rep)
+}
+
+func boolKey(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
 
 var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
@@ -163,6 +197,7 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   .shot img { max-width: 180px; max-height: 110px; border: 1px solid #e2e8f2;
               border-radius: 4px; display: block; }
   .shot a { font-size: .75rem; color: #8a97ab; }
+  details.more summary { cursor: pointer; font-size: .78rem; color: #1f5eff; margin-top: .3rem; }
   footer { margin-top: 3rem; font-size: .8rem; color: #8a97ab; }
   @media print { body { background: #fff; } tr { break-inside: avoid; } }
 </style>
@@ -214,7 +249,10 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
           <span class="desc">{{.Summary}}</span>
         </td>
         <td class="page">{{.Test}}<span class="scan">{{.Scan}}</span></td>
-        <td><span class="target">{{.Target}}</span></td>
+        <td><span class="target">{{.Target}}</span>
+          {{if .MoreTargets}}<details class="more"><summary>+{{len .MoreTargets}} more like this</summary>
+            {{range .MoreTargets}}<span class="target">{{.}}</span><br>{{end}}
+          </details>{{end}}</td>
         <td class="shot">{{if .Screenshot}}<img src="{{.Screenshot}}" alt="Screenshot of the element violating {{.Rule}}">{{else}}—{{end}}</td>
       </tr>
       {{end}}

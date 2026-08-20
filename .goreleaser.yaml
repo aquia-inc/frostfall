@@ -40,6 +40,8 @@ brews:
     homepage: https://github.com/aquia-inc/frostfall
     description: "Accessibility testing made easy"
     license: Apache-2.0
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/frostfall --version")
 
 checksum:
   name_template: checksums.txt
