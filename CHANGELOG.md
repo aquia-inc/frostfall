@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.4.0](https://github.com/aquia-inc/frostfall/compare/v1.3.1...v1.4.0) (2026-08-20)
+
+### Features
+
+* show WCAG criterion and Section 508 provision ids on findings ([#48](https://github.com/aquia-inc/frostfall/issues/48)) ([6eb1e64](https://github.com/aquia-inc/frostfall/commit/6eb1e64d831ad66dfbb7ddeeb53dc3f3ced66cc5)), closes [#41](https://github.com/aquia-inc/frostfall/issues/41)
+
 ## [1.3.1](https://github.com/aquia-inc/frostfall/compare/v1.3.0...v1.3.1) (2026-08-20)
 
 ### Bug Fixes
