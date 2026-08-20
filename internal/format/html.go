@@ -58,7 +58,7 @@ type htmlRow struct {
 	// MoreTargets holds the selectors of same-shaped sibling violations
 	// collapsed into this row (a data grid failing one rule on every row is
 	// one bug, not N table rows). Presentation only - counts and fingerprints
-	// stay per-violation.
+	// stay per-violation, and the screenshot shown is the first member's.
 	MoreTargets []string
 }
 
@@ -107,7 +107,7 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result
 			rep.NewCount++
 		}
 		key := res.RuleID + "\x00" + res.TestID + "\x00" + res.ScanLabel + "\x00" +
-			boolKey(res.Baselined) + rowShape(res.StableTarget)
+			boolKey(res.Baselined) + "\x00" + rowShape(res.StableTarget)
 		if i, ok := rowIndex[key]; ok {
 			rep.Rows[i].MoreTargets = append(rep.Rows[i].MoreTargets, res.StableTarget)
 			rep.Rows[i].Failing = rep.Rows[i].Failing || flagged(res)
