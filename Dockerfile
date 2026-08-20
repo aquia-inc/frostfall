@@ -9,7 +9,7 @@
 
 FROM alpine:3.22
 
-# Renovate keeps this base current; chromium is pinned to the distro release.
+# Dependabot keeps this base current; chromium is pinned to the distro release.
 RUN apk add --no-cache \
     chromium \
     ca-certificates \
