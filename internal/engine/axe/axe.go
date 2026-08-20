@@ -61,11 +61,12 @@ func standardTags(standard string) []string {
 // axeResult mirrors the subset of axe.run() output we consume.
 type axeResult struct {
 	Violations []struct {
-		ID          string `json:"id"`
-		Impact      string `json:"impact"`
-		Description string `json:"description"`
-		Help        string `json:"help"`
-		HelpURL     string `json:"helpUrl"`
+		ID          string   `json:"id"`
+		Impact      string   `json:"impact"`
+		Description string   `json:"description"`
+		Help        string   `json:"help"`
+		HelpURL     string   `json:"helpUrl"`
+		Tags        []string `json:"tags"`
 		Nodes       []struct {
 			Target []json.RawMessage `json:"target"`
 			HTML   string            `json:"html"`
@@ -125,6 +126,7 @@ func (e *Engine) Audit(ctx context.Context, page engine.Page, opts engine.ScanOp
 				Help:    v.Help,
 				HelpURL: v.HelpURL,
 				HTML:    n.HTML,
+				Tags:    v.Tags,
 			})
 		}
 	}

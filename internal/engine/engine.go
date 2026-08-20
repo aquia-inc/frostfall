@@ -62,6 +62,9 @@ type Violation struct {
 	HelpURL string
 	// HTML is the offending node snippet, for reports only. Never fingerprinted.
 	HTML string
+	// Tags are the engine's rule tags (axe: wcag143, section508, cat.aria),
+	// used to derive WCAG/508 criterion ids for reports. Never fingerprinted.
+	Tags []string
 }
 
 // Page is the minimal browser surface an engine needs, implemented by the
