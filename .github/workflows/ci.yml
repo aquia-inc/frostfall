@@ -42,3 +42,13 @@ jobs:
             echo "expected exit 1 (violations found), got $code"
             exit 1
           fi
+
+      - name: Upload fixture scan evidence
+        # Screenshots auto-capture in Actions; without this they evaporated
+        # with the runner. Evidence is most useful when the scan misbehaves.
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fixture-scan-evidence
+          path: frostfall-artifacts/
+          if-no-files-found: ignore
