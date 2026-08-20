@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/runner"
+	"github.com/aquia-inc/frostfall/internal/wcag"
 )
 
 // rowShapeRe strips the per-instance parts of a selector for report-row
@@ -45,8 +46,11 @@ type RunMeta struct {
 }
 
 type htmlRow struct {
-	Impact     string
-	Rule       string
+	Impact string
+	Rule   string
+	// Criteria is the WCAG/508 compliance id line ("WCAG 1.4.3 Contrast
+	// (Minimum) (AA) - Section 508"), empty for best-practice rules.
+	Criteria   string
 	Test       string
 	Scan       string
 	Summary    string
@@ -116,6 +120,7 @@ func HTML(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Result
 		row := htmlRow{
 			Impact:    res.Impact.String(),
 			Rule:      res.RuleID,
+			Criteria:  wcag.Label(res.Tags),
 			Test:      res.TestID,
 			Scan:      res.ScanLabel,
 			Summary:   res.Summary,
@@ -190,6 +195,8 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
             font-size: .85rem; color: #1f5eff; text-decoration: none; }
   .rule a:hover { text-decoration: underline; }
   .rule .desc { display: block; color: #5a6b85; font-size: .8rem; max-width: 34ch; }
+  .rule .criteria { display: block; color: #1a5c2e; font-size: .76rem; font-weight: 600;
+                    margin-top: .25rem; max-width: 34ch; }
   .page { white-space: nowrap; }
   .page .scan { display: block; color: #8a97ab; font-size: .78rem; }
   .target { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem;
@@ -247,6 +254,7 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
         <td class="rule">
           {{if .HelpURL}}<a href="{{.HelpURL}}" title="How to fix">{{.Rule}}</a>{{else}}{{.Rule}}{{end}}
           <span class="desc">{{.Summary}}</span>
+          {{if .Criteria}}<span class="criteria">{{.Criteria}}</span>{{end}}
         </td>
         <td class="page">{{.Test}}<span class="scan">{{.Scan}}</span></td>
         <td><span class="target">{{.Target}}</span>

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/runner"
+	"github.com/aquia-inc/frostfall/internal/wcag"
 )
 
 // Styles render via lipgloss, which detects terminal capability per writer:
@@ -82,6 +83,9 @@ func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, label 
 				newTotal++
 			}
 			fmt.Fprintf(w, "  %s%s %s\n", marker, badge(res.Impact), res.RuleID)
+			if label := wcag.Label(res.Tags); label != "" {
+				fmt.Fprintf(w, "      %s\n", styleGood.Render(label))
+			}
 			fmt.Fprintf(w, "      %s\n", styleSummary.Render(res.Summary))
 			fmt.Fprintf(w, "      %s %s\n", styleMeta.Render("at"), styleTarget.Render(res.StableTarget))
 			if res.HelpURL != "" {
