@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.2.0](https://github.com/aquia-inc/frostfall/compare/v1.1.3...v1.2.0) (2026-08-20)
+
+### Features
+
+* collapse same-shaped violation rows in the HTML report ([#39](https://github.com/aquia-inc/frostfall/issues/39)) ([54ac924](https://github.com/aquia-inc/frostfall/commit/54ac9247f588cd11caf0ed0100a2c695188f3ab4)), closes [#20](https://github.com/aquia-inc/frostfall/issues/20)
+
 ## [1.1.3](https://github.com/aquia-inc/frostfall/compare/v1.1.2...v1.1.3) (2026-08-20)
 
 ### Bug Fixes
