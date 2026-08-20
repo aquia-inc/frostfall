@@ -77,6 +77,18 @@ go install github.com/aquia-inc/frostfall/cmd/frostfall@latest
 
 Or download a release binary from the [releases page](https://github.com/aquia-inc/frostfall/releases).
 
+Docker (the image bundles a pinned Chromium, so nothing else is needed).
+Pass your uid so reports, screenshots, and baselines are writable on the
+bind mount (the image's own user cannot write host-owned directories):
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" \
+  ghcr.io/aquia-inc/frostfall:v1 --serve dist --format html
+# attach mode against a server on your host needs host networking:
+docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" \
+  ghcr.io/aquia-inc/frostfall:v1 --base-url http://localhost:5173
+```
+
 Frostfall needs a Chrome or Chromium. It finds your system install automatically
 (GitHub Actions runners have one preinstalled); if none exists it downloads a
 managed Chromium on first run. Override with `--browser-path`.
@@ -512,6 +524,18 @@ text is meaningful, that a screen reader announces things sensibly, or that a
 human can actually complete your flows with assistive technology. Use Frostfall
 to catch regressions continuously; keep manual testing for what it's uniquely
 good at.
+
+## About Aquia
+
+Frostfall is built and maintained by [Aquia](https://www.aquia.us), a
+service-disabled Veteran-owned small business (SDVOSB) that has worked on
+security and modernization for federal agencies and state governments since
+2021. Accessibility is a daily reality in that mission space: Frostfall grew
+out of Section 508 compliance work on production federal systems - the same
+team that turned CISA's zero trust maturity model into a working scoring
+application for the Department of Health and Human Services - and its sibling
+tool [Emberfall](https://github.com/aquia-inc/emberfall) covers the API side
+of the same testing story.
 
 ## License
 
