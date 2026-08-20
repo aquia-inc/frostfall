@@ -15,13 +15,21 @@ RUN apk add --no-cache \
     ca-certificates \
     ttf-freefont \
     font-noto-emoji \
-    tzdata
+    tzdata \
+ && { [ -x /usr/bin/chromium-browser ] || ln -s /usr/bin/chromium /usr/bin/chromium-browser; }
 
 # Run as non-root: chromium refuses some operations as uid 0, and scans have
 # no reason to write outside the workdir.
 RUN addgroup -S frostfall && adduser -S -G frostfall frostfall
 USER frostfall
 WORKDIR /work
+
+# Chromium (crashpad) requires writable HOME/XDG dirs. /tmp keeps the image
+# usable under docker run --user with arbitrary uids (bind-mount ownership
+# passthrough), which the README documents for writable output.
+ENV HOME=/tmp \
+    XDG_CONFIG_HOME=/tmp \
+    XDG_CACHE_HOME=/tmp
 
 COPY frostfall /usr/local/bin/frostfall
 

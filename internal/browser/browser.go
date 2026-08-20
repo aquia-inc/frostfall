@@ -24,7 +24,10 @@ type Browser struct {
 // Launch finds a system Chrome (GitHub runners and most dev machines have
 // one) or lets rod's launcher download a managed Chromium, then connects.
 func Launch(browserPath string) (*Browser, error) {
-	l := launcher.New().Headless(true)
+	// disable-dev-shm-usage: containers default /dev/shm to 64MB and Chromium
+	// crashes tabs when it fills on large pages; writing shared memory to
+	// /tmp instead is the standard CI mitigation and harmless elsewhere.
+	l := launcher.New().Headless(true).Set("disable-dev-shm-usage")
 	if browserPath != "" {
 		l = l.Bin(browserPath)
 	} else if path, ok := launcher.LookPath(); ok {

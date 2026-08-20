@@ -40,7 +40,7 @@ dockers:
   - image_templates:
       - ghcr.io/aquia-inc/frostfall:{{ .Version }}
       - ghcr.io/aquia-inc/frostfall:v{{ .Major }}
-      - ghcr.io/aquia-inc/frostfall:latest
+      - "{{ if not .Prerelease }}ghcr.io/aquia-inc/frostfall:latest{{ end }}"
     dockerfile: Dockerfile
     goos: linux
     goarch: amd64
