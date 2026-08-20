@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.1.3](https://github.com/aquia-inc/frostfall/compare/v1.1.2...v1.1.3) (2026-08-20)
+
+### Bug Fixes
+
+* satisfy Marketplace validation for action name and description ([#37](https://github.com/aquia-inc/frostfall/issues/37)) ([ba16399](https://github.com/aquia-inc/frostfall/commit/ba1639979bfc58782d889cb8fd51149e951c5bc2))
+
 ## [1.1.2](https://github.com/aquia-inc/frostfall/compare/v1.1.1...v1.1.2) (2026-08-20)
 
 ## [1.1.1](https://github.com/aquia-inc/frostfall/compare/v1.1.0...v1.1.1) (2026-08-19)
