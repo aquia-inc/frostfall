@@ -1,5 +1,8 @@
-name: Frostfall
-description: Accessibility testing for rendered web apps. Scans real DOM with axe-core, baselines existing debt, fails only on new violations.
+# The Marketplace listing name must be globally unique (bare "Frostfall"
+# collides with an existing account name); the repo and binary keep the
+# short name.
+name: Frostfall Accessibility Testing
+description: Accessibility testing for rendered web apps. axe-core scans with baselines, so only new violations fail the build.
 author: Aquia
 
 branding:
