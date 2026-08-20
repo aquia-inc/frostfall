@@ -7,7 +7,7 @@
 # --no-sandbox automatically when it detects a container, so no wrapper or
 # env vars are required.
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 # Renovate keeps this base current; chromium is pinned to the distro release.
 RUN apk add --no-cache \
