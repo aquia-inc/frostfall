@@ -22,7 +22,7 @@ func TestFromTags(t *testing.T) {
 
 func TestLabel(t *testing.T) {
 	got := Label([]string{"wcag2a", "wcag412", "section508", "section508.22.a"})
-	want := "WCAG 4.1.2 Name, Role, Value (A) · Section 508 1194.22(a)"
+	want := "4.1.2 Name, Role, Value (WCAG 2.0 A) · Section 508 1194.22(a)"
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
 	}

@@ -121,6 +121,8 @@ func FromTags(tags []string) (criteria []Criterion, s508 []string, section508 bo
 			continue
 		}
 		num := m[1] + "." + m[2] + "." + m[3]
+		// A miss here is deliberate: axe also emits AAA criterion tags
+		// (wcag146, wcag213, ...) that the A/AA table intentionally omits.
 		if c, ok := table[num]; ok {
 			criteria = append(criteria, c)
 		}
@@ -133,17 +135,17 @@ func FromTags(tags []string) (criteria []Criterion, s508 []string, section508 bo
 // when a rule maps to no criterion (best-practice rules).
 func Label(tags []string) string {
 	criteria, provisions, s508 := FromTags(tags)
+	// Render through String() so the introducing WCAG version is visible:
+	// Section 508 incorporates WCAG 2.0 A/AA, so a 2.1-introduced criterion
+	// on a 508 report is only legible if the version shows.
 	var parts []string
 	for _, c := range criteria {
-		parts = append(parts, c.Number+" "+c.Name+" ("+c.Level+")")
+		parts = append(parts, c.String())
 	}
 	if len(parts) == 0 && !s508 {
 		return ""
 	}
-	var out string
-	if len(parts) > 0 {
-		out = "WCAG " + strings.Join(parts, "; ")
-	}
+	out := strings.Join(parts, "; ")
 	if s508 {
 		if out != "" {
 			out += " · "

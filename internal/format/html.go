@@ -48,8 +48,8 @@ type RunMeta struct {
 type htmlRow struct {
 	Impact string
 	Rule   string
-	// Criteria is the WCAG/508 compliance id line ("WCAG 1.4.3 Contrast
-	// (Minimum) (AA) - Section 508"), empty for best-practice rules.
+	// Criteria is the WCAG/508 compliance id line ("1.4.3 Contrast (Minimum)
+	// (WCAG 2.0 AA) · Section 508 1194.22(i)"), empty for best-practice rules.
 	Criteria   string
 	Test       string
 	Scan       string
