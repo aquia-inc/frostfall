@@ -22,11 +22,24 @@ func TestFromTags(t *testing.T) {
 
 func TestLabel(t *testing.T) {
 	got := Label([]string{"wcag2a", "wcag412", "section508", "section508.22.a"})
-	want := "4.1.2 Name, Role, Value (WCAG 2.0 A) · Section 508 1194.22(a)"
+	want := "4.1.2 Name, Role, Value (WCAG 2.0 A) · Section 508 (E205.4; 1194.22(a))"
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
 	if Label([]string{"best-practice", "cat.aria"}) != "" {
 		t.Errorf("best-practice rules should have no label")
+	}
+	// WCAG 2.0 criteria are 508 requirements by incorporation even without a
+	// legacy axe provision tag (e.g. aria-required-children, color-contrast).
+	got = Label([]string{"cat.aria", "wcag2a", "wcag131"})
+	want = "1.3.1 Info and Relationships (WCAG 2.0 A) · Section 508 (E205.4)"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+	// A 2.1-only criterion is NOT a 508 requirement; no 508 suffix.
+	got = Label([]string{"wcag21aa", "wcag1411"})
+	want = "1.4.11 Non-text Contrast (WCAG 2.1 AA)"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
 	}
 }
