@@ -146,14 +146,28 @@ func Label(tags []string) string {
 		return ""
 	}
 	out := strings.Join(parts, "; ")
-	if s508 {
+
+	// The Revised Section 508 (2017) incorporates WCAG 2.0 A/AA wholesale
+	// (E205.4), so any 2.0-level criterion IS a 508 requirement even when
+	// axe carries no legacy provision tag - axe only tags rules that mapped
+	// to the original 1194.22 paragraphs, which had no equivalent for much
+	// of WCAG (color contrast, ARIA structure, ...).
+	incorporated := false
+	for _, c := range criteria {
+		if c.Version == "2.0" {
+			incorporated = true
+			break
+		}
+	}
+	if s508 || incorporated {
 		if out != "" {
 			out += " · "
 		}
-		out += "Section 508"
+		out += "Section 508 (E205.4"
 		if len(provisions) > 0 {
-			out += " " + strings.Join(provisions, ", ")
+			out += "; " + strings.Join(provisions, ", ")
 		}
+		out += ")"
 	}
 	return out
 }
