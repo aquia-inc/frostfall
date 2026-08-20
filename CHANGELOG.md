@@ -2,6 +2,8 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.4.2](https://github.com/aquia-inc/frostfall/compare/v1.4.1...v1.4.2) (2026-08-20)
+
 ## [1.4.1](https://github.com/aquia-inc/frostfall/compare/v1.4.0...v1.4.1) (2026-08-20)
 
 ### Bug Fixes
