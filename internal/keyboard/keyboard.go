@@ -500,15 +500,11 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) er
 	return nil
 }
 
-// reenter brings focus back into the page if the audit left it in the
-// browser UI (a page with no tab stops, a lap that ended off the page).
-// It asks whether the document has focus, not whether an element does: on a
-// page with no tab stops the document itself takes focus, with <body> active.
+// reenter gives the page focus back if the audit left it in the browser UI
+// (a page with no tab stops, a lap that ended off the page). Tab cannot be
+// relied on to do it: on Linux Chrome a page with no tab stops never gets
+// focus back from Tab, and CDP's Target.activateTarget does not restore it
+// either; window.focus() does on every platform.
 func (a *audit) reenter() {
-	for range 2 {
-		raw, err := a.page.Eval(`() => document.hasFocus()`)
-		if err != nil || string(raw) == "true" || a.page.PressTab() != nil {
-			return
-		}
-	}
+	a.page.Eval(`() => { if (!document.hasFocus()) window.focus() }`)
 }
