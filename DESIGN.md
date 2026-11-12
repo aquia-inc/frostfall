@@ -220,6 +220,7 @@ Deliberately small — enough to reach a state, not to write E2E suites:
 | `wait: 500ms` | fixed sleep, escape hatch of last resort |
 | `scan: {…}` | run the engine now; `label`, `scope`, `rules` as above; `scan` bare = all defaults |
 | `goto: /path` | client-side-relevant fresh navigation mid-test |
+| `keyboard: {…}` | press Tab through the page and report keyboard failures under `frostfall/` rule ids; `label`, `scope`, `maxTabs`, `rules`. A test-level `keyboard: true` audits the initial state. Additive: findings are `engine.Violation`s, so fingerprints, baselines, and formats are unchanged |
 
 Any step failure (selector never appears within the test timeout, click on detached node) fails the
 test with exit 3 semantics — it's an environment/spec failure, not a violation.
@@ -480,3 +481,5 @@ and real changes that must.
 - Strict result mode paralleling Emberfall's planned strict JSON matching
 - Multi-viewport sweeps (mobile breakpoint scans from one test definition)
 - Screen-reader-tree assertions (accessible name/role expectations per selector)
+- Keyboard audit: focus returning to a dialog's trigger on close (needs the
+  focus assertions above)

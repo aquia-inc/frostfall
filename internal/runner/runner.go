@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/config"
 	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/fingerprint"
+	"github.com/aquia-inc/frostfall/internal/keyboard"
 )
 
 // Result is one classified violation.
@@ -151,8 +153,31 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		scanned = true
 		results = append(results, res...)
 	}
+	// After the initial scan: the audit leaves focus where it found it, but
+	// the Tab presses can still fire focus handlers that change the DOM.
+	if k := t.Keyboard; k != nil && !k.Off {
+		res, err := r.keyboard(ctx, session, t, url, "initial", *k)
+		if err != nil {
+			return nil, false, err
+		}
+		scanned = true
+		results = append(results, res...)
+	}
 
 	for i, step := range t.Steps {
+		if k := step.Keyboard; k != nil {
+			label := k.Label
+			if label == "" {
+				label = "step-" + strconv.Itoa(i)
+			}
+			res, err := r.keyboard(ctx, session, t, url, label, *k)
+			if err != nil {
+				return nil, false, err
+			}
+			scanned = true
+			results = append(results, res...)
+			continue
+		}
 		if step.Scan != nil {
 			label := step.Scan.Label
 			if label == "" {
@@ -174,11 +199,36 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	return results, scanned, nil
 }
 
-func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Test, url, label string, s config.ScanStep) ([]Result, error) {
+// mergeRules layers rule toggles (defaults, then test, then step) and keeps
+// only the keyboard rules or only the engine's: axe rejects ids it does not
+// know, so frostfall/ toggles must never reach it.
+func mergeRules(kb bool, layers ...map[string]bool) map[string]bool {
 	rules := map[string]bool{}
-	maps.Copy(rules, r.Config.Defaults.Rules)
-	maps.Copy(rules, t.Rules)
-	maps.Copy(rules, s.Rules)
+	for _, l := range layers {
+		maps.Copy(rules, l)
+	}
+	maps.DeleteFunc(rules, func(id string, _ bool) bool { return keyboard.IsRule(id) != kb })
+	return rules
+}
+
+func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t config.Test, url, label string, k config.KeyboardStep) ([]Result, error) {
+	r.logf("test %s: keyboard audit (%s)", t.ID, label)
+	violations, err := keyboard.Audit(ctx, session, keyboard.Options{
+		Scope:   k.Scope,
+		MaxTabs: k.MaxTabs,
+		Rules:   mergeRules(true, r.Config.Defaults.Rules, t.Rules, k.Rules),
+	})
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("keyboard audit %q: %w (an audit presses Tab through every stop on the page, ~150ms each; raise the timeout for this test)", label, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("keyboard audit %q: %w", label, err)
+	}
+	return r.results(session, t, url, label, violations), nil
+}
+
+func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Test, url, label string, s config.ScanStep) ([]Result, error) {
+	rules := mergeRules(false, r.Config.Defaults.Rules, t.Rules, s.Rules)
 
 	r.logf("test %s: scanning (%s)", t.ID, label)
 	violations, err := r.Engine.Audit(ctx, session, engine.ScanOptions{
@@ -189,7 +239,11 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	if err != nil {
 		return nil, fmt.Errorf("scan %q: %w", label, err)
 	}
+	return r.results(session, t, url, label, violations), nil
+}
 
+// results fingerprints one scan point's violations and captures evidence.
+func (r *Runner) results(session *browser.Session, t config.Test, url, label string, violations []engine.Violation) []Result {
 	results := make([]Result, 0, len(violations))
 	for _, v := range violations {
 		res := Result{
@@ -209,7 +263,7 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 		}
 		results = append(results, res)
 	}
-	return results, nil
+	return results
 }
 
 // captureScreenshot best-effort shoots the violating element. Failure is

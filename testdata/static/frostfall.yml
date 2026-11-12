@@ -12,6 +12,7 @@ defaults:
 tests:
   - id: fixture-initial
     path: /
+    keyboard: true
 
   - id: fixture-dialog
     path: /
@@ -20,5 +21,8 @@ tests:
       - click: "#open-dialog"
       - waitFor: "#dialog"
       - scan:
+          label: dialog-open
+          scope: "#dialog"
+      - keyboard:
           label: dialog-open
           scope: "#dialog"

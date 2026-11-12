@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 
@@ -247,6 +248,23 @@ func (s *Session) CaptureElement(sel string) ([]byte, error) {
 		return nil, err
 	}
 	return el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
+}
+
+// PressTab implements keyboard.Page with a real CDP key event, which moves
+// focus the way a user's Tab does - a synthetic JS event would not.
+func (s *Session) PressTab() error { return s.page.Keyboard.Press(input.Tab) }
+
+// CaptureRegion implements keyboard.Page: a PNG of a rectangle in document
+// coordinates, inside the viewport.
+func (s *Session) CaptureRegion(x, y, w, h float64) ([]byte, error) {
+	res, err := proto.PageCaptureScreenshot{
+		Format: proto.PageCaptureScreenshotFormatPng,
+		Clip:   &proto.PageViewport{X: x, Y: y, Width: w, Height: h, Scale: 1},
+	}.Call(s.page)
+	if err != nil {
+		return nil, err
+	}
+	return res.Data, nil
 }
 
 // Eval implements engine.Page.

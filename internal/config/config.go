@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/aquia-inc/frostfall/internal/keyboard"
 )
 
 // Duration wraps time.Duration for "60s"/"500ms" YAML values.
@@ -159,6 +161,8 @@ type Test struct {
 	Steps   []Step          `yaml:"steps"`
 	Rules   map[string]bool `yaml:"rules"`
 	Expect  *Expect         `yaml:"expect"`
+	// Keyboard opts the initial state into a keyboard audit.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
 }
 
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
@@ -173,6 +177,8 @@ type Step struct {
 	Wait    Duration  `yaml:"wait"`
 	Scan    *ScanStep `yaml:"scan"`
 	Goto    string    `yaml:"goto"`
+	// Keyboard audits the state the preceding steps reached.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
 }
 
 // Field is one selector/value pair of a fill or select step.
@@ -233,8 +239,8 @@ func decodeStrict(node *yaml.Node, v any) error {
 	return node.Decode(v)
 }
 
-// UnmarshalYAML gives a null `scan:` step its documented meaning, all
-// defaults. yaml.v3 never calls a field's own UnmarshalYAML for
+// UnmarshalYAML gives a null `scan:` or `keyboard:` step its documented
+// meaning, all defaults. yaml.v3 never calls a field's own UnmarshalYAML for
 // a null value; it leaves the pointer nil, which reads as no action at all.
 func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 	type plain Step
@@ -245,8 +251,11 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 		if node.Content[i+1].Tag != "!!null" {
 			continue
 		}
-		if node.Content[i].Value == "scan" {
+		switch node.Content[i].Value {
+		case "scan":
 			s.Scan = &ScanStep{}
+		case "keyboard":
+			s.Keyboard = &KeyboardStep{}
 		}
 	}
 	return nil
@@ -267,6 +276,53 @@ func (s *ScanStep) UnmarshalYAML(node *yaml.Node) error {
 	}
 	type plain ScanStep
 	return decodeStrict(node, (*plain)(s))
+}
+
+// KeyboardStep configures a keyboard traversal audit. As a test field it
+// accepts true/false or the full form (without label: it is the initial
+// state); as a step, bare `- keyboard:` or the full form.
+type KeyboardStep struct {
+	Label   string          `yaml:"label"`
+	Scope   string          `yaml:"scope"`
+	MaxTabs int             `yaml:"maxTabs"`
+	Rules   map[string]bool `yaml:"rules"`
+	// Off records an explicit `keyboard: false`.
+	Off bool `yaml:"-"`
+}
+
+func (k *KeyboardStep) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Tag {
+	case "!!null":
+		return nil
+	case "!!bool":
+		var on bool
+		if err := node.Decode(&on); err != nil {
+			return err
+		}
+		k.Off = !on
+		return nil
+	}
+	type plain KeyboardStep
+	return decodeStrict(node, (*plain)(k))
+}
+
+func (k *KeyboardStep) validate() error {
+	if k.MaxTabs < 0 {
+		return fmt.Errorf("keyboard.maxTabs: must not be negative")
+	}
+	return validateRules("keyboard.rules", k.Rules)
+}
+
+// validateRules rejects frostfall/ rule ids this binary does not implement:
+// a typo there would silently leave a keyboard check on. Axe ids are not
+// checked here - axe itself rejects unknown ones at scan time.
+func validateRules(where string, rules map[string]bool) error {
+	for id := range rules {
+		if keyboard.IsRule(id) && !keyboard.Known(id) {
+			return fmt.Errorf("%s: unknown rule %q", where, id)
+		}
+	}
+	return nil
 }
 
 var validStandards = map[string]bool{
@@ -494,6 +550,9 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	if err := validateRules("defaults.rules", c.Defaults.Rules); err != nil {
+		return err
+	}
 	if s := c.Defaults.Expect.Severity; s != "" && !validSeverities[s] {
 		return fmt.Errorf("defaults.expect.severity: must be minor, moderate, serious, or critical")
 	}
@@ -515,6 +574,17 @@ func (c *Config) validate() error {
 		if t.Expect != nil && t.Expect.Severity != "" && !validSeverities[t.Expect.Severity] {
 			return fmt.Errorf("test %q: invalid expect.severity", t.ID)
 		}
+		if err := validateRules("rules", t.Rules); err != nil {
+			return fmt.Errorf("test %q: %w", t.ID, err)
+		}
+		if k := t.Keyboard; k != nil {
+			if k.Label != "" {
+				return fmt.Errorf("test %q: keyboard.label: the test-level audit is always labelled initial; use a keyboard step to name one", t.ID)
+			}
+			if err := k.validate(); err != nil {
+				return fmt.Errorf("test %q: %w", t.ID, err)
+			}
+		}
 		for j, s := range t.Steps {
 			if err := s.validate(); err != nil {
 				return fmt.Errorf("test %q steps[%d]: %w", t.ID, j, err)
@@ -529,6 +599,7 @@ func (s *Step) validate() error {
 	for _, set := range []bool{
 		s.Click != "", len(s.Fill) > 0, s.Press != "", s.Hover != "",
 		len(s.Select) > 0, s.WaitFor != "", s.Wait != 0, s.Scan != nil, s.Goto != "",
+		s.Keyboard != nil,
 	} {
 		if set {
 			actions++
@@ -536,6 +607,17 @@ func (s *Step) validate() error {
 	}
 	if actions != 1 {
 		return fmt.Errorf("each step must have exactly one action")
+	}
+	if s.Scan != nil {
+		if err := validateRules("scan.rules", s.Scan.Rules); err != nil {
+			return err
+		}
+	}
+	if k := s.Keyboard; k != nil {
+		if k.Off {
+			return fmt.Errorf("keyboard: false is only meaningful on a test; drop the step instead")
+		}
+		return k.validate()
 	}
 	return nil
 }
