@@ -9,6 +9,8 @@ server:
 auth:
   storageState: state-empty.json
   loginPath: /login.html
+  # Rendered by protected.html and by no login page: the guard's main signal.
+  signedIn: "[data-testid=app-shell]"
 
 defaults:
   waitFor: load

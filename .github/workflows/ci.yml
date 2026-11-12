@@ -61,15 +61,22 @@ jobs:
 
       - name: Integration test (auth fixture, no session)
         # Same page with an empty storage state: the page redirects to login,
-        # and the run must stop with exit 3 (login-redirect guard) rather than
-        # scan the login page and pass.
+        # and the run must stop with exit 3 (login-redirect guard) and say why,
+        # rather than scan the login page and pass. The message check keeps an
+        # unrelated exit 3 (a crashed browser, an unreachable server) from
+        # passing for the guard.
         run: |
           set +e
-          /tmp/frostfall --config testdata/auth/frostfall-nosession.yml
+          /tmp/frostfall --config testdata/auth/frostfall-nosession.yml 2> /tmp/auth-nosession.err
           code=$?
           set -e
+          cat /tmp/auth-nosession.err
           if [ "$code" -ne 3 ]; then
             echo "expected exit 3 (landed on the login page), got $code"
+            exit 1
+          fi
+          if ! grep -q "landed on the login page" /tmp/auth-nosession.err; then
+            echo "exit 3 came from something other than the login guard"
             exit 1
           fi
 
