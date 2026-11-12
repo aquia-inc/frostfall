@@ -68,6 +68,10 @@ type Session struct {
 	// signed in; auth is nil for an unauthenticated run.
 	auth    *Auth
 	testURL string
+	// redact prints URLs in this session's errors without their query and
+	// other secrets; set for authenticated runs only, so a config without
+	// auth reports exactly what it always did.
+	redact bool
 }
 
 // setTimeout restarts the session's time budget at d.
@@ -180,7 +184,10 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 		idle = s.newIdleWaiter()
 	}
 	if err := s.page.Navigate(url); err != nil {
-		return fmt.Errorf("navigating to %s: %w", RedactURL(url), err)
+		if s.redact {
+			url = RedactURL(url)
+		}
+		return fmt.Errorf("navigating to %s: %w", url, err)
 	}
 	if idle != nil {
 		return s.finishIdle(idle, settle)

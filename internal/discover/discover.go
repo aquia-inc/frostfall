@@ -21,7 +21,9 @@ type Crawler struct {
 	BaseURL  string
 	Options  config.Discover
 	Defaults config.Defaults
-	// Auth seeds every crawled page's context; nil crawls signed out.
+	// Auth seeds every crawled page's context; nil crawls signed out. It
+	// should hold captured state (see browser.Auth.ForCrawl), so the login
+	// flow never runs once per page.
 	Auth *browser.Auth
 	Log  func(format string, args ...any)
 }
@@ -81,7 +83,7 @@ func (c *Crawler) Run() ([]string, error) {
 				return nil, err
 			}
 			if c.Log != nil {
-				c.Log("discover: dropping %s: %s", browser.RedactURL(n.path), err)
+				c.Log("discover: dropping %s: %s (a public page belongs in the config as an explicit test with auth: false)", c.shown(n.path), err)
 			}
 			continue
 		}
@@ -91,7 +93,7 @@ func (c *Crawler) Run() ([]string, error) {
 		}
 		if err != nil {
 			if c.Log != nil {
-				c.Log("discover: not following links of %s: %v", browser.RedactURL(n.path), err)
+				c.Log("discover: not following links of %s: %v", c.shown(n.path), err)
 			}
 			continue
 		}
@@ -105,6 +107,15 @@ func (c *Crawler) Run() ([]string, error) {
 		}
 	}
 	return found, nil
+}
+
+// shown is path as it may be printed: redacted when signed in, unchanged
+// otherwise so an unauthenticated crawl logs exactly what it always did.
+func (c *Crawler) shown(path string) string {
+	if c.Auth != nil {
+		return browser.RedactURL(path)
+	}
+	return path
 }
 
 func (c *Crawler) collectLinks(path string) ([]string, error) {

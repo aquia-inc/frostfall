@@ -199,8 +199,16 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		waitFor = d.WaitFor
 	}
 
-	r.logf("test %s: loading %s", t.ID, browser.RedactURL(url))
-	session, err := r.Browser.NewAuthSession(r.Auth, url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
+	auth := r.Auth
+	if !t.UsesAuth() {
+		auth = nil // auth: false is a fresh, signed-out context with no guard
+	}
+	shown := url
+	if r.Auth != nil {
+		shown = browser.RedactURL(url) // a signed-in run's URLs can carry tokens
+	}
+	r.logf("test %s: loading %s", t.ID, shown)
+	session, err := r.Browser.NewAuthSession(auth, url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -216,9 +224,15 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		results = append(results, res...)
 	}
 	if tr := t.Transcript; tr != nil && !tr.Off {
+		if err := session.CheckLanding(); err != nil {
+			return nil, nil, nil, fmt.Errorf("before the initial transcript: %w", err)
+		}
 		lines, err := screenreader.Transcript(session, tr.Scope)
 		if err != nil {
 			return nil, nil, nil, err
+		}
+		if err := session.CheckLanding(); err != nil {
+			return nil, nil, nil, fmt.Errorf("after the initial transcript: %w", err)
 		}
 		transcripts = append(transcripts, Transcript{TestID: t.ID, Label: "initial", PageURL: url, Lines: lines})
 	}
@@ -226,6 +240,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	// found it, but its Tab presses can fire focus handlers that change the
 	// DOM, which the scan and transcript above must not see.
 	if k := r.Config.KeyboardFor(t); k != nil {
+		if err := session.CheckLanding(); err != nil {
+			return nil, nil, nil, fmt.Errorf("before the initial keyboard audit: %w", err)
+		}
 		res, err := r.keyboard(ctx, session, t, url, "initial", *k, cov)
 		if err != nil {
 			return nil, nil, nil, err
@@ -251,6 +268,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			lines, err := screenreader.Transcript(session, tr.Scope)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
+			}
+			if err := session.CheckLanding(); err != nil {
+				return nil, nil, nil, fmt.Errorf("steps[%d]: after the transcript: %w", i, err)
 			}
 			transcripts = append(transcripts, Transcript{TestID: t.ID, Label: label, PageURL: url, Lines: lines})
 			continue
@@ -328,6 +348,12 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 	if err != nil {
 		return nil, fmt.Errorf("keyboard audit %q: %w", label, err)
 	}
+	// Tab presses can fire handlers that navigate. If the audit walked the
+	// page into the login page, its findings describe that page: report the
+	// redirect, not them.
+	if err := session.CheckLanding(); err != nil {
+		return nil, fmt.Errorf("after keyboard audit %q: %w", label, err)
+	}
 	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
 	return r.results(session, t, url, label, audit.Violations), nil
 }
@@ -393,6 +419,11 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan %q: %w", label, err)
+	}
+	// A page that navigates while axe runs (a late client-side redirect)
+	// would have its login page's findings reported as this page's.
+	if err := session.CheckLanding(); err != nil {
+		return nil, fmt.Errorf("after scan %q: %w", label, err)
 	}
 	cov.record(checkAxe, rules)
 	return r.results(session, t, url, label, violations), nil

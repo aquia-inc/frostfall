@@ -219,7 +219,15 @@ type Test struct {
 	Keyboard *KeyboardStep `yaml:"keyboard"`
 	// Transcript records the initial state's screen reader transcript.
 	Transcript *TranscriptStep `yaml:"transcript"`
+	// Auth: false runs this test in a fresh context with no session and no
+	// login guard, for public pages and signed-out states. Absent or true
+	// means the configured auth applies.
+	Auth *bool `yaml:"auth"`
 }
+
+// UsesAuth reports whether the config's auth block applies to t: always,
+// unless the test says auth: false.
+func (t Test) UsesAuth() bool { return t.Auth == nil || *t.Auth }
 
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
 // field is set.

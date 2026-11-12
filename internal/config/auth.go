@@ -25,19 +25,23 @@ type Auth struct {
 	// StorageState is a Playwright-compatible storage-state file captured
 	// elsewhere. A relative path resolves against the config file.
 	StorageState string `yaml:"storageState"`
-	// LoginPath is the path, relative to the base URL, that a signed-out
-	// visitor is sent to. A test that lands there without having asked for
-	// it fails instead of being scanned. Defaults to Setup.Path; required
-	// with StorageState, which has no path of its own to fall back on.
-	LoginPath string `yaml:"loginPath"`
-	// SignedIn is an optional CSS selector that exists on every page a
-	// signed-in session shows. Where it is absent the test failed to sign
-	// in. It is the only guard for a login rendered in place at the base
-	// root, which no path comparison can see.
+	// SignedIn is a CSS selector that exists on every page a signed-in
+	// session shows and on no login page. Required: a URL comparison alone
+	// cannot tell a signed-out page from a signed-in one (a login rendered in
+	// place, an IdP page, a renamed route), a marker in the page can. It is
+	// the guard's main signal.
 	SignedIn string `yaml:"signedIn"`
-	// AllowedOrigins are the origins, besides the base URL's, a flow or a
-	// test may legitimately end on (an SSO identity provider). A landing on
-	// any other origin is treated as a login redirect.
+	// LoginPath is the path, relative to the base URL, that a signed-out
+	// visitor is sent to. Optional: it is a second signal and gives clearer
+	// messages, and a test that is itself about the login page may land
+	// there. Defaults to Setup.Path; an explicit empty string says the app
+	// has no separate login URL (a login rendered in place), so no path is
+	// ever mistaken for it.
+	LoginPath *string `yaml:"loginPath"`
+	// AllowedOrigins are the origins, besides the base URL's, that a setup
+	// flow may pass through on the way back to the app (an SSO identity
+	// provider): their storage is captured. They never excuse a test landing
+	// off the app's origin.
 	AllowedOrigins []string `yaml:"allowedOrigins"`
 
 	// State is the parsed StorageState file, held in memory only.
@@ -54,10 +58,11 @@ type AuthSetup struct {
 func (a *Auth) ReuseSetup() bool { return a.Reuse == nil || *a.Reuse }
 
 // LoginRoute is the path whose appearance after a test's navigation means
-// the session was not applied: loginPath, else the setup flow's path.
+// the session was not applied: loginPath, else the setup flow's path, else
+// "" (a storageState config that did not say).
 func (a *Auth) LoginRoute() string {
-	if a.LoginPath != "" {
-		return a.LoginPath
+	if a.LoginPath != nil {
+		return *a.LoginPath
 	}
 	if a.Setup != nil {
 		return a.Setup.Path
@@ -149,7 +154,11 @@ func (c *Config) validateAuth() error {
 	case a.Setup == nil && a.StorageState == "":
 		return errors.New("auth: set exactly one of setup and storageState")
 	}
-	if a.LoginPath != "" && !strings.HasPrefix(a.LoginPath, "/") {
+	if a.SignedIn == "" {
+		return errors.New("auth.signedIn: required; a CSS selector that exists on every signed-in page and on no login page " +
+			"(Frostfall fails a test where it is missing, since the URL alone cannot tell a login page from the app)")
+	}
+	if a.LoginPath != nil && *a.LoginPath != "" && !strings.HasPrefix(*a.LoginPath, "/") {
 		return errors.New("auth.loginPath: must be a path starting with /")
 	}
 	for i, o := range a.AllowedOrigins {
@@ -161,11 +170,6 @@ func (c *Config) validateAuth() error {
 	}
 
 	if a.StorageState != "" {
-		// Without a login route the guard has nothing to compare against, and
-		// an expired session in the file would be scanned as the login page.
-		if a.LoginPath == "" {
-			return errors.New("auth.loginPath: required with storageState; without it a session that has expired cannot be told from a valid one")
-		}
 		if a.Reuse != nil {
 			return errors.New("auth.reuse: only applies to setup; a storageState file is restored into every test")
 		}
@@ -178,7 +182,7 @@ func (c *Config) validateAuth() error {
 			return fmt.Errorf("auth.storageState %s: %w", a.StorageState, err)
 		}
 		a.State = st
-		return a.requireSignedInAtRoot()
+		return nil
 	}
 
 	s := a.Setup
@@ -205,21 +209,6 @@ func (c *Config) validateAuth() error {
 		if err := st.validate(); err != nil {
 			return fmt.Errorf("auth.setup.steps[%d]: %w", i, err)
 		}
-	}
-	return a.requireSignedInAtRoot()
-}
-
-// requireSignedInAtRoot rejects a login route that is the base root: a login
-// rendered at / (or in place, with no URL change) leaves no path to compare,
-// so only a selector for the signed-in app can tell the two apart.
-func (a *Auth) requireSignedInAtRoot() error {
-	u, err := url.Parse(a.LoginRoute())
-	if err != nil {
-		return fmt.Errorf("auth.loginPath: %w", err)
-	}
-	if RouteKey(u) == "/" && a.SignedIn == "" {
-		return errors.New("auth.signedIn: required when the login route is the base root (/): the login page and the app share a URL, " +
-			"so only a selector that exists on every signed-in page can tell them apart")
 	}
 	return nil
 }

@@ -212,7 +212,14 @@ func run(args []string) int {
 		Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
 	if *discoverFlag {
-		discovered, derr := discoverTests(b, authn, base, cfg, tests)
+		// With reuse: false the login flow would run once per crawled page;
+		// the crawl logs in once and restores that session into every page.
+		crawlAuth, aerr := authn.ForCrawl(b)
+		if aerr != nil {
+			fmt.Fprintln(os.Stderr, "auth error:", aerr)
+			return exitEnvironment
+		}
+		discovered, derr := discoverTests(b, crawlAuth, base, cfg, tests)
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "discover error:", derr)
 			return exitEnvironment
