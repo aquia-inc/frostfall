@@ -222,7 +222,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	// Last of the initial-state checks: the audit leaves focus where it
 	// found it, but its Tab presses can fire focus handlers that change the
 	// DOM, which the scan and transcript above must not see.
-	if k := t.Keyboard; k != nil && !k.Off {
+	if k := r.Config.KeyboardFor(t); k != nil {
 		res, err := r.keyboard(ctx, session, t, url, "initial", *k, cov)
 		if err != nil {
 			return nil, nil, nil, err

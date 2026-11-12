@@ -73,6 +73,19 @@ type ProfileDefaults struct {
 	Timeout    *Duration       `yaml:"timeout"`
 	Rules      map[string]bool `yaml:"rules"`
 	Expect     *Expect         `yaml:"expect"`
+	Keyboard   *KeyboardStep   `yaml:"keyboard"`
+}
+
+// UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
+func (d *ProfileDefaults) UnmarshalYAML(node *yaml.Node) error {
+	type plain ProfileDefaults
+	if err := decodeStrict(node, (*plain)(d)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"keyboard": func() { d.Keyboard = cmp.Or(d.Keyboard, &KeyboardStep{}) },
+	})
+	return nil
 }
 
 type Server struct {
@@ -104,6 +117,36 @@ type Defaults struct {
 	Timeout    Duration        `yaml:"timeout"`
 	Rules      map[string]bool `yaml:"rules"`
 	Expect     Expect          `yaml:"expect"`
+	// Keyboard audits every test's initial state, discovered ones included,
+	// unless a test sets its own keyboard (false opts it out). Opt-in per
+	// config, never a binary default: turning it on in a release would fail
+	// every enforcing pipeline on findings nobody asked for.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
+}
+
+// UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
+func (d *Defaults) UnmarshalYAML(node *yaml.Node) error {
+	type plain Defaults
+	if err := decodeStrict(node, (*plain)(d)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"keyboard": func() { d.Keyboard = cmp.Or(d.Keyboard, &KeyboardStep{}) },
+	})
+	return nil
+}
+
+// KeyboardFor is the keyboard audit t's initial state gets, nil for none: the
+// test's own setting when it has one, else the default.
+func (c *Config) KeyboardFor(t Test) *KeyboardStep {
+	k := t.Keyboard
+	if k == nil {
+		k = c.Defaults.Keyboard
+	}
+	if k == nil || k.Off {
+		return nil
+	}
+	return k
 }
 
 // Expect is the enforcement contract. When no expect block is configured
@@ -549,6 +592,9 @@ func (c *Config) applyProfile(profile string) error {
 		if d.Expect != nil {
 			c.Defaults.Expect = *d.Expect
 		}
+		if d.Keyboard != nil {
+			c.Defaults.Keyboard = d.Keyboard
+		}
 	}
 	return nil
 }
@@ -674,6 +720,14 @@ func (c *Config) validate() error {
 	}
 	if err := validateRules("defaults.rules", c.Defaults.Rules); err != nil {
 		return err
+	}
+	if k := c.Defaults.Keyboard; k != nil {
+		if k.Label != "" || k.Scope != "" {
+			return fmt.Errorf("defaults.keyboard: label and scope are per test; set them on a keyboard step")
+		}
+		if err := k.validate(); err != nil {
+			return fmt.Errorf("defaults: %w", err)
+		}
 	}
 	if s := c.Defaults.Expect.Severity; s != "" && !validSeverities[s] {
 		return fmt.Errorf("defaults.expect.severity: must be minor, moderate, serious, or critical")

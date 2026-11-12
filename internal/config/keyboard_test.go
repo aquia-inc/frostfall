@@ -142,3 +142,72 @@ tests: [{id: a, path: /, keyboard: {maxTabs: -1}}]`, "must not be negative"},
 		})
 	}
 }
+
+func TestKeyboardDefault(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://x
+defaults:
+  keyboard:
+profiles:
+  quick:
+    defaults:
+      keyboard: false
+tests:
+  - id: inherits
+    path: /
+  - id: opts-out
+    path: /
+    keyboard: false
+  - id: own
+    path: /
+    keyboard: { maxTabs: 50 }
+`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.KeyboardFor(cfg.Tests[0]) == nil {
+		t.Error("a test without its own setting did not inherit defaults.keyboard")
+	}
+	// Discovered tests are synthesized with only an id and path.
+	if cfg.KeyboardFor(Test{ID: "discovered:/x", Path: "/x"}) == nil {
+		t.Error("a discovered test did not inherit defaults.keyboard")
+	}
+	if cfg.KeyboardFor(cfg.Tests[1]) != nil {
+		t.Error("keyboard: false did not opt the test out")
+	}
+	if k := cfg.KeyboardFor(cfg.Tests[2]); k == nil || k.MaxTabs != 50 {
+		t.Errorf("the test's own setting lost to the default: %+v", k)
+	}
+
+	quick, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://x
+defaults:
+  keyboard: true
+profiles:
+  quick:
+    defaults:
+      keyboard: false
+tests: [{id: a, path: /}]
+`), "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quick.KeyboardFor(quick.Tests[0]) != nil {
+		t.Error("a profile's keyboard: false did not override the default")
+	}
+
+	none, err := Load(writeConfig(t, "version: 1\nserver:\n  baseUrl: http://x\ntests: [{id: a, path: /}]\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.KeyboardFor(none.Tests[0]) != nil {
+		t.Error("keyboard audits ran with nothing configured; they must stay opt-in")
+	}
+
+	if _, err := Load(writeConfig(t, "version: 1\nserver:\n  baseUrl: http://x\ndefaults:\n  keyboard: { scope: main }\ntests: [{id: a, path: /}]\n"), ""); err == nil ||
+		!strings.Contains(err.Error(), "label and scope are per test") {
+		t.Errorf("scope on defaults.keyboard: err = %v", err)
+	}
+}

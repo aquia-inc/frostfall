@@ -211,6 +211,9 @@ defaults:                        # applied to every test unless overridden
   timeout: 30s                   # per-test budget: load + steps + scans
   rules:                         # per-rule toggles for every scan
     color-contrast: on
+  keyboard: true                 # keyboard-audit every test's initial state,
+                                 # discovered ones included (default off;
+                                 # a test opts out with keyboard: false)
   expect:                        # ABSENT = report-only, always exit 0
     severity: serious            # fail on new violations at this impact or worse:
                                  #   minor | moderate | serious | critical
@@ -281,9 +284,12 @@ always the fix.
 
 axe inspects the DOM; it cannot press keys. A keyboard audit does: it presses
 Tab through the page until focus cycles back to where it started, then
-reports what a keyboard user would hit. Opt in per test with `keyboard: true`
-(audits the initial state) or with a `keyboard` step (audits the state the
-steps reached - an open dialog, say):
+reports what a keyboard user would hit. It is opt-in, so upgrading Frostfall
+never fails a pipeline on findings nobody asked for. Turn it on for every
+test, discovered ones included, with `defaults: { keyboard: true }` (a test
+opts out with `keyboard: false`); per test with `keyboard: true` (audits the
+initial state); or with a `keyboard` step (audits the state the steps
+reached - an open dialog, say):
 
 ```yaml
   - id: checkout

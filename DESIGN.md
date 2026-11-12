@@ -222,7 +222,7 @@ Deliberately small — enough to reach a state, not to write E2E suites:
 | `goto: /path` | client-side-relevant fresh navigation mid-test |
 | `transcript: {…}` | record the screen reader transcript (role, name, state in reading order, from the CDP accessibility tree); `label`, `scope`. A test-level `transcript: true` records the initial state. Evidence only, carried on the run, never a violation |
 | `expectFocus: {…}` | assert focus is `within` a selector with an accessible `role`/`name`; a miss is a `frostfall/focus-expectation` violation |
-| `keyboard: {…}` | press Tab through the page and report keyboard failures under `frostfall/` rule ids; `label`, `scope`, `maxTabs`, `rules`. A test-level `keyboard: true` audits the initial state. Additive: findings are `engine.Violation`s, so fingerprints, baselines, and formats are unchanged |
+| `keyboard: {…}` | press Tab through the page and report keyboard failures under `frostfall/` rule ids; `label`, `scope`, `maxTabs`, `rules`. A test-level `keyboard: true` audits the initial state; `defaults.keyboard` does so for every test, discovered ones included, and a test's own setting wins. Opt-in per config, never a binary default, so a release cannot fail enforcing pipelines on new findings. Additive: findings are `engine.Violation`s, so fingerprints, baselines, and formats are unchanged |
 
 Any step failure (selector never appears within the test timeout, click on detached node) fails the
 test with exit 3 semantics — it's an environment/spec failure, not a violation.
