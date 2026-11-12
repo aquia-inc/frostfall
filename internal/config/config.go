@@ -220,8 +220,9 @@ type Test struct {
 	// Transcript records the initial state's screen reader transcript.
 	Transcript *TranscriptStep `yaml:"transcript"`
 	// Auth: false runs this test in a fresh context with no session and no
-	// login guard, for public pages and signed-out states. Absent or true
-	// means the configured auth applies.
+	// login guard, for public pages, signed-out states and the login page
+	// itself. Absent or true means the configured auth applies (true needs
+	// an auth block).
 	Auth *bool `yaml:"auth"`
 }
 
@@ -767,6 +768,9 @@ func (c *Config) validate() error {
 		seen[t.ID] = true
 		if (t.Path == "") == (t.URL == "") {
 			return fmt.Errorf("test %q: exactly one of path, url must be set", t.ID)
+		}
+		if t.Auth != nil && *t.Auth && c.Auth == nil {
+			return fmt.Errorf("test %q: auth: true needs an auth block in the config; remove it, or configure auth", t.ID)
 		}
 		if t.Expect != nil && t.Expect.Severity != "" && !validSeverities[t.Expect.Severity] {
 			return fmt.Errorf("test %q: invalid expect.severity", t.ID)

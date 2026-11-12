@@ -32,12 +32,12 @@ type Auth struct {
 	// the guard's main signal.
 	SignedIn string `yaml:"signedIn"`
 	// LoginPath is the path, relative to the base URL, that a signed-out
-	// visitor is sent to. Optional: it is a second signal and gives clearer
-	// messages, and a test that is itself about the login page may land
-	// there. Defaults to Setup.Path; an explicit empty string says the app
-	// has no separate login URL (a login rendered in place), so no path is
-	// ever mistaken for it.
-	LoginPath *string `yaml:"loginPath"`
+	// visitor is sent to. Optional, with no default: a login route exists
+	// only when this is set. It is a second signal beside SignedIn and the
+	// source of clearer messages, and the crawl never follows it. (setup.path
+	// is no default: it is often a protected page that bounces through SSO
+	// and back, which is not a login page.)
+	LoginPath string `yaml:"loginPath"`
 	// AllowedOrigins are the origins, besides the base URL's, that a setup
 	// flow may pass through on the way back to the app (an SSO identity
 	// provider): their storage is captured. They never excuse a test landing
@@ -57,18 +57,8 @@ type AuthSetup struct {
 // (the default) rather than inside every test's own context.
 func (a *Auth) ReuseSetup() bool { return a.Reuse == nil || *a.Reuse }
 
-// LoginRoute is the path whose appearance after a test's navigation means
-// the session was not applied: loginPath, else the setup flow's path, else
-// "" (a storageState config that did not say).
-func (a *Auth) LoginRoute() string {
-	if a.LoginPath != nil {
-		return *a.LoginPath
-	}
-	if a.Setup != nil {
-		return a.Setup.Path
-	}
-	return ""
-}
+// LoginRoute is the configured login path, "" when there is none.
+func (a *Auth) LoginRoute() string { return a.LoginPath }
 
 // StorageState is the Playwright storage-state shape. Fields Playwright adds
 // beyond these (indexedDB, newer versions' extras) are ignored on purpose, so
@@ -158,7 +148,7 @@ func (c *Config) validateAuth() error {
 		return errors.New("auth.signedIn: required; a CSS selector that exists on every signed-in page and on no login page " +
 			"(Frostfall fails a test where it is missing, since the URL alone cannot tell a login page from the app)")
 	}
-	if a.LoginPath != nil && *a.LoginPath != "" && !strings.HasPrefix(*a.LoginPath, "/") {
+	if a.LoginPath != "" && !strings.HasPrefix(a.LoginPath, "/") {
 		return errors.New("auth.loginPath: must be a path starting with /")
 	}
 	for i, o := range a.AllowedOrigins {
@@ -335,4 +325,34 @@ func nodeAt(n *yaml.Node, keys ...string) *yaml.Node {
 		n = next
 	}
 	return resolveAlias(n)
+}
+
+// CheckTestOrigins rejects, for a config with auth, a test whose url: is not
+// on the base URL's origin unless it sets auth: false. The session's cookies
+// are injected into the whole browser context, so such a test would send them
+// to a host the guard cannot judge (localhost versus 127.0.0.1 is enough). It
+// takes the base URL the run resolved, which --base-url and serve: decide.
+func (c *Config) CheckTestOrigins(baseURL string, tests []Test) error {
+	if c.Auth == nil {
+		return nil
+	}
+	bu, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("base url: %w", err)
+	}
+	base := originOfURL(bu)
+	for _, t := range tests {
+		if t.URL == "" || !t.UsesAuth() {
+			continue
+		}
+		u, err := url.Parse(t.URL)
+		if err != nil || u.Host == "" {
+			continue // not an absolute URL: validate and the run report that
+		}
+		if o := originOfURL(u); o != base {
+			return fmt.Errorf("test %q: url is on %s, not on the app's origin %s: the session's cookies go to every host a test loads "+
+				"and the login guard cannot judge another origin; set auth: false on this test", t.ID, o, base)
+		}
+	}
+	return nil
 }

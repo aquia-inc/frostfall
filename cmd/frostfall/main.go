@@ -137,6 +137,13 @@ func run(args []string) int {
 	// "path relative to the base URL" is base + path everywhere, so a
 	// trailing slash on the base would put a double slash in every URL.
 	base = strings.TrimRight(base, "/")
+	// The session reaches every host a test loads, so with auth a test must
+	// stay on the app's origin (or opt out). Known only now: --base-url and
+	// serve: decide the origin.
+	if err := cfg.CheckTestOrigins(base, cfg.Tests); err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
+		return exitBadConfig
+	}
 
 	bp := cfg.Baseline
 	if *baselinePath != "" {
@@ -212,14 +219,10 @@ func run(args []string) int {
 		Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
 	if *discoverFlag {
-		// With reuse: false the login flow would run once per crawled page;
-		// the crawl logs in once and restores that session into every page.
-		crawlAuth, aerr := authn.ForCrawl(b)
-		if aerr != nil {
-			fmt.Fprintln(os.Stderr, "auth error:", aerr)
-			return exitEnvironment
+		if w := discoverAuthWarning(cfg); w != "" {
+			fmt.Fprintln(os.Stderr, "warning:", w)
 		}
-		discovered, derr := discoverTests(b, crawlAuth, base, cfg, tests)
+		discovered, derr := discoverTests(b, authn, base, cfg, tests)
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "discover error:", derr)
 			return exitEnvironment
@@ -464,6 +467,20 @@ func activeProfileName(req string, cfg *config.Config) string {
 	default:
 		return req
 	}
+}
+
+// discoverAuthWarning says what a crawl costs when the session cannot be
+// shared: with auth.reuse: false every page it loads runs the login flow, up
+// to discover.maxPages of them. "" when it does not apply.
+func discoverAuthWarning(cfg *config.Config) string {
+	if cfg.Auth == nil || cfg.Auth.Setup == nil || cfg.Auth.ReuseSetup() {
+		return ""
+	}
+	max := 100
+	if cfg.Discover != nil && cfg.Discover.MaxPages > 0 {
+		max = cfg.Discover.MaxPages
+	}
+	return fmt.Sprintf("auth.reuse is false, so discovery logs in once per crawled page, up to discover.maxPages (%d) times", max)
 }
 
 // discoverTests crawls from the root and synthesizes fresh-load tests for

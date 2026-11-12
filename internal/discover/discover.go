@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/browser"
@@ -21,9 +22,9 @@ type Crawler struct {
 	BaseURL  string
 	Options  config.Discover
 	Defaults config.Defaults
-	// Auth seeds every crawled page's context; nil crawls signed out. It
-	// should hold captured state (see browser.Auth.ForCrawl), so the login
-	// flow never runs once per page.
+	// Auth seeds every crawled page's context; nil crawls signed out. With
+	// auth.reuse: false each page loaded runs the login flow itself, up to
+	// MaxPages times.
 	Auth *browser.Auth
 	Log  func(format string, args ...any)
 }
@@ -62,6 +63,7 @@ func (c *Crawler) Run() ([]string, error) {
 	seen := map[string]bool{"/": true}
 	seenShape := map[string]bool{ShapeKey("/"): true}
 	var found []string
+	dropped := 0
 
 	for len(queue) > 0 && len(found) < c.Options.MaxPages {
 		n := queue[0]
@@ -82,8 +84,10 @@ func (c *Crawler) Run() ([]string, error) {
 			if n.depth == 0 {
 				return nil, err
 			}
+			dropped++
 			if c.Log != nil {
-				c.Log("discover: dropping %s: %s (a public page belongs in the config as an explicit test with auth: false)", c.shown(n.path), err)
+				c.Log("discover: dropping %s: %s (a public page belongs in the config as an explicit test with auth: false; "+
+					"a signed-in page that does not render the signedIn marker needs a marker every signed-in page renders)", c.shown(n.path), err)
 			}
 			continue
 		}
@@ -98,6 +102,14 @@ func (c *Crawler) Run() ([]string, error) {
 			continue
 		}
 		for _, p := range FilterLinks(base, links, excludes) {
+			if c.Auth != nil {
+				// These paths become test ids in reports, baselines and issues,
+				// so a signed-in crawl does not let a token in a link reach them.
+				var ok bool
+				if p, ok = cleanAuthPath(p); !ok {
+					continue
+				}
+			}
 			shape := ShapeKey(p)
 			if !seen[p] && !seenShape[shape] {
 				seen[p] = true
@@ -106,7 +118,45 @@ func (c *Crawler) Run() ([]string, error) {
 			}
 		}
 	}
+	if c.Auth != nil && c.Log != nil {
+		// Always said, zero included: a crawl that dropped nothing and one
+		// that was not told are different things to a reader.
+		c.Log("discover: dropped %d of %d pages (not signed in)", dropped, dropped+len(found))
+	}
 	return found, nil
+}
+
+var pathParams = regexp.MustCompile(`;[^/]*`)
+
+// credentialMarks in a path say the link carries a secret in the path itself.
+var credentialMarks = []string{"token=", "access_token", "sig=", "code="}
+
+// cleanAuthPath makes a discovered path safe to use as a test id when signed
+// in: ;params are stripped, a hash route keeps only the route (its query and
+// any nested fragment are dropped, as in browser.RedactURL), and a path that
+// still looks like it carries a credential is rejected. Without auth nothing
+// is changed: discovery output stays as it always was.
+func cleanAuthPath(p string) (string, bool) {
+	route, hash, hasHash := strings.Cut(p, "#")
+	route = pathParams.ReplaceAllString(route, "")
+	if route == "" {
+		route = "/"
+	}
+	if hasHash {
+		if i := strings.IndexAny(hash, "#?&="); i >= 0 {
+			hash = hash[:i]
+		}
+		if hash = pathParams.ReplaceAllString(hash, ""); hash != "" {
+			route += "#" + hash
+		}
+	}
+	lower := strings.ToLower(route)
+	for _, mark := range credentialMarks {
+		if strings.Contains(lower, mark) {
+			return "", false
+		}
+	}
+	return route, true
 }
 
 // shown is path as it may be printed: redacted when signed in, unchanged

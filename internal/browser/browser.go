@@ -64,10 +64,9 @@ type Session struct {
 	timeout time.Duration
 	// seed unregisters the auth storage script; nil when there is none.
 	seed func() error
-	// auth and testURL let a step re-check that the session is still
-	// signed in; auth is nil for an unauthenticated run.
-	auth    *Auth
-	testURL string
+	// auth lets a step re-check that the session is still signed in; nil
+	// for an unauthenticated session, and for an auth: false test's.
+	auth *Auth
 	// redact prints URLs in this session's errors without their query and
 	// other secrets; set for authenticated runs only, so a config without
 	// auth reports exactly what it always did.

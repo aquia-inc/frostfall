@@ -43,20 +43,28 @@ var pathParamRe = regexp.MustCompile(`;[^/]*`)
 // RedactURL reduces a URL to where it points, safe to print: userinfo, the
 // query, ;params on path segments (/login;jsessionid=...) and the fragment
 // are dropped. A hash route (#/users) is the page's identity in a hash-routed
-// app and is kept, without its own query. Setup paths and navigation targets
-// are printed in errors and logs, and any of those parts can carry a token or
+// app and is kept, but only up to the first '#', '?', '&' or '=' after it:
+// OAuth implicit flows put the token in exactly those places
+// (#/home#access_token=..., #/cb&access_token=...). A percent-encoded '?' or
+// '#' in the path is decoded by the parse, so it is cut the same way and
+// cannot smuggle a query past it. Setup paths and navigation targets are
+// printed in errors and logs, and any of those parts can carry a token or
 // credential. A URL that does not parse prints as a placeholder.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<unparsable url>"
 	}
-	out := pathParamRe.ReplaceAllString(u.Path, "")
+	path := u.Path
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	out := pathParamRe.ReplaceAllString(path, "")
 	if u.Host != "" {
 		out = u.Scheme + "://" + u.Host + out
 	}
 	if frag := u.Fragment; strings.HasPrefix(frag, "/") {
-		if i := strings.IndexByte(frag, '?'); i >= 0 {
+		if i := strings.IndexAny(frag, "#?&="); i >= 0 {
 			frag = frag[:i]
 		}
 		out += "#" + pathParamRe.ReplaceAllString(frag, "")
@@ -108,13 +116,14 @@ type Auth struct {
 	// setup is the login flow each context runs for itself (reuse: false).
 	setup *config.AuthSetup
 
-	// setupCfg is the configured flow, kept even when its state is captured
-	// once, so discovery can capture its own.
-	setupCfg *config.AuthSetup
+	// anon marks the auth an auth: false test gets: no state, no setup, no
+	// guard. It exists to carry the run's redaction setting alone.
+	anon bool
 
-	// loginDisplay is the configured login path redacted for printing;
-	// loginKey is its page identity under the base path. Both empty when no
-	// login route is known (storageState without loginPath).
+	// loginPath is the configured login path, loginDisplay it redacted for
+	// printing, loginKey its page identity under the base path. All empty
+	// when the config names no login path.
+	loginPath    string
 	loginDisplay string
 	loginKey     string
 }
@@ -148,6 +157,7 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 		a.allowed[o] = true
 	}
 	if route := cfg.Auth.LoginRoute(); route != "" {
+		a.loginPath = route
 		lu, err := url.Parse(route)
 		if err != nil {
 			return nil, fmt.Errorf("auth: login path: %w", err)
@@ -158,7 +168,13 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 		lu.Path = a.basePath + lu.Path
 		a.loginKey = guardKey(lu)
 	}
-	a.setupCfg = cfg.Auth.Setup
+
+	// The marker must not match a page with no session, or the guard would
+	// pass the login page it is there to catch. Checked before anything
+	// runs, so a bad marker costs one page load, not a scan of the wrong page.
+	if err := a.probeSignedOut(b); err != nil {
+		return nil, err
+	}
 
 	switch {
 	case cfg.Auth.State != nil:
@@ -175,21 +191,64 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 	return a, nil
 }
 
-// ForCrawl is the auth discovery crawls with. With reuse: false the flow would
-// otherwise run once per crawled page, so it runs once here and its state is
-// restored into every page instead. Otherwise it returns a unchanged.
-func (a *Auth) ForCrawl(b *Browser) (*Auth, error) {
-	if a == nil || a.state != nil || a.setupCfg == nil {
-		return a, nil
+// Anonymous is the auth an auth: false test gets: no session, no setup, no
+// guard. It keeps only the run's redaction, which follows the config, not the
+// test. Nil stays nil.
+func (a *Auth) Anonymous() *Auth {
+	if a == nil {
+		return nil
 	}
-	crawl := *a
-	crawl.setup = nil
-	st, err := crawl.captureOnce(b, a.setupCfg)
+	c := *a
+	c.state, c.setup, c.anon = nil, nil, true
+	return &c
+}
+
+// probeSignedOut loads the base URL, and the login path when one is set, in a
+// fresh context with no session and no storage seed, and fails if signedIn
+// matches. A marker that also matches a signed-out page (main, nav, a layout
+// shell that renders before auth resolves) cannot tell the two apart, and the
+// run would scan a login form and pass. One load per page, under the usual
+// readiness rules, and no wait: the page is ready, the marker is there or not.
+func (a *Auth) probeSignedOut(b *Browser) error {
+	pages := []struct{ what, path string }{{"the base URL", "/"}}
+	if a.loginPath != "" {
+		pages = append(pages, struct{ what, path string }{"the login path " + a.loginDisplay, a.loginPath})
+	}
+	for _, p := range pages {
+		s, err := b.open(a.defaults.Viewport, a.defaults.Timeout.Std(), nil)
+		if err != nil {
+			return fmt.Errorf("auth: probing %s signed out: %w", p.what, err)
+		}
+		s.redact = true
+		present, err := a.markerOnLoad(s, a.baseURL+p.path)
+		s.Close()
+		if err != nil {
+			return fmt.Errorf("auth: probing %s signed out: %w", p.what, err)
+		}
+		if present {
+			return &redirectError{fmt.Sprintf("auth: the signedIn selector %q also matches %s with no session: pick a marker that only signed-in pages "+
+				"render, such as a test id on content that needs the user (not main, nav, header or a layout shell, which render before auth resolves)",
+				a.signedIn, p.what)}
+		}
+	}
+	return nil
+}
+
+// markerOnLoad navigates s to url and reports whether signedIn is on the page
+// once it is ready, without waiting for it to appear.
+func (a *Auth) markerOnLoad(s *Session, url string) (bool, error) {
+	if err := s.navigate(url, a.defaults.WaitFor, a.defaults.SettleTime.Std()); err != nil {
+		return false, err
+	}
+	return s.present(a.signedIn)
+}
+
+func (s *Session) present(selector string) (bool, error) {
+	ok, _, err := s.page.Has(selector)
 	if err != nil {
-		return nil, err
+		return false, fmt.Errorf("signedIn selector %q: %w", selector, err)
 	}
-	crawl.state = st
-	return &crawl, nil
+	return ok, nil
 }
 
 func (a *Auth) logf(format string, args ...any) {
@@ -240,6 +299,15 @@ func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
 	a.logf("auth setup: loading %s", RedactURL(setup.Path))
 	if err := s.navigate(a.baseURL+setup.Path, a.defaults.WaitFor, settle); err != nil {
 		return fmt.Errorf("auth setup: %w", err)
+	}
+	// Before anyone has signed in the marker must be absent. If it is there
+	// already it says nothing about a session, and the end-of-setup check
+	// below would pass a login that never happened.
+	if present, err := s.present(a.signedIn); err != nil {
+		return fmt.Errorf("auth setup: %w", err)
+	} else if present {
+		return &redirectError{fmt.Sprintf("auth setup: the signedIn selector %q already matches the setup page %s before the steps ran: "+
+			"pick a marker that only signed-in pages render", a.signedIn, RedactURL(setup.Path))}
 	}
 	for i, st := range setup.Steps {
 		a.logf("auth setup: step %d: %s", i, describeStep(st))
@@ -311,16 +379,22 @@ func describeStep(st config.Step) string {
 // first (reuse: false), and the landing page is checked. A nil a is plain
 // NewSession.
 func (b *Browser) NewAuthSession(a *Auth, url string, vp config.Viewport, waitFor string, settle, timeout time.Duration) (*Session, error) {
+	guarded := a != nil && !a.anon
 	var state *State
-	if a != nil {
+	if guarded {
 		state = a.state
 	}
 	s, err := b.open(vp, timeout, state)
 	if err != nil {
 		return nil, err
 	}
-	s.auth, s.testURL, s.redact = a, url, a != nil
-	if a != nil && a.setup != nil {
+	// Redaction follows the run's auth config, an auth: false test included;
+	// the guard and the session follow the test's.
+	s.redact = a != nil
+	if guarded {
+		s.auth = a
+	}
+	if guarded && a.setup != nil {
 		// A login is not part of the test: it runs under the budget a login
 		// gets anywhere else, and the test's own budget starts after it.
 		s.setTimeout(a.defaults.Timeout.Std())
@@ -346,16 +420,15 @@ func (b *Browser) NewAuthSession(a *Auth, url string, vp config.Viewport, waitFo
 }
 
 // CheckLanding fails with ErrLoginRedirect when the session's page is not
-// the signed-in app. On the app's origin the signedIn marker must be present;
-// being on the login route fails too, with a clearer message. A test on the
-// app's origin that lands on any other origin fails, allowedOrigins
-// included: those are for a setup flow's hops, and a test is not one. A test
-// that is itself about the login route may land on it. A test whose own URL
-// is on another origin is not judged by the app's session, except that
-// landing on the app's login page still fails. A nil error for an
-// unauthenticated session. It runs after the first load and again around
-// every check that reports on the page, because a goto step, or the check
-// itself, can walk the page into the login page after the first load passed.
+// the signed-in app: it is on another origin (allowedOrigins is for a setup
+// flow's hops, not for a test), on the configured login path, or without the
+// signedIn marker, which is the main signal and must be present within a
+// short wait. There is no exemption: a test of the login page itself, or of a
+// signed-out state, sets auth: false and has no session and no guard. A nil
+// error for a session with no guard. It runs after the first load and again
+// around every check that reports on the page, because a goto step, or the
+// check itself, can walk the page into the login page after the first load
+// passed.
 func (s *Session) CheckLanding() error {
 	a := s.auth
 	if a == nil {
@@ -365,29 +438,13 @@ func (s *Session) CheckLanding() error {
 	if err != nil {
 		return err
 	}
-	var want *url.URL
-	if u, err := url.Parse(s.testURL); err == nil && u.Host != "" {
-		want = u
-	}
-	landedOrigin := originOf2(landed)
-	testOrigin := ""
-	if want != nil {
-		testOrigin = originOf2(want)
-	}
-	switch {
-	case landedOrigin == a.origin:
-	case testOrigin == a.origin:
+	if o := originOf2(landed); o != a.origin {
 		return &redirectError{fmt.Sprintf("landed on %s, not on the app's origin %s: the auth session was not applied or has expired "+
-			"(auth.allowedOrigins does not apply to tests)", landedOrigin, a.origin)}
-	default:
-		return nil // a cross-origin test sent elsewhere is not judged by the app's session
+			"(auth.allowedOrigins is for a setup flow's hops, not for tests)", o, a.origin)}
 	}
-	onLogin := a.onLogin(landed)
-	if onLogin && want != nil && a.onLogin(want) {
-		return nil // the test is about the login page itself
-	}
-	if onLogin {
-		return &redirectError{fmt.Sprintf("landed on the login page %s: the auth session was not applied or has expired", a.loginDisplay)}
+	if a.onLogin(landed) {
+		return &redirectError{fmt.Sprintf("landed on the login page %s: the auth session was not applied or has expired "+
+			"(to test the login page itself, set auth: false on that test)", a.loginDisplay)}
 	}
 	if !s.has(a.signedIn) {
 		return &redirectError{fmt.Sprintf("landed on %s without the signedIn selector %q (waited up to %s): "+
@@ -414,10 +471,10 @@ func (s *Session) has(selector string) bool {
 	return err == nil
 }
 
-// onLogin reports whether u is the app's login route: same origin as the
-// base URL and the same path (under the base path) plus hash route.
+// onLogin reports whether u is the configured login path (under the base
+// path), by path plus hash route. Callers have compared the origin.
 func (a *Auth) onLogin(u *url.URL) bool {
-	return a.loginKey != "" && originOf2(u) == a.origin && guardKey(u) == a.loginKey
+	return a.loginKey != "" && guardKey(u) == a.loginKey
 }
 
 // guardKey is RouteKey with the query of a hash route removed, so

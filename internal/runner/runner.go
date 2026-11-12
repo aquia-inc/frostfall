@@ -155,6 +155,24 @@ type Runner struct {
 	Log           func(format string, args ...any)
 
 	baselineIdx map[string]baseline.Violation
+	// afterOp, when set, runs right after a check that reports on the page
+	// and just before its landing re-check. Tests use it to move the page
+	// into the login page at exactly that point, which no real page can be
+	// timed to do.
+	afterOp func(s *browser.Session, op string)
+}
+
+// recheck is the landing check that follows a check which reported on the
+// page: if the check walked the page somewhere it must not be, its results
+// describe that page, and the redirect is reported instead of them.
+func (r *Runner) recheck(s *browser.Session, op string) error {
+	if r.afterOp != nil {
+		r.afterOp(s, op)
+	}
+	if err := s.CheckLanding(); err != nil {
+		return fmt.Errorf("after %s: %w", op, err)
+	}
+	return nil
 }
 
 func (r *Runner) logf(format string, args ...any) {
@@ -201,7 +219,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 
 	auth := r.Auth
 	if !t.UsesAuth() {
-		auth = nil // auth: false is a fresh, signed-out context with no guard
+		// auth: false is a fresh, signed-out context with no guard. It still
+		// belongs to a run with auth, whose URLs are printed redacted.
+		auth = auth.Anonymous()
 	}
 	shown := url
 	if r.Auth != nil {
@@ -231,8 +251,8 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if err := session.CheckLanding(); err != nil {
-			return nil, nil, nil, fmt.Errorf("after the initial transcript: %w", err)
+		if err := r.recheck(session, "the initial transcript"); err != nil {
+			return nil, nil, nil, err
 		}
 		transcripts = append(transcripts, Transcript{TestID: t.ID, Label: "initial", PageURL: url, Lines: lines})
 	}
@@ -269,8 +289,8 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 			}
-			if err := session.CheckLanding(); err != nil {
-				return nil, nil, nil, fmt.Errorf("steps[%d]: after the transcript: %w", i, err)
+			if err := r.recheck(session, "the transcript"); err != nil {
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 			}
 			transcripts = append(transcripts, Transcript{TestID: t.ID, Label: label, PageURL: url, Lines: lines})
 			continue
@@ -351,8 +371,8 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 	// Tab presses can fire handlers that navigate. If the audit walked the
 	// page into the login page, its findings describe that page: report the
 	// redirect, not them.
-	if err := session.CheckLanding(); err != nil {
-		return nil, fmt.Errorf("after keyboard audit %q: %w", label, err)
+	if err := r.recheck(session, fmt.Sprintf("keyboard audit %q", label)); err != nil {
+		return nil, err
 	}
 	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
 	return r.results(session, t, url, label, audit.Violations), nil
@@ -383,6 +403,11 @@ func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label
 	r.logf("test %s: expectFocus (%s)", t.ID, label)
 	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name})
 	if err != nil {
+		return nil, err
+	}
+	// Reading focus can run handlers too; do not judge or report a page the
+	// check left behind.
+	if err := r.recheck(session, fmt.Sprintf("expectFocus %q", label)); err != nil {
 		return nil, err
 	}
 	cov.record(checkExpectFocus, nil)
@@ -422,8 +447,8 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	}
 	// A page that navigates while axe runs (a late client-side redirect)
 	// would have its login page's findings reported as this page's.
-	if err := session.CheckLanding(); err != nil {
-		return nil, fmt.Errorf("after scan %q: %w", label, err)
+	if err := r.recheck(session, fmt.Sprintf("scan %q", label)); err != nil {
+		return nil, err
 	}
 	cov.record(checkAxe, rules)
 	return r.results(session, t, url, label, violations), nil
