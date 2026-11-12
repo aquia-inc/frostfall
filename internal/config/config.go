@@ -5,6 +5,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"reflect"
@@ -272,27 +273,64 @@ func checkKeys(node *yaml.Node, t reflect.Type) error {
 }
 
 // UnmarshalYAML gives a null `scan:`, `keyboard:`, or `transcript:` step its
-// documented meaning, all defaults. yaml.v3 never calls a field's own UnmarshalYAML for
-// a null value; it leaves the pointer nil, which reads as no action at all.
+// documented meaning, all defaults.
 func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 	type plain Step
 	if err := decodeStrict(node, (*plain)(s)); err != nil {
 		return err
 	}
+	defaultNulls(node, map[string]func(){
+		"scan":       func() { s.Scan = cmp.Or(s.Scan, &ScanStep{}) },
+		"keyboard":   func() { s.Keyboard = cmp.Or(s.Keyboard, &KeyboardStep{}) },
+		"transcript": func() { s.Transcript = cmp.Or(s.Transcript, &TranscriptStep{}) },
+	})
+	return nil
+}
+
+// defaultNulls runs fill for each key of the mapping whose value is null,
+// following aliases and merge keys (<<) as the decoder does. yaml.v3 never
+// calls a field's own UnmarshalYAML for null; it leaves the pointer nil,
+// which reads as "not configured" rather than the documented defaults. Each
+// fill leaves an already-decoded value alone, so an explicit key still wins
+// over a merged one.
+func defaultNulls(node *yaml.Node, fill map[string]func()) {
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i+1].Tag != "!!null" {
+		key, val := node.Content[i], node.Content[i+1]
+		if val.Kind == yaml.AliasNode {
+			val = val.Alias
+		}
+		if key.Tag == "!!merge" || key.Value == "<<" {
+			merged := []*yaml.Node{val}
+			if val.Kind == yaml.SequenceNode {
+				merged = val.Content
+			}
+			for _, m := range merged {
+				defaultNulls(m, fill)
+			}
 			continue
 		}
-		switch node.Content[i].Value {
-		case "scan":
-			s.Scan = &ScanStep{}
-		case "keyboard":
-			s.Keyboard = &KeyboardStep{}
-		case "transcript":
-			s.Transcript = &TranscriptStep{}
+		if f, ok := fill[key.Value]; ok && val.Tag == "!!null" {
+			f()
 		}
 	}
-	return nil
+}
+
+// decodeToggle decodes a block that also takes a bare boolean, in any form
+// the rule toggles accept (true/false, on/off, yes/no): off sets *off, on
+// means all defaults.
+func decodeToggle(node *yaml.Node, v any, off *bool) error {
+	if node.Kind == yaml.ScalarNode && node.Tag != "!!null" {
+		var on bool
+		if err := node.Decode(&on); err != nil {
+			return fmt.Errorf("line %d: want true, false, or a mapping: %w", node.Line, err)
+		}
+		*off = !on
+		return nil
+	}
+	return decodeStrict(node, v)
 }
 
 // ScanStep supports both bare `- scan:` / `scan: {}` and the full form.
@@ -313,24 +351,17 @@ func (s *ScanStep) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // UnmarshalYAML gives a bare `keyboard:` or `transcript:` on a test the
-// meaning the same key has on a step - on. yaml.v3 would leave the pointer
-// nil, silently skipping the check the config asked for.
+// meaning the same key has on a step - on - rather than silently skipping
+// the check the config asked for.
 func (t *Test) UnmarshalYAML(node *yaml.Node) error {
 	type plain Test
 	if err := decodeStrict(node, (*plain)(t)); err != nil {
 		return err
 	}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i+1].Tag != "!!null" {
-			continue
-		}
-		switch node.Content[i].Value {
-		case "keyboard":
-			t.Keyboard = &KeyboardStep{}
-		case "transcript":
-			t.Transcript = &TranscriptStep{}
-		}
-	}
+	defaultNulls(node, map[string]func(){
+		"keyboard":   func() { t.Keyboard = cmp.Or(t.Keyboard, &KeyboardStep{}) },
+		"transcript": func() { t.Transcript = cmp.Or(t.Transcript, &TranscriptStep{}) },
+	})
 	return nil
 }
 
@@ -347,17 +378,8 @@ type KeyboardStep struct {
 }
 
 func (k *KeyboardStep) UnmarshalYAML(node *yaml.Node) error {
-	switch node.Tag {
-	case "!!bool":
-		var on bool
-		if err := node.Decode(&on); err != nil {
-			return err
-		}
-		k.Off = !on
-		return nil
-	}
 	type plain KeyboardStep
-	return decodeStrict(node, (*plain)(k))
+	return decodeToggle(node, (*plain)(k), &k.Off)
 }
 
 func (k *KeyboardStep) validate() error {
@@ -376,6 +398,10 @@ func (k *KeyboardStep) validate() error {
 // rules feed both, so they take either.
 func onlyRules(where string, rules map[string]bool, kb bool) error {
 	for id := range rules {
+		// expectFocus reads only the defaults' and test's rules.
+		if kb && id == keyboard.RuleFocusExpectation {
+			return fmt.Errorf("%s: %q applies to expectFocus steps; set it in the test's rules", where, id)
+		}
 		if keyboard.IsRule(id) != kb {
 			if kb {
 				return fmt.Errorf("%s: %q is an axe rule; set it in a scan step or the test's rules", where, id)
@@ -408,16 +434,8 @@ type TranscriptStep struct {
 }
 
 func (t *TranscriptStep) UnmarshalYAML(node *yaml.Node) error {
-	if node.Tag == "!!bool" {
-		var on bool
-		if err := node.Decode(&on); err != nil {
-			return err
-		}
-		t.Off = !on
-		return nil
-	}
 	type plain TranscriptStep
-	return decodeStrict(node, (*plain)(t))
+	return decodeToggle(node, (*plain)(t), &t.Off)
 }
 
 // ExpectFocus asserts where focus is: every field set must hold. Role and

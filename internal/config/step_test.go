@@ -35,3 +35,37 @@ func TestUnknownKeysInSteps(t *testing.T) {
 		})
 	}
 }
+
+// A bare key reached through an alias or merge key means defaults too, and
+// an explicit key still wins over a merged one.
+func TestBareKeysThroughMerges(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `version: 1
+server:
+  baseUrl: http://x
+tests:
+  - id: merged
+    path: /
+    <<: &audit
+      keyboard:
+  - id: overridden
+    path: /
+    <<: *audit
+    keyboard: false
+  - id: step
+    path: /
+    steps:
+      - <<: *audit
+`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := cfg.Tests[0].Keyboard; k == nil || k.Off {
+		t.Errorf("merged bare keyboard: decoded as %+v", k)
+	}
+	if k := cfg.Tests[1].Keyboard; k == nil || !k.Off {
+		t.Errorf("explicit keyboard: false lost to the merge: %+v", k)
+	}
+	if cfg.Tests[2].Steps[0].Keyboard == nil {
+		t.Error("merged bare keyboard: step decoded as no action")
+	}
+}

@@ -14,7 +14,7 @@ defaults:
 tests:
   - id: on
     path: /
-    keyboard: true
+    keyboard: on
   - id: off
     path: /
     keyboard: false
@@ -39,7 +39,7 @@ func TestKeyboardForms(t *testing.T) {
 	}
 	on, off, full, step := cfg.Tests[0], cfg.Tests[1], cfg.Tests[2], cfg.Tests[3]
 	if on.Keyboard == nil || on.Keyboard.Off {
-		t.Errorf("keyboard: true decoded as %+v", on.Keyboard)
+		t.Errorf("keyboard: on decoded as %+v", on.Keyboard)
 	}
 	if off.Keyboard == nil || !off.Keyboard.Off {
 		t.Errorf("keyboard: false decoded as %+v", off.Keyboard)
@@ -122,6 +122,14 @@ tests:
     path: /
     steps:
       - keyboard: { rules: { color-contrast: off } }`, "is an axe rule"},
+		"focus-expectation in a keyboard step": {`
+tests:
+  - id: a
+    path: /
+    steps:
+      - keyboard: { rules: { frostfall/focus-expectation: off } }`, "applies to expectFocus steps"},
+		"keyboard toggle that is not a boolean": {`
+tests: [{id: a, path: /, keyboard: sometimes}]`, "want true, false, or a mapping"},
 		"negative maxTabs": {`
 tests: [{id: a, path: /, keyboard: {maxTabs: -1}}]`, "must not be negative"},
 	}

@@ -17,6 +17,7 @@ import (
 	"math"
 
 	"github.com/aquia-inc/frostfall/internal/engine"
+	"github.com/aquia-inc/frostfall/internal/fingerprint"
 )
 
 //go:embed keyboard.js
@@ -219,10 +220,14 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 		return nil, fmt.Errorf("injecting keyboard audit: %w", err)
 	}
 	var init initResult
-	if err := a.call("init", &init, opts.Scope); err != nil {
+	if err := a.call("init", &init, opts.Scope, fingerprint.GeneratedIDPattern); err != nil {
 		return nil, err
 	}
+	// Deferred in this order so reenter runs first: finish restores focus
+	// with element.focus(), which cannot pull focus back from the browser
+	// UI a traversal may have ended on.
 	defer a.call("finish", nil)
+	defer a.reenter()
 
 	if init.Modal != nil && !init.ActiveInModal {
 		a.report(RuleDialog, init.Modal.Sel, init.Modal.HTML,
@@ -237,7 +242,6 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 	reached := map[int]bool{}
 	var (
 		first int
-		prev  *stop
 		// pend is the last stop captured while focused, awaiting its
 		// comparison once something else has focus.
 		pend       *stop
@@ -310,7 +314,7 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 				cycleEnded = true
 				break
 			}
-			prev, lastID, leftPage = nil, 0, true
+			lastID, leftPage = 0, true
 			continue
 		}
 		outs = 0
@@ -318,7 +322,6 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 		// active element; its contents are out of scope.
 		if cur.Frame {
 			reached[cur.ID] = true
-			prev = nil
 			continue
 		}
 		last = cur
@@ -355,11 +358,8 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 				"Pressing Tab moved focus out of the open modal dialog to "+cur.Sel)
 		}
 		if !cur.InScope {
-			prev = nil
 			continue
 		}
-		stopCopy := cur
-		prev = &stopCopy
 		if cur.Hidden != "" {
 			a.report(RuleHidden, cur.Sel, cur.HTML, "Focus landed on this element, but "+cur.Hidden)
 			continue
@@ -369,7 +369,8 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 			if err != nil {
 				return nil, err
 			}
-			pend, pendRegion, pendShot = prev, curRegion, shot
+			focused := cur
+			pend, pendRegion, pendShot = &focused, curRegion, shot
 		}
 	}
 	if !cycleEnded && !trapped {
@@ -497,4 +498,17 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) er
 		}
 	}
 	return nil
+}
+
+// reenter brings focus back into the page if the audit left it in the
+// browser UI (a page with no tab stops, a lap that ended off the page).
+// It asks whether the document has focus, not whether an element does: on a
+// page with no tab stops the document itself takes focus, with <body> active.
+func (a *audit) reenter() {
+	for range 2 {
+		raw, err := a.page.Eval(`() => document.hasFocus()`)
+		if err != nil || string(raw) == "true" || a.page.PressTab() != nil {
+			return
+		}
+	}
 }

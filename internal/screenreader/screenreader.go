@@ -18,6 +18,8 @@ import (
 type Page interface {
 	Eval(js string, args ...any) (json.RawMessage, error)
 	AXTree() ([]*proto.AccessibilityAXNode, error)
+	// FocusedAX is the focused element's node, nil when nothing has focus.
+	FocusedAX() (*proto.AccessibilityAXNode, error)
 	// BackendNodeID resolves a CSS selector to its DOM node, for scoping.
 	BackendNodeID(selector string) (proto.DOMBackendNodeID, error)
 }
@@ -224,19 +226,11 @@ type Expectation struct {
 // CheckFocus reports whether focus meets e, and when it does not, a sentence
 // saying where focus actually is.
 func CheckFocus(p Page, e Expectation) (ok bool, actual string, err error) {
-	nodes, err := p.AXTree()
+	focused, err := p.FocusedAX()
 	if err != nil {
-		return false, "", fmt.Errorf("reading accessibility tree: %w", err)
+		return false, "", fmt.Errorf("reading the focused element: %w", err)
 	}
-	var focused *proto.AccessibilityAXNode
-	for _, n := range nodes {
-		for _, prop := range n.Properties {
-			if prop.Name == "focused" && prop.Value != nil && prop.Value.Value.Bool() {
-				focused = n
-			}
-		}
-	}
-	if focused == nil || str(focused.Role) == "RootWebArea" {
+	if focused == nil {
 		return false, "focus is not on any element", nil
 	}
 	actual = "focus is on " + Line(focused)

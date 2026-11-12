@@ -205,3 +205,36 @@ func TestAuditRestoresState(t *testing.T) {
 		t.Errorf("after audit: focus@scroll = %s, want start@0", got)
 	}
 }
+
+// An audit of a page with no tab stops ends with focus in the browser UI;
+// steps after it (a press, an expectFocus) need the page to have it back.
+func TestAuditReturnsFocusToPage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<!DOCTYPE html><html><body><p>nothing to focus</p></body></html>`))
+	}))
+	defer srv.Close()
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer b.Close()
+	s, err := b.NewSession(srv.URL, config.Viewport{Width: 800, Height: 600}, "load", 0, 20*time.Second)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := keyboard.Audit(context.Background(), s, keyboard.Options{}); err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	raw, err := s.Eval(`() => document.hasFocus()`)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if string(raw) != "true" {
+		t.Error("after audit, the page does not have focus")
+	}
+}

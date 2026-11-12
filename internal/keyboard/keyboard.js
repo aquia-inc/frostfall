@@ -21,14 +21,15 @@
     'video[controls]', '[contenteditable]:not([contenteditable="false"])',
   ].join(',');
 
-  // Mirrors the fingerprinter's generated-id test: anchoring a selector on a
-  // per-session id would make every run look like a new violation.
-  const generatedID = /[0-9a-f]{8,}|[0-9]{4,}$|^:r[a-z0-9]+:?$/;
+  // The fingerprinter's generated-id test, passed in by init: anchoring a
+  // selector on a per-session id would make every run look like a new
+  // violation.
+  let generatedID = null;
 
   function selectorOf(el) {
     const parts = [];
     for (let n = el; n && n.nodeType === 1 && n !== document.documentElement; n = n.parentElement) {
-      if (n.id && !generatedID.test(n.id)) {
+      if (n.id && !(generatedID && generatedID.test(n.id))) {
         parts.unshift('#' + CSS.escape(n.id));
         break;
       }
@@ -143,7 +144,8 @@
   const inScope = (el) => !scopeEl || containsDeep(scopeEl, el);
 
   window.__ffkb = {
-    init(scope) {
+    init(scope, idPattern) {
+      generatedID = new RegExp(idPattern);
       scopeEl = scope ? document.querySelector(scope) : null;
       if (scope && !scopeEl) throw new Error(`scope ${JSON.stringify(scope)} matches no element`);
       // A blinking caret would make an input with no focus style look styled.
@@ -166,11 +168,17 @@
     unreached(reachedIDs) {
       const reached = reachedIDs.map((id) => byID.get(id)?.deref()).filter(Boolean);
       const groups = new Set(reached.map(radioGroup).filter(Boolean));
+      // Every element focus landed on or inside, built once: a stop counts as
+      // reached when it is one of them.
+      const covered = new Set();
+      for (const r of reached) {
+        for (let n = r; n && !covered.has(n); n = n.parentElement || n.getRootNode().host) covered.add(n);
+      }
       const root = modal || document;
       return [...root.querySelectorAll(FOCUSABLE)]
         .filter((el) => inScope(el) && el.tabIndex >= 0 && !el.matches(':disabled') &&
           !el.closest('[inert]') && el.checkVisibility({ visibilityProperty: true }) && hasSize(el))
-        .filter((el) => !reached.some((r) => containsDeep(el, r)) && !groups.has(radioGroup(el)))
+        .filter((el) => !covered.has(el) && !groups.has(radioGroup(el)))
         .map((el) => ({ sel: selectorOf(el), html: snippet(el) }));
     },
 

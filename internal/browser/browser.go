@@ -189,7 +189,9 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		if err != nil {
 			return err
 		}
-		return s.page.Keyboard.Press(key)
+		// Type, not Press: rod's Press sends only keydown, leaving the key
+		// held and keyup handlers unfired.
+		return s.page.Keyboard.Type(key)
 	case st.Hover != "":
 		el, err := s.page.Element(st.Hover)
 		if err != nil {
@@ -250,9 +252,10 @@ func (s *Session) CaptureElement(sel string) ([]byte, error) {
 	return el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
 }
 
-// PressTab implements keyboard.Page with a real CDP key event, which moves
-// focus the way a user's Tab does - a synthetic JS event would not.
-func (s *Session) PressTab() error { return s.page.Keyboard.Press(input.Tab) }
+// PressTab implements keyboard.Page with real CDP key events, which move
+// focus the way a user's Tab does - a synthetic JS event would not. Type
+// sends keydown and keyup; rod's Press alone would leave Tab held.
+func (s *Session) PressTab() error { return s.page.Keyboard.Type(input.Tab) }
 
 // CaptureRegion implements keyboard.Page: a PNG of a rectangle in document
 // coordinates, inside the viewport.
@@ -275,6 +278,37 @@ func (s *Session) AXTree() ([]*proto.AccessibilityAXNode, error) {
 		return nil, err
 	}
 	return res.Nodes, nil
+}
+
+// FocusedAX implements screenreader.Page: the accessibility node of the
+// element with focus (descending into shadow roots), or nil when focus is on
+// no element.
+func (s *Session) FocusedAX() (*proto.AccessibilityAXNode, error) {
+	res, err := s.page.Evaluate(rod.Eval(`() => {
+		let a = document.activeElement;
+		while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+		return !document.hasFocus() || !a || a === document.body || a === document.documentElement ? null : a;
+	}`).ByObject())
+	if err != nil {
+		return nil, err
+	}
+	if res.ObjectID == "" {
+		return nil, nil
+	}
+	node, err := proto.DOMDescribeNode{ObjectID: res.ObjectID}.Call(s.page)
+	if err != nil {
+		return nil, err
+	}
+	tree, err := proto.AccessibilityGetPartialAXTree{BackendNodeID: node.Node.BackendNodeID}.Call(s.page)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range tree.Nodes {
+		if n.BackendDOMNodeID == node.Node.BackendNodeID {
+			return n, nil
+		}
+	}
+	return nil, nil
 }
 
 // BackendNodeID implements screenreader.Page. A short timeout: a scope that
