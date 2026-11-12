@@ -155,7 +155,7 @@ func TestDiscoverAuthWarning(t *testing.T) {
 		return c
 	}
 	setup := "auth:\n  signedIn: \"#in\"\n  setup:\n    path: /login\n    steps:\n      - click: a\n"
-	if w := discoverAuthWarning(load(setup+"  reuse: false\n", "discover:\n  maxPages: 7\n")); !strings.Contains(w, "once per crawled page") || !strings.Contains(w, "(7)") {
+	if w := discoverAuthWarning(load(setup+"  reuse: false\n", "discover:\n  maxPages: 7\n")); !strings.Contains(w, "once per page it loads") || !strings.Contains(w, "(7) loads") || !strings.Contains(w, "each discovered test logs in again") {
 		t.Errorf("reuse false: warning = %q", w)
 	}
 	if w := discoverAuthWarning(load(setup+"  reuse: false\n", "")); !strings.Contains(w, "(100)") {
@@ -166,5 +166,79 @@ func TestDiscoverAuthWarning(t *testing.T) {
 	}
 	if w := discoverAuthWarning(load("", "")); w != "" {
 		t.Errorf("no auth warned: %q", w)
+	}
+}
+
+// authSite serves a marker (#in) on every page, so the signed-out probe
+// refuses it whenever it runs.
+func authSite(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i>page</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func writeAuthConfig(t *testing.T, base, tests string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"cookies":[],"origins":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "version: 1\nserver:\n  baseUrl: " + base + "\ndefaults:\n  waitFor: load\n  timeout: 8s\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n" + tests
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+// When every selected test says auth: false and there is no discovery,
+// nothing signs in: no probe, no login flow. The probe here would refuse the
+// marker (it is on every page), so reaching exit 0 shows it never ran.
+func TestAuthIsSkippedWhenNoTestUsesIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	t.Chdir(t.TempDir())
+	off := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /\n    auth: false\n")
+	if code, stderr := runCaptured(t, "--config", off, "--no-screenshots", "--baseline", "none"); code != exitOK {
+		t.Errorf("all tests auth: false: exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	on := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /\n")
+	if code, stderr := runCaptured(t, "--config", on, "--no-screenshots", "--baseline", "none"); code != exitEnvironment {
+		t.Errorf("a test uses auth: exit code = %d, want %d (stderr: %s)", code, exitEnvironment, stderr)
+	}
+}
+
+func TestValidateChecksTestOriginsAndFilters(t *testing.T) {
+	cfg := writeAuthConfig(t, "http://127.0.0.1:9", "  - id: ok\n    path: /\n  - id: other\n    url: http://localhost:9/x\n")
+	// --validate with a known base URL runs the check.
+	code, stderr := runCaptured(t, "--config", cfg, "--validate")
+	if code != exitBadConfig || !strings.Contains(stderr, `test "other"`) {
+		t.Errorf("--validate: exit code = %d, stderr = %q, want a config error naming the test", code, stderr)
+	}
+	// A filtered run is only judged on the tests it selects.
+	if code, stderr := runCaptured(t, "--config", cfg, "--validate", "--id", "^ok$"); code != exitOK {
+		t.Errorf("--validate --id ok: exit code = %d, stderr = %q", code, stderr)
+	}
+}
+
+// A filtered run is judged only on the tests it selects: the cross-origin
+// test is not run, so it is not refused.
+func TestScanChecksOnlySelectedTestsForOrigins(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	t.Chdir(t.TempDir())
+	cfg := writeAuthConfig(t, srv.URL, "  - id: ok\n    path: /\n    auth: false\n  - id: other\n    url: http://localhost:9/x\n")
+	if code, stderr := runCaptured(t, "--config", cfg, "--no-screenshots", "--baseline", "none"); code != exitBadConfig {
+		t.Fatalf("unfiltered: exit code = %d, want %d (stderr: %s)", code, exitBadConfig, stderr)
+	}
+	if code, stderr := runCaptured(t, "--config", cfg, "--id", "^ok$", "--no-screenshots", "--baseline", "none"); code != exitOK {
+		t.Errorf("filtered to the test that is fine: exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
 	}
 }

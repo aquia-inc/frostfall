@@ -64,7 +64,7 @@ func authFor(t *testing.T, b *browser.Browser, base string, withSession bool, al
 	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"cookies":`+cookies+`,"origins":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	yml := "version: 1\nserver:\n  baseUrl: " + base + "\ntests:\n  - id: t\n    path: /\nauth:\n  storageState: state.json\n  loginPath: /login\n  signedIn: \"#in\"\n"
+	yml := "version: 1\nserver:\n  baseUrl: " + base + "\ndefaults:\n  timeout: 8s\ntests:\n  - id: t\n    path: /\nauth:\n  storageState: state.json\n  loginPath: /login\n  signedIn: \"#in\"\n"
 	for _, o := range allowed {
 		yml += "  allowedOrigins: [\"" + o + "\"]\n"
 	}
@@ -262,7 +262,7 @@ func TestCrawlOffOriginLandings(t *testing.T) {
 func setupAuth(t *testing.T, b *browser.Browser, base string, reuse bool) *browser.Auth {
 	t.Helper()
 	dir := t.TempDir()
-	yml := fmt.Sprintf("version: 1\nserver:\n  baseUrl: %s\ntests:\n  - id: t\n    path: /\nauth:\n  reuse: %v\n  signedIn: \"#in\"\n"+
+	yml := fmt.Sprintf("version: 1\nserver:\n  baseUrl: %s\ndefaults:\n  timeout: 8s\ntests:\n  - id: t\n    path: /\nauth:\n  reuse: %v\n  signedIn: \"#in\"\n"+
 		"  setup:\n    path: /login\n    steps:\n      - click: \"#go\"\n      - waitFor: \"#in\"\n", base, reuse)
 	if err := os.WriteFile(filepath.Join(dir, "frostfall.yml"), []byte(yml), 0o644); err != nil {
 		t.Fatal(err)
@@ -479,5 +479,133 @@ func TestSignedInCrawlCleansDiscoveredPaths(t *testing.T) {
 				t.Errorf("%q carries %q into a test id", p, secret)
 			}
 		}
+	}
+}
+
+// Signed in, the cleaning runs before the excludes: a ;param or a token must
+// not carry a login page or a user's excluded path past its regex.
+func TestSignedInCrawlCleansBeforeExcludes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		if r.URL.Path == "/login" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>login</body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/login;sid=1">x</a><a href="/admin;x=1">x</a><a href="/ok">x</a>`)
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	a := authFor(t, b, srv.URL, true)
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+	c := crawler(b, a, srv.URL)
+	c.Options.Exclude = []string{`^/admin$`}
+	got, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/", "/ok"}; !slices.Equal(got, want) {
+		t.Errorf("found = %v, want %v", got, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["/login"] != 0 || hits["/admin"] != 0 {
+		t.Errorf("hits = %v: an excluded page was loaded", hits)
+	}
+}
+
+func manyLinksSite(t *testing.T, mu *sync.Mutex, hits map[string]int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		if r.URL.Path == "/login" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>login</body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" || r.URL.Path == "/a-drop" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/a-drop">x</a><a href="/b">x</a><a href="/c">x</a><a href="/d">x</a>`)
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// Signed in, maxPages caps page loads, dropped pages included: a crawl whose
+// pages keep being dropped (each possibly costing a login) must still stop.
+// Signed out the loop is as it always was, a cap on pages found.
+func TestMaxPagesCapsLoadsWhenSignedIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := manyLinksSite(t, &mu, hits)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	a := authFor(t, b, srv.URL, true)
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+	c := crawler(b, a, srv.URL)
+	c.Options.MaxDepth, c.Options.MaxPages = 1, 3
+	got, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Loads: /, /a-drop (dropped), /b. A cap on found pages would have gone on to /c.
+	if want := []string{"/", "/b"}; !slices.Equal(got, want) {
+		t.Errorf("found = %v, want %v", got, want)
+	}
+	mu.Lock()
+	if hits["/c"] != 0 {
+		t.Errorf("hits = %v: the dropped page did not count toward maxPages", hits)
+	}
+	mu.Unlock()
+
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><a href="/a">x</a><a href="/b">x</a><a href="/c">x</a></body></html>`)
+	}))
+	t.Cleanup(public.Close)
+	c = crawler(b, nil, public.URL)
+	c.Options.MaxDepth, c.Options.MaxPages = 1, 3
+	plain, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/", "/a", "/b"}; !slices.Equal(plain, want) {
+		t.Errorf("signed-out found = %v, want %v: the unauthenticated loop must not change", plain, want)
 	}
 }

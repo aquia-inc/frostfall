@@ -73,7 +73,7 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 	}
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"cookies":`+cookies+`,"origins":[]}`), 0o600)
-	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  settleTime: 10ms\ntests:\n" + o.tests
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  settleTime: 10ms\n  timeout: 8s\ntests:\n" + o.tests
 	if !o.noAuth {
 		yml += "auth:\n  storageState: state.json\n  loginPath: /login\n  signedIn: \"#in\"\n"
 	}
@@ -266,5 +266,44 @@ func TestEveryCheckIsFollowedByALandingRecheck(t *testing.T) {
 				t.Errorf("results were returned from the login page: %+v", run.Results)
 			}
 		})
+	}
+}
+
+// oneViolation reports a single finding on every scan.
+type oneViolation struct{}
+
+func (oneViolation) Name() string    { return "one" }
+func (oneViolation) Version() string { return "0" }
+func (oneViolation) Audit(context.Context, engine.Page, engine.ScanOptions) ([]engine.Violation, error) {
+	return []engine.Violation{{RuleID: "image-alt", Impact: engine.Critical, Target: "img"}}, nil
+}
+
+// PageURL ends up in SARIF locations and the HTML report. With auth it is
+// redacted like every other printed URL; without, it is what it always was.
+func TestReportedPageURLsFollowTheAuthConfig(t *testing.T) {
+	tests := "  - id: q\n    path: /app?token=SECRETTOK123#/route&access_token=ZZZ\n    transcript: true\n"
+	run, err := runSite(t, runOpts{withSession: true, tests: tests, engine: oneViolation{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Results) == 0 || len(run.Transcripts) == 0 {
+		t.Fatalf("results = %d, transcripts = %d", len(run.Results), len(run.Transcripts))
+	}
+	urls := []string{run.Results[0].PageURL, run.Transcripts[0].PageURL}
+	for _, u := range urls {
+		if strings.Contains(u, "SECRETTOK123") || strings.Contains(u, "ZZZ") || strings.Contains(u, "?") {
+			t.Errorf("a secret reached a reported PageURL: %q", u)
+		}
+		if !strings.HasSuffix(u, "/app#/route") {
+			t.Errorf("PageURL = %q, want the redacted page identity", u)
+		}
+	}
+
+	plain, err := runSite(t, runOpts{noAuth: true, tests: "  - id: q\n    path: /plain?keep=1\n", engine: oneViolation{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(plain.Results[0].PageURL, "/plain?keep=1") {
+		t.Errorf("without auth PageURL = %q, want it unchanged", plain.Results[0].PageURL)
 	}
 }

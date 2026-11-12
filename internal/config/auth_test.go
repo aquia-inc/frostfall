@@ -305,3 +305,38 @@ func TestCheckTestOrigins(t *testing.T) {
 		t.Errorf("a config without auth was checked: %v", err)
 	}
 }
+
+// A default port is the same origin as none, in the base URL or the test's.
+func TestCheckTestOriginsDefaultPorts(t *testing.T) {
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ base, url string }{
+		{"http://127.0.0.1", "http://127.0.0.1:80/x"},
+		{"http://127.0.0.1:80", "http://127.0.0.1/x"},
+		{"https://app.example.com", "https://app.example.com:443/x"},
+		{"https://app.example.com:443", "https://APP.example.com/x"},
+	}
+	for _, tc := range cases {
+		if err := cfg.CheckTestOrigins(tc.base, []Test{{ID: "t", URL: tc.url}}); err != nil {
+			t.Errorf("base %s, url %s: %v", tc.base, tc.url, err)
+		}
+	}
+	if err := cfg.CheckTestOrigins("http://127.0.0.1", []Test{{ID: "t", URL: "https://127.0.0.1:80/x"}}); err == nil {
+		t.Error("another scheme on the same number is another origin")
+	}
+}
+
+func TestTestPathMustStartWithASlash(t *testing.T) {
+	for path, ok := range map[string]bool{"/": true, "/a/b": true, "/#/route": true, "dashboard": false, "./a": false, "?q=1": false} {
+		yml := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: \"" + path + "\"\n"
+		_, err := Load(writeConfigIn(t, t.TempDir(), yml), "")
+		if (err == nil) != ok {
+			t.Errorf("path %q: err = %v, want ok=%v", path, err, ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "path must start with /") {
+			t.Errorf("path %q: err = %v", path, err)
+		}
+	}
+}

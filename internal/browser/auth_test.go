@@ -31,6 +31,10 @@ type authApp struct {
 	idp, bounceTo, loginTo string
 	loginDelay, rootDelay  time.Duration
 	rootCookie             string
+	// rootTo redirects /, rootDrop hangs up on it, rootLate draws #late on it
+	// a second after load, signed in or not.
+	rootTo             string
+	rootDrop, rootLate bool
 }
 
 func newAuthApp(t *testing.T) *authApp {
@@ -118,6 +122,20 @@ func newAuthApp(t *testing.T) *authApp {
 	// then, and rootDelay stalls it.
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(app.rootDelay)
+		if app.rootDrop {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				conn.Close()
+			}
+			return
+		}
+		if app.rootTo != "" {
+			http.Redirect(w, r, app.rootTo+"/idp-probe", http.StatusFound)
+			return
+		}
+		late := ""
+		if app.rootLate {
+			late = `<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<i id="late"></i>'), 1000)</script>`
+		}
 		if app.rootCookie != "" {
 			http.SetCookie(w, &http.Cookie{Name: app.rootCookie, Value: "1", Path: "/"})
 		}
@@ -125,7 +143,7 @@ func newAuthApp(t *testing.T) *authApp {
 		if c, err := r.Cookie("sid"); err == nil && c.Value == "valid" {
 			shell = `<div id="shell">app</div>`
 		}
-		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>home</title></head><body><main>%s<form><button>sign in</button></form></main></body></html>`, shell)
+		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>home</title></head><body><main>%s<form><button>sign in</button></form></main>%s</body></html>`, shell, late)
 	})
 	app.Server = httptest.NewServer(mux)
 	t.Cleanup(app.Close)

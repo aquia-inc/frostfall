@@ -558,12 +558,12 @@ func TestSignedOutProbeRefusesAMarkerThatMatchesWithoutASession(t *testing.T) {
 			t.Errorf("err = %v, want the login path probe to refuse the marker", err)
 		}
 	})
-	t.Run("the setup page before the steps", func(t *testing.T) {
+	t.Run("the setup page", func(t *testing.T) {
 		// /probe is public and marked, so the end-of-setup check alone would pass
 		// a login that never happened.
 		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /probe\n    steps:\n      - waitFor: \"#t\"\n")
 		_, err := NewAuth(b, cfg, app.URL, AuthOptions{})
-		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "already matches the setup page") {
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "the setup page") {
 			t.Errorf("err = %v, want the marker refused on the setup page", err)
 		}
 	})
@@ -592,4 +592,111 @@ func TestAnonymousSessionKeepsTheRunsRedaction(t *testing.T) {
 	if strings.Contains(err.Error(), "SECRETTOK123") {
 		t.Errorf("an auth: false test printed a secret: %v", err)
 	}
+}
+
+func probeWarnings(t *testing.T, b *Browser, app *authApp, authYAML, firstTest string) ([]string, error) {
+	t.Helper()
+	cfg := loadAuthConfig(t, app.URL, authYAML)
+	var warns []string
+	var mu sync.Mutex
+	_, err := NewAuth(b, cfg, app.URL, AuthOptions{
+		FirstTest: firstTest,
+		Warn: func(f string, a ...any) {
+			mu.Lock()
+			warns = append(warns, fmt.Sprintf(f, a...))
+			mu.Unlock()
+		},
+	})
+	return warns, err
+}
+
+// A signed-out page that draws the marker a moment after load must be seen by
+// the probe as the guard would see it, or it passes both.
+func TestProbeWaitsForALateMarker(t *testing.T) {
+	app := newAuthApp(t)
+	app.rootLate = true
+	b := launch(t)
+	_, err := probeWarnings(t, b, app, "  storageState: "+stateFile(t, app, "-1", true)+"\n  signedIn: \"#late\"\n", "")
+	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "also matches the base URL") {
+		t.Errorf("err = %v, want the late marker caught on the signed-out base URL", err)
+	}
+}
+
+// A selector waitFor is typically something only signed-in pages render:
+// waiting for it signed out would time out every run.
+func TestProbeAndSetupIgnoreASelectorWaitFor(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	for name, auth := range map[string]string{
+		"storageState": "  storageState: " + stateFile(t, app, "-1", true) + "\n  loginPath: /login\n",
+		"setup":        setupYAML + "  loginPath: /login\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := loadAuthConfig(t, app.URL, auth)
+			cfg.Defaults.WaitFor = "#in" // absent on every signed-out page
+			cfg.Defaults.Timeout = config.Duration(4 * time.Second)
+			start := time.Now()
+			if _, err := NewAuth(b, cfg, app.URL, AuthOptions{}); err != nil {
+				t.Fatalf("a selector waitFor broke the startup: %v", err)
+			}
+			if d := time.Since(start); d > 20*time.Second {
+				t.Errorf("startup took %s", d)
+			}
+		})
+	}
+}
+
+func TestProbeCoverageAndWarnings(t *testing.T) {
+	app, idp := newAuthApp(t), newAuthApp(t)
+	b := launch(t)
+	state := "  storageState: " + stateFile(t, app, "-1", true) + "\n"
+
+	t.Run("the first test that uses auth is probed", func(t *testing.T) {
+		// /probe is public and marked: the guard would judge that test's page
+		// first, and the marker cannot tell it from the signed-in app.
+		_, err := probeWarnings(t, b, app, state, "/probe")
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "the first test that uses auth") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("a root that bounces off the app warns twice", func(t *testing.T) {
+		bounced := newAuthApp(t)
+		bounced.rootTo = idp.URL
+		warns, err := probeWarnings(t, b, bounced, "  storageState: "+stateFile(t, bounced, "-1", true)+"\n", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(warns, "\n")
+		for _, want := range []string{"not the app's origin", "was not checked on that page", "could not be verified as absent"} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("warnings %q lack %q", warns, want)
+			}
+		}
+	})
+	t.Run("an unreachable root only warns when another page was checked", func(t *testing.T) {
+		dropped := newAuthApp(t)
+		dropped.rootDrop = true
+		warns, err := probeWarnings(t, b, dropped, "  storageState: "+stateFile(t, dropped, "-1", true)+"\n", "/idp-probe")
+		if err != nil {
+			t.Fatalf("a network error on the root killed the run: %v", err)
+		}
+		if len(warns) != 1 || !strings.Contains(warns[0], "could not load the base URL") {
+			t.Errorf("warnings = %q, want only the unreachable root", warns)
+		}
+	})
+	t.Run("a failing page that is not the root fails clearly, redacted", func(t *testing.T) {
+		_, err := probeWarnings(t, b, app, state+"  loginPath: /drop?token=SECRETTOK123\n", "")
+		if err == nil || !strings.Contains(err.Error(), "probing the login path /drop signed out") {
+			t.Fatalf("err = %v, want the failing page named", err)
+		}
+		if strings.Contains(err.Error(), "SECRETTOK123") {
+			t.Errorf("the probe printed a secret: %v", err)
+		}
+	})
+	t.Run("a good marker raises no warnings", func(t *testing.T) {
+		warns, err := probeWarnings(t, b, app, state+"  loginPath: /login\n", "/app")
+		if err != nil || len(warns) != 0 {
+			t.Errorf("err = %v, warnings = %q", err, warns)
+		}
+	})
 }
