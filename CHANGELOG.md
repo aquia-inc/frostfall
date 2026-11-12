@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.5.0](https://github.com/aquia-inc/frostfall/compare/v1.4.2...v1.5.0) (2026-11-12)
+
+### Features
+
+* keyboard audit, screen reader transcripts, and focus assertions ([#61](https://github.com/aquia-inc/frostfall/issues/61)) ([d7f6749](https://github.com/aquia-inc/frostfall/commit/d7f6749596da8b68c412eb46b0edf3f8c7461d36)), closes [#51](https://github.com/aquia-inc/frostfall/issues/51) [#52](https://github.com/aquia-inc/frostfall/issues/52)
+
 ## [1.4.2](https://github.com/aquia-inc/frostfall/compare/v1.4.1...v1.4.2) (2026-08-20)
 
 ## [1.4.1](https://github.com/aquia-inc/frostfall/compare/v1.4.0...v1.4.1) (2026-08-20)
