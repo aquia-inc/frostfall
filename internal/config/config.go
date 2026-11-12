@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -209,7 +210,49 @@ func (f *Fields) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// ScanStep supports both bare `- scan` / `scan: {}` and the full form.
+// decodeStrict decodes node into v, rejecting unknown keys. A custom
+// UnmarshalYAML must use it instead of node.Decode, which does not inherit
+// the outer decoder's KnownFields: a typo'd scope would otherwise be dropped
+// and the scan would silently cover the whole page. The keys are checked
+// against v's yaml tags rather than by re-decoding a marshalled copy, which
+// would lose anchors defined elsewhere in the file.
+func decodeStrict(node *yaml.Node, v any) error {
+	if node.Kind == yaml.MappingNode {
+		known := map[string]bool{}
+		t := reflect.TypeOf(v).Elem()
+		for i := range t.NumField() {
+			name, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ",")
+			known[name] = name != "-"
+		}
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if key := node.Content[i]; key.Tag != "!!merge" && !known[key.Value] {
+				return fmt.Errorf("line %d: field %s not found", key.Line, key.Value)
+			}
+		}
+	}
+	return node.Decode(v)
+}
+
+// UnmarshalYAML gives a null `scan:` step its documented meaning, all
+// defaults. yaml.v3 never calls a field's own UnmarshalYAML for
+// a null value; it leaves the pointer nil, which reads as no action at all.
+func (s *Step) UnmarshalYAML(node *yaml.Node) error {
+	type plain Step
+	if err := decodeStrict(node, (*plain)(s)); err != nil {
+		return err
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i+1].Tag != "!!null" {
+			continue
+		}
+		if node.Content[i].Value == "scan" {
+			s.Scan = &ScanStep{}
+		}
+	}
+	return nil
+}
+
+// ScanStep supports both bare `- scan:` / `scan: {}` and the full form.
 type ScanStep struct {
 	Label string          `yaml:"label"`
 	Scope string          `yaml:"scope"`
@@ -223,7 +266,7 @@ func (s *ScanStep) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	}
 	type plain ScanStep
-	return node.Decode((*plain)(s))
+	return decodeStrict(node, (*plain)(s))
 }
 
 var validStandards = map[string]bool{
