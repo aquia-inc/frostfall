@@ -82,18 +82,28 @@ func TestGuardKeyIgnoresHashRouteQuery(t *testing.T) {
 	}
 }
 
-func TestRedactURLDropsQuery(t *testing.T) {
+func TestRedactURL(t *testing.T) {
 	for in, want := range map[string]string{
-		"/login?token=abc":    "/login",
-		"/#/login?token=abc":  "/#/login",
-		"http://h/app?x=1#/y": "http://h/app",
-		"/plain":              "/plain",
+		"/login?token=abc":                       "/login",
+		"/#/login?token=abc":                     "/#/login",
+		"http://h/app?x=1#/y":                    "http://h/app#/y", // a hash route is page identity
+		"http://h/app?x=1#section":               "http://h/app",
+		"/plain":                                 "/plain",
+		"http://user:pa55@h:8080/p?q=1#frag":     "http://h:8080/p",
+		"https://u@h/p":                          "https://h/p",
+		"/login;jsessionid=ABC123":               "/login",
+		"/a;x=1/b;y=2?z":                         "/a/b",
+		"http://h/login;jsessionid=ABC?x#/r?t=1": "http://h/login#/r",
+		"":                                       "",
 	} {
 		if got := RedactURL(in); got != want {
 			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if got := describeStep(config.Step{Goto: "/next?token=abc"}); strings.Contains(got, "abc") {
+	if got := RedactURL("http://[bad"); strings.Contains(got, "bad") {
+		t.Errorf("an unparsable URL was echoed: %q", got)
+	}
+	if got := describeStep(config.Step{Goto: "/next?token=abc;k=v"}); strings.Contains(got, "abc") || strings.Contains(got, "k=v") {
 		t.Errorf("describeStep leaks a query: %q", got)
 	}
 }

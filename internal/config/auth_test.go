@@ -18,6 +18,9 @@ const validSetup = `  setup:
       - click: "button[type=submit]"
 `
 
+// signed is the signedIn line every auth block needs.
+const signed = "  signedIn: \"#shell\"\n"
+
 const goodState = `{"cookies":[{"name":"sid","value":"s3cret","domain":"x","path":"/","expires":-1,
 "httpOnly":true,"secure":false,"sameSite":"Lax"}],"origins":[{"origin":"http://x","localStorage":[{"name":"token","value":"t0k"}]}]}`
 
@@ -39,33 +42,32 @@ func TestAuthValidation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte(`{"cookies": [`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	validSetup := validSetup + signed
 	cases := []struct {
 		name string
 		auth string
 		want string // empty means it must load
 	}{
 		{"setup", validSetup, ""},
-		{"storageState", "  storageState: state.json\n  loginPath: /login\n", ""},
+		{"storageState", "  storageState: state.json\n" + signed, ""},
+		{"storageState with loginPath", "  storageState: state.json\n  loginPath: /login\n" + signed, ""},
+		{"setup without signedIn", validSetup[:len(validSetup)-len(signed)], "auth.signedIn: required"},
+		{"storageState without signedIn", "  storageState: state.json\n  loginPath: /login\n", "auth.signedIn: required"},
 		{"setup with explicit reuse", validSetup + "  reuse: false\n", ""},
 		{"both setup and storageState", validSetup + "  storageState: state.json\n", "not both"},
-		{"neither", "  loginPath: /login\n", "exactly one of setup and storageState"},
-		{"missing path", "  setup:\n    steps:\n      - click: a\n", "auth.setup.path: required"},
-		{"relative path without slash", "  setup:\n    path: login\n    steps:\n      - click: a\n", "auth.setup.path: required"},
-		{"empty steps", "  setup:\n    path: /login\n    steps: []\n", "at least one step"},
-		{"no steps key", "  setup:\n    path: /login\n", "at least one step"},
-		{"scan in setup", "  setup:\n    path: /login\n    steps:\n      - scan: {}\n", "steps[0]: scan is not allowed in setup"},
-		{"keyboard in setup", "  setup:\n    path: /login\n    steps:\n      - click: a\n      - keyboard:\n", "steps[1]: keyboard is not allowed"},
-		{"transcript in setup", "  setup:\n    path: /login\n    steps:\n      - transcript:\n", "transcript is not allowed"},
-		{"expectFocus in setup", "  setup:\n    path: /login\n    steps:\n      - expectFocus: { role: button }\n", "expectFocus is not allowed"},
-		{"invalid step", "  setup:\n    path: /login\n    steps:\n      - click: a\n        press: Enter\n", "exactly one action"},
-		{"reuse with storageState", "  storageState: state.json\n  loginPath: /login\n  reuse: true\n", "auth.reuse: only applies to setup"},
-		{"missing storageState file", "  storageState: nope.json\n  loginPath: /login\n", "auth.storageState nope.json"},
-		{"malformed JSON", "  storageState: bad.json\n  loginPath: /login\n", "not a storage-state JSON file"},
-		{"storageState without loginPath", "  storageState: state.json\n", "auth.loginPath: required with storageState"},
-		{"login route at the base root without signedIn", validSetup + "  loginPath: /\n", "auth.signedIn: required"},
-		{"hash root without signedIn", validSetup + "  loginPath: \"/#/\"\n", "auth.signedIn: required"},
-		{"setup at the base root without signedIn", "  setup:\n    path: /\n    steps:\n      - click: a\n", "auth.signedIn: required"},
-		{"login route at the root with signedIn", validSetup + "  loginPath: /\n  signedIn: \"#shell\"\n", ""},
+		{"neither", "  loginPath: /login\n" + signed, "exactly one of setup and storageState"},
+		{"missing path", "  setup:\n    steps:\n      - click: a\n" + signed, "auth.setup.path: required"},
+		{"relative path without slash", "  setup:\n    path: login\n    steps:\n      - click: a\n" + signed, "auth.setup.path: required"},
+		{"empty steps", "  setup:\n    path: /login\n    steps: []\n" + signed, "at least one step"},
+		{"no steps key", "  setup:\n    path: /login\n" + signed, "at least one step"},
+		{"scan in setup", "  setup:\n    path: /login\n    steps:\n      - scan: {}\n" + signed, "steps[0]: scan is not allowed in setup"},
+		{"keyboard in setup", "  setup:\n    path: /login\n    steps:\n      - click: a\n      - keyboard:\n" + signed, "steps[1]: keyboard is not allowed"},
+		{"transcript in setup", "  setup:\n    path: /login\n    steps:\n      - transcript:\n" + signed, "transcript is not allowed"},
+		{"expectFocus in setup", "  setup:\n    path: /login\n    steps:\n      - expectFocus: { role: button }\n" + signed, "expectFocus is not allowed"},
+		{"invalid step", "  setup:\n    path: /login\n    steps:\n      - click: a\n        press: Enter\n" + signed, "exactly one action"},
+		{"reuse with storageState", "  storageState: state.json\n  loginPath: /login\n  reuse: true\n" + signed, "auth.reuse: only applies to setup"},
+		{"missing storageState file", "  storageState: nope.json\n" + signed, "auth.storageState nope.json"},
+		{"malformed JSON", "  storageState: bad.json\n" + signed, "not a storage-state JSON file"},
 		{"allowedOrigins", validSetup + "  allowedOrigins: [\"https://login.example.com\", \"http://localhost:9000\"]\n", ""},
 		{"allowedOrigins relative", validSetup + "  allowedOrigins: [\"/sso\"]\n", "auth.allowedOrigins[0]"},
 		{"allowedOrigins with a path", validSetup + "  allowedOrigins: [\"https://idp.example.com/realm\"]\n", "auth.allowedOrigins[0]"},
@@ -98,7 +100,7 @@ func TestStorageStateRelativeToConfigDir(t *testing.T) {
 	// The working directory is somewhere else entirely: resolution must
 	// follow the config file, not the process.
 	t.Chdir(t.TempDir())
-	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: .auth/state.json\n  loginPath: /login\n"), "")
+	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: .auth/state.json\n  loginPath: /login\n"+signed), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +124,7 @@ func TestStorageStateContentErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			os.WriteFile(filepath.Join(dir, "s.json"), []byte(content), 0o600)
-			_, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n  loginPath: /login\n"), "")
+			_, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n  loginPath: /login\n"+signed), "")
 			if err == nil {
 				t.Fatal("want a config error")
 			}
@@ -134,7 +136,7 @@ func TestStorageStateContentErrors(t *testing.T) {
 }
 
 func TestAllowedOriginsAreNormalized(t *testing.T) {
-	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed+
 		"  allowedOrigins: [\"HTTPS://Login.Example.com:443\", \"http://localhost:80/\", \"https://idp.example.com:8443\"]\n"), "")
 	if err != nil {
 		t.Fatal(err)
@@ -145,20 +147,64 @@ func TestAllowedOriginsAreNormalized(t *testing.T) {
 	}
 }
 
-func TestStorageStateWithoutLoginPathIsAConfigError(t *testing.T) {
+// loginPath is a second signal, not a requirement: signedIn carries the guard.
+func TestLoginPathIsOptionalWithStorageState(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "s.json"), []byte(goodState), 0o600)
-	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n"), "")
-	if err == nil || !strings.Contains(err.Error(), "auth.loginPath") {
-		t.Fatalf("err = %v, want a loginPath config error", err)
+	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n"+signed), "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if cfg != nil {
-		t.Errorf("a config was returned alongside the error")
+	if cfg.Auth.LoginRoute() != "" {
+		t.Errorf("login route = %q, want none known", cfg.Auth.LoginRoute())
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", cfg.Warnings)
+	}
+}
+
+// A test's auth must be a real boolean: a string or mapping there is a typo
+// that would otherwise silently leave the session on.
+func TestTestAuthIsAStrictBool(t *testing.T) {
+	cases := map[string]struct {
+		line string
+		ok   bool
+		uses bool
+	}{
+		"absent": {"", true, true},
+		"false":  {"    auth: false\n", true, false},
+		"true":   {"    auth: true\n", true, true},
+		"string": {"    auth: \"false\"\n", false, false},
+		"map":    {"    auth: { x: 1 }\n", false, false},
+		"list":   {"    auth: [false]\n", false, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// The tests: block comes before auth: in authPrefix, so append a second test.
+			yml := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n" + tc.line + "auth:\n" + validSetup + signed
+			cfg, err := Load(writeConfigIn(t, t.TempDir(), yml), "")
+			if (err == nil) != tc.ok {
+				t.Fatalf("err = %v, want ok=%v", err, tc.ok)
+			}
+			if err == nil && cfg.Tests[0].UsesAuth() != tc.uses {
+				t.Errorf("UsesAuth = %v, want %v", cfg.Tests[0].UsesAuth(), tc.uses)
+			}
+		})
+	}
+}
+
+func TestEmptyLoginPathMeansNoLoginRoute(t *testing.T) {
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed+"  loginPath: \"\"\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Auth.LoginRoute(); got != "" {
+		t.Errorf("login route = %q, want none: an explicit empty loginPath overrides the setup path", got)
 	}
 }
 
 func TestAuthDefaults(t *testing.T) {
-	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup), "")
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +215,7 @@ func TestAuthDefaults(t *testing.T) {
 	if a.LoginRoute() != "/login" {
 		t.Errorf("login route = %q, want setup.path", a.LoginRoute())
 	}
-	cfg, err = Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+"  reuse: false\n  loginPath: /signin\n"), "")
+	cfg, err = Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed+"  reuse: false\n  loginPath: /signin\n"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +243,7 @@ func TestSecretLint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+"  setup:\n    path: /login\n    steps:\n      - fill: "+tc.fill+"\n  loginPath: /login\n"), "")
+			cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+"  setup:\n    path: /login\n    steps:\n      - fill: "+tc.fill+"\n  loginPath: /login\n"+signed), "")
 			if err != nil {
 				t.Fatal(err)
 			}

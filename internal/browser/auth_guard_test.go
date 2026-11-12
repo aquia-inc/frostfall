@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/go-rod/rod/lib/proto"
+
+	"github.com/aquia-inc/frostfall/internal/config"
 )
 
 // allowing returns the auth YAML line that allows origins.
@@ -47,19 +49,19 @@ func TestCrossOriginLandingIsARedirect(t *testing.T) {
 		t.Fatalf("err = %v, want a redirect naming %s and auth.allowedOrigins", err, idp.URL)
 	}
 
+	// allowedOrigins is for the setup flow's hops. A test is not one: landing
+	// on the provider is still a login redirect.
 	cfg = loadAuthConfig(t, app.URL, state+allowing(idp.URL))
 	a, err = NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := openAuthed(t, b, a, cfg, app.URL, "/bounce")
-	if err != nil {
-		t.Fatalf("an allowed origin still failed: %v", err)
+	if _, err = openAuthed(t, b, a, cfg, app.URL, "/bounce"); !errors.Is(err, ErrLoginRedirect) {
+		t.Fatalf("an allowed origin excused a test landing off the app: err = %v", err)
 	}
-	s.Close()
 }
 
-func TestSetupMustEndOnTheAppOrAnAllowedOrigin(t *testing.T) {
+func TestSetupMustEndBackOnTheApp(t *testing.T) {
 	app, idp := newAuthApp(t), newAuthApp(t)
 	app.idp = idp.URL
 	b := launch(t)
@@ -73,13 +75,14 @@ func TestSetupMustEndOnTheAppOrAnAllowedOrigin(t *testing.T) {
 	if !errors.Is(err, ErrLoginRedirect) {
 		t.Fatalf("err = %v, want a login redirect", err)
 	}
-	for _, want := range []string{"auth setup", idp.URL, "baseUrl", "auth.allowedOrigins"} {
+	for _, want := range []string{"auth setup", "ended on " + idp.URL, "finish back on the app"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
 	}
-	if _, err := authWith(t, b, app, flow+allowing(idp.URL)); err != nil {
-		t.Errorf("a flow ending on an allowed origin failed: %v", err)
+	// Naming the provider lets the flow pass through it, not end on it.
+	if _, err := authWith(t, b, app, flow+allowing(idp.URL)); !errors.Is(err, ErrLoginRedirect) {
+		t.Errorf("a flow ending on an allowed origin passed: err = %v", err)
 	}
 }
 
@@ -161,7 +164,7 @@ func TestAppUnderAPathPrefix(t *testing.T) {
 			http.Redirect(w, r, "/prefix/login", http.StatusFound)
 			return
 		}
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>h</title></head><body><main id="shell">home</main></body></html>`)
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>h</title></head><body><main id="shell"><i id="in"></i>home</main></body></html>`)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -203,7 +206,8 @@ func TestSignedInSelector(t *testing.T) {
 	app := newAuthApp(t)
 	b := launch(t)
 	auth := func(expires string) string {
-		return "  storageState: " + stateFile(t, app, expires, false) + "\n  loginPath: /\n  signedIn: \"#shell\"\n"
+		// A login rendered in place has no URL of its own to name: no loginPath.
+		return "  storageState: " + stateFile(t, app, expires, false) + "\n  signedIn: \"#shell\"\n"
 	}
 
 	cfg := loadAuthConfig(t, app.URL, auth("-1"))
@@ -415,5 +419,116 @@ func TestLoginRouteIsScopedToTheAppOrigin(t *testing.T) {
 	_, err = openAuthed(t, b, a, cfg, other.URL, "/login")
 	if !errors.Is(err, ErrLoginRedirect) {
 		t.Errorf("err = %v, want the redirect into the app's login page caught", err)
+	}
+}
+
+// Where the URL says nothing (a page that is not the login route and not the
+// app either), the marker decides: every landing on the app's origin needs it.
+func TestSignedInMarkerIsRequiredOnEveryLanding(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n") // no loginPath
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// /idp-end is neither the login route (none is named) nor marked.
+	_, err = openAuthed(t, b, a, cfg, app.URL, "/idp-end")
+	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), `signedIn selector "#in"`) {
+		t.Errorf("err = %v, want the missing marker reported", err)
+	}
+	s, err := openAuthed(t, b, a, cfg, app.URL, "/app")
+	if err != nil {
+		t.Fatalf("a marked page failed: %v", err)
+	}
+	s.Close()
+}
+
+// A page on the login route that carries the marker is a configuration
+// error to be loud about, not a pass.
+func TestLoginRouteStillFailsWhenMarked(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	// /probe is marked; naming it the login route makes landing there a failure
+	// for any test that did not ask for it, marker or not.
+	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n  loginPath: /probe\n")
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openAuthed(t, b, a, cfg, app.URL, "/probe"); err != nil {
+		t.Fatalf("a test about the login route itself must be allowed there: %v", err)
+	}
+	// A sibling that lands there by redirect is not allowed.
+	app.bounceTo = "" // /bounce redirects to bounceTo+"/probe"; empty bounceTo is the app's own /probe
+	if _, err := openAuthed(t, b, a, cfg, app.URL, "/bounce"); !errors.Is(err, ErrLoginRedirect) {
+		t.Errorf("err = %v, want the redirect onto the login route caught", err)
+	}
+}
+
+// An explicit empty loginPath says there is no login URL: nothing is the login
+// route, and a test at the setup path is not exempt from the marker.
+func TestEmptyLoginPathMeansNoLoginRoute(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	cfg := loadAuthConfig(t, app.URL, setupYAML+"  loginPath: \"\"\n")
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if err != nil {
+		t.Fatalf("a setup ending signed in failed: %v", err)
+	}
+	if a.loginKey != "" {
+		t.Errorf("login key = %q, want none", a.loginKey)
+	}
+	// The login page is unmarked, so with no login route it is caught by the
+	// marker alone.
+	if _, err := openAuthed(t, b, a, cfg, app.URL, "/login"); !errors.Is(err, ErrLoginRedirect) {
+		t.Errorf("err = %v, want the unmarked login page caught by the marker", err)
+	}
+}
+
+func TestCaptureReadsCookiesAfterTheRevisits(t *testing.T) {
+	app, idp := newAuthApp(t), newAuthApp(t)
+	app.idp = idp.URL
+	idp.rootCookie = "idpseen" // set when the capture revisits the provider's root
+	b := launch(t)
+	flow := "  setup:\n    path: /sso-start\n    steps:\n      - click: \"#go\"\n      - waitFor: \"[data-testid=app-shell]\"\n" + allowing(idp.URL)
+	a, err := authWith(t, b, app, flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, c := range a.state.cookies {
+		names = append(names, c.Name)
+	}
+	if !slices.Contains(names, "idpseen") || !slices.Contains(names, "sid") {
+		t.Errorf("cookies = %v, want sid from the flow and idpseen from the revisit: the state must describe one moment", names)
+	}
+}
+
+func TestRevisitFailureWarns(t *testing.T) {
+	app, idp := newAuthApp(t), newAuthApp(t)
+	app.idp = idp.URL
+	idp.rootDelay = 5 * time.Second // the capture's revisit of the provider stalls
+	b := launch(t)
+	flow := "  setup:\n    path: /sso-start\n    steps:\n      - click: \"#go\"\n      - waitFor: \"[data-testid=app-shell]\"\n" + allowing(idp.URL)
+	cfg := loadAuthConfig(t, app.URL, flow)
+	cfg.Defaults.Timeout = config.Duration(3 * time.Second)
+	var warns []string
+	if _, err := NewAuth(b, cfg, app.URL, AuthOptions{Warn: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }}); err != nil {
+		t.Fatal(err)
+	}
+	if len(warns) == 0 || !strings.Contains(warns[0], "could not revisit "+idp.URL) {
+		t.Errorf("warnings = %q, want one naming the origin that could not be read", warns)
+	}
+}
+
+// Without auth the output is what it always was: URLs are not redacted.
+func TestNavigationErrorsAreUnredactedWithoutAuth(t *testing.T) {
+	dead := newAuthApp(t)
+	b := launch(t)
+	dead.Close()
+	_, err := b.NewSession(dead.URL+"/x?keep=1", config.Viewport{Width: 800, Height: 600}, "load", 0, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "/x?keep=1") {
+		t.Errorf("err = %v, want the URL printed as it always was", err)
 	}
 }

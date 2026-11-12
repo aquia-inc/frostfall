@@ -29,7 +29,8 @@ type authApp struct {
 	// bounceTo where /bounce redirects; loginTo where GET /login redirects
 	// instead of rendering the form. loginDelay slows POST /login.
 	idp, bounceTo, loginTo string
-	loginDelay             time.Duration
+	loginDelay, rootDelay  time.Duration
+	rootCookie             string
 }
 
 func newAuthApp(t *testing.T) *authApp {
@@ -65,19 +66,19 @@ func newAuthApp(t *testing.T) *authApp {
 			return
 		}
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>app</title></head><body>
-			<div data-testid="app-shell"><span id="marker"></span></div>
+			<div data-testid="app-shell"><i id="in"></i><span id="marker"></span></div>
 			<script>marker.textContent = localStorage.getItem('token') === 'tok-123' ? 'authed' : 'no-token'</script>
 			</body></html>`)
 	})
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>probe</title></head><body>
-			<pre id="t"></pre><script>t.textContent = 'token=' + localStorage.getItem('token')</script></body></html>`)
+			<i id="in"></i><pre id="t"></pre><script>t.textContent = 'token=' + localStorage.getItem('token')</script></body></html>`)
 	})
 	// A hash-routed page: it sends a signed-out visitor to /spa#/login
 	// without any HTTP redirect.
 	mux.HandleFunc("/spa", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>spa</title></head><body>
-			<script>if (!localStorage.getItem('token')) location.hash = location.search.includes('withquery') ? '#/login?redirect=/x' : '#/login'</script></body></html>`)
+			<i id="in"></i><script>if (!localStorage.getItem('token')) location.hash = location.search.includes('withquery') ? '#/login?redirect=/x' : '#/login'</script></body></html>`)
 	})
 	// The app side of an SSO round trip: /sso-start sends the browser to the
 	// identity provider, which stores something of its own and comes back to
@@ -105,8 +106,14 @@ func newAuthApp(t *testing.T) *authApp {
 	mux.HandleFunc("/bounce", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, app.bounceTo+"/probe", http.StatusFound)
 	})
-	// A login rendered in place at the root: same URL signed in and out.
+	// A login rendered in place at the root: same URL signed in and out. The
+	// root also answers the capture's revisit of an origin: rootCookie is set
+	// then, and rootDelay stalls it.
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(app.rootDelay)
+		if app.rootCookie != "" {
+			http.SetCookie(w, &http.Cookie{Name: app.rootCookie, Value: "1", Path: "/"})
+		}
 		shell := ""
 		if c, err := r.Cookie("sid"); err == nil && c.Value == "valid" {
 			shell = `<div id="shell">app</div>`
@@ -130,6 +137,9 @@ func loadAuthConfig(t *testing.T, baseURL, authYAML string) *config.Config {
 	t.Setenv("FF_TEST_USER", testUser)
 	t.Setenv("FF_TEST_PASS", testPass)
 	path := filepath.Join(t.TempDir(), "frostfall.yml")
+	if !strings.Contains(authYAML, "signedIn") {
+		authYAML += "  signedIn: \"#in\"\n"
+	}
 	body := "version: 1\nserver:\n  baseUrl: " + baseURL + "\ndefaults:\n  timeout: 8s\n  settleTime: 50ms\ntests:\n  - id: t\n    path: /\nauth:\n" + authYAML
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)

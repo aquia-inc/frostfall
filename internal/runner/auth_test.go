@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aquia-inc/frostfall/internal/browser"
 	"github.com/aquia-inc/frostfall/internal/config"
+	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/engine/axe"
 )
 
@@ -24,9 +26,24 @@ func runWithAuth(t *testing.T, withSession bool) error {
 	return runTests(t, withSession, "  - id: dashboard\n    path: /app\n", nil)
 }
 
-// runTests is runWithAuth with the tests: block and the verbose log under the
-// caller's control.
+// runOpts shape one run against the test site.
+type runOpts struct {
+	withSession bool
+	noAuth      bool // a config with no auth block at all
+	tests       string
+	log         func(string, ...any)
+	engine      engine.Engine
+}
+
 func runTests(t *testing.T, withSession bool, testsYAML string, log func(string, ...any)) error {
+	t.Helper()
+	_, err := runSite(t, runOpts{withSession: withSession, tests: testsYAML, log: log})
+	return err
+}
+
+// runSite runs tests against a site whose /app needs a session cookie and
+// whose pages other than /login carry the signed-in marker (#in).
+func runSite(t *testing.T, o runOpts) (*Run, error) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("launches a browser")
@@ -38,18 +55,25 @@ func runTests(t *testing.T, withSession bool, testsYAML string, log func(string,
 				return
 			}
 		}
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>page</main></body></html>`)
+		marker := `<i id="in"></i>`
+		if r.URL.Path == "/login" {
+			marker = ""
+		}
+		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>%spage</main></body></html>`, marker)
 	}))
 	t.Cleanup(srv.Close)
 
 	u, _ := url.Parse(srv.URL)
 	cookies := "[]"
-	if withSession {
+	if o.withSession {
 		cookies = fmt.Sprintf(`[{"name":"sid","value":"valid","domain":%q,"path":"/","expires":-1}]`, u.Hostname())
 	}
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"cookies":`+cookies+`,"origins":[]}`), 0o600)
-	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  settleTime: 10ms\ntests:\n" + testsYAML + "auth:\n  storageState: state.json\n  loginPath: /login\n"
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  settleTime: 10ms\ntests:\n" + o.tests
+	if !o.noAuth {
+		yml += "auth:\n  storageState: state.json\n  loginPath: /login\n  signedIn: \"#in\"\n"
+	}
 	os.WriteFile(filepath.Join(dir, "frostfall.yml"), []byte(yml), 0o644)
 	cfg, err := config.Load(filepath.Join(dir, "frostfall.yml"), "")
 	if err != nil {
@@ -65,9 +89,12 @@ func runTests(t *testing.T, withSession bool, testsYAML string, log func(string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &Runner{Browser: b, Engine: axe.New(), Config: cfg, BaseURL: srv.URL, Auth: a, Verbose: log != nil, Log: log}
-	_, err = r.Execute(context.Background(), cfg.Tests)
-	return err
+	var eng engine.Engine = axe.New()
+	if o.engine != nil {
+		eng = o.engine
+	}
+	r := &Runner{Browser: b, Engine: eng, Config: cfg, BaseURL: srv.URL, Auth: a, Verbose: o.log != nil, Log: o.log}
+	return r.Execute(context.Background(), cfg.Tests)
 }
 
 func TestAuthenticatedRunScansThePage(t *testing.T) {
@@ -129,5 +156,69 @@ func TestVerboseLogOmitsQueryStrings(t *testing.T) {
 		if strings.Contains(l, "SECRETTOK123") {
 			t.Errorf("a query token reached the log: %q", l)
 		}
+	}
+}
+
+// navigatingEngine reports one violation, but only after walking the page into
+// the login page, the way a late client-side redirect during a scan would.
+type navigatingEngine struct{}
+
+func (navigatingEngine) Name() string    { return "navigating" }
+func (navigatingEngine) Version() string { return "0" }
+func (navigatingEngine) Audit(_ context.Context, page engine.Page, _ engine.ScanOptions) ([]engine.Violation, error) {
+	if _, err := page.Eval(`() => { setTimeout(() => { location.href = '/login' }, 0) }`); err != nil {
+		return nil, err
+	}
+	time.Sleep(1500 * time.Millisecond)
+	return []engine.Violation{{RuleID: "image-alt", Impact: engine.Critical, Target: "img"}}, nil
+}
+
+// Results from a page that navigated to login while it was being checked are
+// the login page's: the run must report the redirect, not them.
+func TestScanThatEndsOnTheLoginPageIsRejected(t *testing.T) {
+	for name, tests := range map[string]string{
+		"initial scan": "  - id: late\n    path: /app\n",
+		"step scan":    "  - id: late\n    path: /app\n    scan: false\n    steps:\n      - scan: {}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			run, err := runSite(t, runOpts{withSession: true, tests: tests, engine: navigatingEngine{}})
+			if !errors.Is(err, browser.ErrLoginRedirect) || !strings.Contains(err.Error(), "after scan") {
+				t.Fatalf("err = %v, want the redirect reported after the scan", err)
+			}
+			if run != nil {
+				t.Errorf("results of the login page were returned: %+v", run.Results)
+			}
+		})
+	}
+}
+
+// auth: false is a fresh, signed-out context with no guard: the page that
+// redirects to login is just scanned. The session is withheld on purpose, so
+// the same page would otherwise fail the guard.
+func TestAuthFalseTestHasNoSessionAndNoGuard(t *testing.T) {
+	run, err := runSite(t, runOpts{withSession: false, tests: "  - id: public\n    path: /app\n    auth: false\n"})
+	if err != nil {
+		t.Fatalf("a test with auth: false was guarded: %v", err)
+	}
+	if run.TestsRun != 1 {
+		t.Errorf("tests run = %d", run.TestsRun)
+	}
+	// Default (auth on) is guarded, and is what discovered tests get.
+	_, err = runSite(t, runOpts{withSession: false, tests: "  - id: signed-in\n    path: /app\n"})
+	if !errors.Is(err, browser.ErrLoginRedirect) {
+		t.Errorf("without a session the signed-in test must fail: %v", err)
+	}
+}
+
+// A config without auth reports exactly what it always did: nothing redacted.
+func TestVerboseLogIsUnredactedWithoutAuth(t *testing.T) {
+	var lines []string
+	_, err := runSite(t, runOpts{noAuth: true, tests: "  - id: q\n    path: /plain?keep=1\n",
+		log: func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(lines, "\n"), "/plain?keep=1") {
+		t.Errorf("log = %q, want the URL as printed before auth existed", lines)
 	}
 }
