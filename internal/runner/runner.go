@@ -233,6 +233,11 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		return nil, nil, nil, err
 	}
 	defer session.Close()
+	// From here url is only ever reported, as the PageURL of results and
+	// transcripts (SARIF locations, the HTML report). With auth configured it
+	// goes out redacted, like every other printed URL: a token interpolated
+	// into a test path or userinfo in the base URL must not reach a report.
+	url = shown
 	cov = newCoverage()
 
 	scanInitial := t.Scan == nil || *t.Scan

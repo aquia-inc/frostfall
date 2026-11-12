@@ -55,6 +55,14 @@ func (c *Crawler) Run() ([]string, error) {
 		excludes = append(excludes, c.Auth.DiscoverExcludes()...)
 	}
 
+	// These paths become test ids in reports, baselines and issues, so a
+	// signed-in crawl cleans them before anything else looks at them. Signed
+	// out nothing is touched: the output stays as it always was.
+	var clean func(string) (string, bool)
+	if c.Auth != nil {
+		clean = cleanAuthPath
+	}
+
 	type node struct {
 		path  string
 		depth int
@@ -63,9 +71,19 @@ func (c *Crawler) Run() ([]string, error) {
 	seen := map[string]bool{"/": true}
 	seenShape := map[string]bool{ShapeKey("/"): true}
 	var found []string
-	dropped := 0
+	dropped, loads := 0, 0
+	// maxPages caps what is scanned. Signed out that is the pages found. Signed
+	// in it caps page loads, dropped pages included: each load can cost a
+	// login (reuse: false), and a crawl whose pages keep being dropped would
+	// otherwise never stop.
+	more := func() bool {
+		if c.Auth != nil {
+			return loads < c.Options.MaxPages
+		}
+		return len(found) < c.Options.MaxPages
+	}
 
-	for len(queue) > 0 && len(found) < c.Options.MaxPages {
+	for len(queue) > 0 && more() {
 		n := queue[0]
 		queue = queue[1:]
 		// Signed in, pages at the depth limit are still loaded once: their
@@ -75,6 +93,7 @@ func (c *Crawler) Run() ([]string, error) {
 		var err error
 		if n.depth < c.Options.MaxDepth || c.Auth != nil {
 			links, err = c.collectLinks(n.path)
+			loads++
 		}
 		if errors.Is(err, browser.ErrLoginRedirect) {
 			// A root that redirects to the login page means the session was not
@@ -101,15 +120,7 @@ func (c *Crawler) Run() ([]string, error) {
 			}
 			continue
 		}
-		for _, p := range FilterLinks(base, links, excludes) {
-			if c.Auth != nil {
-				// These paths become test ids in reports, baselines and issues,
-				// so a signed-in crawl does not let a token in a link reach them.
-				var ok bool
-				if p, ok = cleanAuthPath(p); !ok {
-					continue
-				}
-			}
+		for _, p := range filterLinks(base, links, excludes, clean) {
 			shape := ShapeKey(p)
 			if !seen[p] && !seenShape[shape] {
 				seen[p] = true
@@ -129,15 +140,70 @@ func (c *Crawler) Run() ([]string, error) {
 var pathParams = regexp.MustCompile(`;[^/]*`)
 
 // credentialMarks in a path say the link carries a secret in the path itself.
-var credentialMarks = []string{"token=", "access_token", "sig=", "code="}
+// Matched case-insensitively as substrings, so they are blunt on purpose: a
+// page named /signature-pad is skipped too, and is added as an explicit test.
+var credentialMarks = []string{
+	"token=", "access_token", "sig=", "code=",
+	"password=", "passwd=", "key=", "api_key", "apikey", "session=", "sessionid",
+	"ticket=", "signature", "x-amz-", "auth=", "otp=",
+}
+
+var (
+	jwtSegment = regexp.MustCompile(`^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$`)
+	hexSegment = regexp.MustCompile(`^[0-9a-fA-F]{32,}$`)
+	b64Segment = regexp.MustCompile(`^[A-Za-z0-9_-]{24,}$`)
+	wordChunk  = regexp.MustCompile(`^[a-z]{4,}$`)
+)
+
+// tokenLike reports whether a single path segment looks like a secret rather
+// than a name: a JWT (three base64url parts joined by dots), 32 or more hex
+// characters, or 24 or more base64url characters that carry a digit or mixed
+// case and no recognizable word. A slug like release-notes-2024-summary has
+// words between its hyphens and is kept; a random string has none. The
+// heuristic is deliberately simple: it will miss a short or all-lowercase
+// token, and skip a long opaque id that is not one, which is the safer error
+// for something that becomes a test id.
+func tokenLike(seg string) bool {
+	if jwtSegment.MatchString(seg) || hexSegment.MatchString(seg) {
+		return true
+	}
+	if !b64Segment.MatchString(seg) {
+		return false
+	}
+	hasDigit, hasUpper, hasLower := false, false, false
+	for _, r := range seg {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r >= 'A' && r <= 'Z':
+			hasUpper = true
+		case r >= 'a' && r <= 'z':
+			hasLower = true
+		}
+	}
+	if !hasDigit && !(hasUpper && hasLower) {
+		return false
+	}
+	for _, chunk := range strings.FieldsFunc(seg, func(r rune) bool { return r == '-' || r == '_' }) {
+		if wordChunk.MatchString(chunk) && strings.ContainsAny(chunk, "aeiou") {
+			return false // a word between separators: a slug, not a secret
+		}
+	}
+	return true
+}
 
 // cleanAuthPath makes a discovered path safe to use as a test id when signed
-// in: ;params are stripped, a hash route keeps only the route (its query and
-// any nested fragment are dropped, as in browser.RedactURL), and a path that
-// still looks like it carries a credential is rejected. Without auth nothing
-// is changed: discovery output stays as it always was.
+// in: a percent-decoded '?' in the path is cut like a real query, ;params are
+// stripped, a hash route keeps only the route (its query and any nested
+// fragment are dropped, as in browser.RedactURL), and a path that still looks
+// like it carries a credential, by name (credentialMarks) or by shape
+// (tokenLike), is rejected. Without auth nothing is changed: discovery output
+// stays as it always was.
 func cleanAuthPath(p string) (string, bool) {
 	route, hash, hasHash := strings.Cut(p, "#")
+	if i := strings.IndexByte(route, '?'); i >= 0 {
+		route = route[:i]
+	}
 	route = pathParams.ReplaceAllString(route, "")
 	if route == "" {
 		route = "/"
@@ -153,6 +219,11 @@ func cleanAuthPath(p string) (string, bool) {
 	lower := strings.ToLower(route)
 	for _, mark := range credentialMarks {
 		if strings.Contains(lower, mark) {
+			return "", false
+		}
+	}
+	for _, seg := range strings.FieldsFunc(route, func(r rune) bool { return r == '/' || r == '#' }) {
+		if tokenLike(seg) {
 			return "", false
 		}
 	}
@@ -195,6 +266,14 @@ func (c *Crawler) collectLinks(path string) ([]string, error) {
 // app into "/". Plain fragments and queries are dropped, trailing slashes
 // trimmed (except root). Sorted for deterministic queueing.
 func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []string {
+	return filterLinks(base, hrefs, excludes, nil)
+}
+
+// filterLinks is FilterLinks with an optional clean step, run on each path
+// before the excludes and the dedupe see it, so that a ;param or a token
+// cannot slip a login page or a user's exclude past its regex, and two links
+// that differ only in a secret are one page. Nil leaves every path as it was.
+func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean func(string) (string, bool)) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, href := range hrefs {
@@ -209,6 +288,12 @@ func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []str
 			continue
 		}
 		p := browser.RouteKey(u)
+		if clean != nil {
+			var ok bool
+			if p, ok = clean(p); !ok {
+				continue
+			}
+		}
 		if seen[p] || excluded(p, excludes) {
 			continue
 		}

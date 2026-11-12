@@ -114,6 +114,20 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	if *validateOnly {
+		// With auth, a test on another origin is a config error. Where the base
+		// URL is known without starting anything (baseUrl or --base-url) that is
+		// checked here; with serve: the origin is an ephemeral port, so it is
+		// checked at scan time.
+		if base := knownBaseURL(cfg, *baseURL, *serveDir); cfg.Auth != nil && base != "" {
+			selected, ferr := filterTests(cfg.Tests, *idFilter, *pathFilter)
+			if ferr == nil {
+				ferr = cfg.CheckTestOrigins(strings.TrimRight(base, "/"), selected)
+			}
+			if ferr != nil {
+				fmt.Fprintln(os.Stderr, "config error:", ferr)
+				return exitBadConfig
+			}
+		}
 		fmt.Println("config OK")
 		return exitOK
 	}
@@ -140,7 +154,9 @@ func run(args []string) int {
 	// The session reaches every host a test loads, so with auth a test must
 	// stay on the app's origin (or opt out). Known only now: --base-url and
 	// serve: decide the origin.
-	if err := cfg.CheckTestOrigins(base, cfg.Tests); err != nil {
+	// Only the tests this run selects: --id and --path must not be refused over
+	// tests they do not run.
+	if err := cfg.CheckTestOrigins(base, tests); err != nil {
 		fmt.Fprintln(os.Stderr, "config error:", err)
 		return exitBadConfig
 	}
@@ -202,8 +218,25 @@ func run(args []string) int {
 	if *verbose {
 		authOpts.Log = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
 	}
-	authn, err := browser.NewAuth(b, cfg, base, authOpts)
-	if err != nil {
+	// Nothing to sign in for when every selected test says auth: false and
+	// there is no discovery: skip the probe and the login flow, and keep only
+	// the redaction a run with an auth block has.
+	needAuth := *discoverFlag
+	for _, t := range tests {
+		if t.UsesAuth() {
+			needAuth = true
+			if authOpts.FirstTest == "" {
+				authOpts.FirstTest = t.Path
+				if t.URL != "" {
+					authOpts.FirstTest = t.URL
+				}
+			}
+		}
+	}
+	var authn *browser.Auth
+	if cfg.Auth != nil && !needAuth {
+		authn = browser.RedactingAuth()
+	} else if authn, err = browser.NewAuth(b, cfg, base, authOpts); err != nil {
 		fmt.Fprintln(os.Stderr, "auth error:", err)
 		return exitEnvironment
 	}
@@ -469,6 +502,19 @@ func activeProfileName(req string, cfg *config.Config) string {
 	}
 }
 
+// knownBaseURL is the base URL a run would use when it can be known without
+// starting a server: --base-url, else the config's baseUrl. "" for serve mode,
+// whose origin is an ephemeral port.
+func knownBaseURL(cfg *config.Config, baseURLFlag, serveFlag string) string {
+	switch {
+	case baseURLFlag != "":
+		return baseURLFlag
+	case serveFlag != "", cfg.Server == nil:
+		return ""
+	}
+	return cfg.Server.BaseURL
+}
+
 // discoverAuthWarning says what a crawl costs when the session cannot be
 // shared: with auth.reuse: false every page it loads runs the login flow, up
 // to discover.maxPages of them. "" when it does not apply.
@@ -480,7 +526,8 @@ func discoverAuthWarning(cfg *config.Config) string {
 	if cfg.Discover != nil && cfg.Discover.MaxPages > 0 {
 		max = cfg.Discover.MaxPages
 	}
-	return fmt.Sprintf("auth.reuse is false, so discovery logs in once per crawled page, up to discover.maxPages (%d) times", max)
+	return fmt.Sprintf("auth.reuse is false, so discovery logs in once per page it loads, up to discover.maxPages (%d) loads, "+
+		"and each discovered test logs in again when it runs", max)
 }
 
 // discoverTests crawls from the root and synthesizes fresh-load tests for

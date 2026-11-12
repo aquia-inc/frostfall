@@ -769,6 +769,11 @@ func (c *Config) validate() error {
 		if (t.Path == "") == (t.URL == "") {
 			return fmt.Errorf("test %q: exactly one of path, url must be set", t.ID)
 		}
+		// path is appended to the base URL, so "dashboard" would become
+		// http://localhost:3000dashboard.
+		if t.Path != "" && !strings.HasPrefix(t.Path, "/") {
+			return fmt.Errorf("test %q: path must start with / (it is relative to the base URL)", t.ID)
+		}
 		if t.Auth != nil && *t.Auth && c.Auth == nil {
 			return fmt.Errorf("test %q: auth: true needs an auth block in the config; remove it, or configure auth", t.ID)
 		}

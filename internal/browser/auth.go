@@ -98,6 +98,10 @@ type AuthOptions struct {
 	// Warn receives findings that do not stop the run but should always be
 	// seen, such as a setup that left no session behind.
 	Warn func(format string, args ...any)
+	// FirstTest is the path (or absolute URL) of the first explicit test that
+	// uses auth. The startup probe loads it signed out too, since that is the
+	// page the guard will be judging first. Empty to probe the rest only.
+	FirstTest string
 }
 
 // Auth carries everything a new test context needs to start signed in.
@@ -126,6 +130,8 @@ type Auth struct {
 	loginPath    string
 	loginDisplay string
 	loginKey     string
+	// setupPath is the configured flow's start page, for the probe.
+	setupPath string
 }
 
 // NewAuth prepares the config's auth block: it loads a storage-state file's
@@ -155,6 +161,9 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 	}
 	for _, o := range cfg.Auth.AllowedOrigins {
 		a.allowed[o] = true
+	}
+	if cfg.Auth.Setup != nil {
+		a.setupPath = cfg.Auth.Setup.Path
 	}
 	if route := cfg.Auth.LoginRoute(); route != "" {
 		a.loginPath = route
@@ -203,54 +212,132 @@ func (a *Auth) Anonymous() *Auth {
 	return &c
 }
 
-// probeSignedOut loads the base URL, and the login path when one is set, in a
-// fresh context with no session and no storage seed, and fails if signedIn
-// matches. A marker that also matches a signed-out page (main, nav, a layout
-// shell that renders before auth resolves) cannot tell the two apart, and the
-// run would scan a login form and pass. One load per page, under the usual
-// readiness rules, and no wait: the page is ready, the marker is there or not.
-func (a *Auth) probeSignedOut(b *Browser) error {
-	pages := []struct{ what, path string }{{"the base URL", "/"}}
-	if a.loginPath != "" {
-		pages = append(pages, struct{ what, path string }{"the login path " + a.loginDisplay, a.loginPath})
+// readiness is the readiness the startup probe and the setup flow's first
+// load use: the configured one, except that a selector waitFor is replaced by
+// load. A selector is typically something only signed-in pages render, so
+// waiting for it signed out would time out on every run, for no reason the
+// error could name.
+func readiness(waitFor string) string {
+	switch waitFor {
+	case "", "load", "networkIdle":
+		return waitFor
 	}
-	for _, p := range pages {
-		s, err := b.open(a.defaults.Viewport, a.defaults.Timeout.Std(), nil)
-		if err != nil {
-			return fmt.Errorf("auth: probing %s signed out: %w", p.what, err)
+	return "load"
+}
+
+// RedactingAuth is the auth of a run whose config has an auth block but where
+// nothing uses it (every test says auth: false and there is no discovery): no
+// session, no guard, only the redaction of printed URLs.
+func RedactingAuth() *Auth { return &Auth{anon: true} }
+
+type probeResult struct {
+	err     error
+	landed  string // origin the page ended on, when it is not the app's
+	checked bool   // the marker was looked for, on the app's origin
+	present bool
+}
+
+// probeSignedOut loads pages in fresh contexts with no session and no storage
+// seed, and fails if signedIn matches on any of them: a marker that also
+// matches a signed-out page (main, nav, a layout shell that renders before
+// auth resolves) cannot tell the two apart, and the run would scan a login
+// form and pass. The pages are the base URL, the login path, the setup page,
+// and the first explicit test that uses auth. The marker is waited for the
+// way the guard waits for it (signedInWait), so a marker drawn a second after
+// load is seen here as it would be there; the pages load in parallel so that
+// costs one wait, not one per page. A page that bounces off the app's origin
+// (to an identity provider) cannot be checked, which is a warning, not a
+// failure.
+func (a *Auth) probeSignedOut(b *Browser) error {
+	type page struct {
+		what, url string
+		root      bool
+	}
+	pages := []page{{"the base URL", a.baseURL + "/", true}}
+	add := func(what, u string) {
+		for _, p := range pages {
+			if p.url == u {
+				return
+			}
 		}
-		s.redact = true
-		present, err := a.markerOnLoad(s, a.baseURL+p.path)
-		s.Close()
-		if err != nil {
-			return fmt.Errorf("auth: probing %s signed out: %w", p.what, err)
+		pages = append(pages, page{what: what, url: u})
+	}
+	if a.loginPath != "" {
+		add("the login path "+a.loginDisplay, a.baseURL+a.loginPath)
+	}
+	if a.setupPath != "" {
+		add("the setup page "+RedactURL(a.setupPath), a.baseURL+a.setupPath)
+	}
+	if t := a.opts.FirstTest; t != "" {
+		u := t
+		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
+			u = a.baseURL + t
 		}
-		if present {
+		add("the first test that uses auth ("+RedactURL(t)+")", u)
+	}
+
+	results := make([]probeResult, len(pages))
+	var wg sync.WaitGroup
+	for i, p := range pages {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = a.probeOne(b, p.url)
+		}()
+	}
+	wg.Wait()
+
+	var warns []string
+	checked := 0
+	for i, r := range results {
+		p := pages[i]
+		switch {
+		case r.err != nil && p.root:
+			// An unreachable root alone is not fatal: a run that never loads it
+			// does not need it, and one that does fails on its own.
+			warns = append(warns, fmt.Sprintf("auth: could not load %s signed out (%v): the signedIn marker was not checked there", p.what, r.err))
+		case r.err != nil:
+			return fmt.Errorf("auth: probing %s signed out: %w", p.what, r.err)
+		case r.landed != "":
+			warns = append(warns, fmt.Sprintf("auth: probing %s signed out landed on %s, not the app's origin %s: the signedIn marker was not checked on that page",
+				p.what, r.landed, a.origin))
+		case r.checked && r.present:
 			return &redirectError{fmt.Sprintf("auth: the signedIn selector %q also matches %s with no session: pick a marker that only signed-in pages "+
 				"render, such as a test id on content that needs the user (not main, nav, header or a layout shell, which render before auth resolves)",
 				a.signedIn, p.what)}
 		}
+		if r.checked {
+			checked++
+		}
+	}
+	if checked == 0 {
+		warns = append(warns, "auth: no page loaded signed out on the app's origin, so the signedIn marker could not be verified as absent without a session")
+	}
+	for _, w := range warns {
+		a.warnf("%s", w)
 	}
 	return nil
 }
 
-// markerOnLoad navigates s to url and reports whether signedIn is on the page
-// once it is ready, without waiting for it to appear.
-func (a *Auth) markerOnLoad(s *Session, url string) (bool, error) {
-	if err := s.navigate(url, a.defaults.WaitFor, a.defaults.SettleTime.Std()); err != nil {
-		return false, err
-	}
-	return s.present(a.signedIn)
-}
-
-func (s *Session) present(selector string) (bool, error) {
-	ok, _, err := s.page.Has(selector)
+func (a *Auth) probeOne(b *Browser, url string) probeResult {
+	s, err := b.open(a.defaults.Viewport, a.defaults.Timeout.Std(), nil)
 	if err != nil {
-		return false, fmt.Errorf("signedIn selector %q: %w", selector, err)
+		return probeResult{err: err}
 	}
-	return ok, nil
+	defer s.Close()
+	s.redact = true
+	if err := s.navigate(url, readiness(a.defaults.WaitFor), a.defaults.SettleTime.Std()); err != nil {
+		return probeResult{err: err}
+	}
+	landed, err := s.landedAt()
+	if err != nil {
+		return probeResult{err: err}
+	}
+	if o := originOf2(landed); o != a.origin {
+		return probeResult{landed: o}
+	}
+	return probeResult{checked: true, present: s.has(a.signedIn)}
 }
-
 func (a *Auth) logf(format string, args ...any) {
 	if a.opts.Log != nil {
 		a.opts.Log(format, args...)
@@ -297,21 +384,12 @@ func (a *Auth) captureOnce(b *Browser, setup *config.AuthSetup) (*State, error) 
 func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
 	settle := a.defaults.SettleTime.Std()
 	a.logf("auth setup: loading %s", RedactURL(setup.Path))
-	if err := s.navigate(a.baseURL+setup.Path, a.defaults.WaitFor, settle); err != nil {
+	if err := s.navigate(a.baseURL+setup.Path, readiness(a.defaults.WaitFor), settle); err != nil {
 		return fmt.Errorf("auth setup: %w", err)
-	}
-	// Before anyone has signed in the marker must be absent. If it is there
-	// already it says nothing about a session, and the end-of-setup check
-	// below would pass a login that never happened.
-	if present, err := s.present(a.signedIn); err != nil {
-		return fmt.Errorf("auth setup: %w", err)
-	} else if present {
-		return &redirectError{fmt.Sprintf("auth setup: the signedIn selector %q already matches the setup page %s before the steps ran: "+
-			"pick a marker that only signed-in pages render", a.signedIn, RedactURL(setup.Path))}
 	}
 	for i, st := range setup.Steps {
 		a.logf("auth setup: step %d: %s", i, describeStep(st))
-		if err := s.Step(st, a.baseURL, a.defaults.WaitFor, settle); err != nil {
+		if err := s.Step(st, a.baseURL, readiness(a.defaults.WaitFor), settle); err != nil {
 			return fmt.Errorf("auth setup: steps[%d]: %w", i, err)
 		}
 	}
