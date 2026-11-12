@@ -1,0 +1,21 @@
+# Auth fixture, signed out: the state holds no session, the protected page
+# redirects to login, and the run must exit 3 rather than scan the login page.
+# CI expects exit 3. Compare frostfall.yml, which differs only in the state file.
+version: 1
+
+server:
+  serve: testdata/auth/site
+
+auth:
+  storageState: state-empty.json
+  loginPath: /login.html
+
+defaults:
+  waitFor: load
+  expect:
+    severity: serious
+    maxViolations: 0
+
+tests:
+  - id: protected
+    path: /protected.html

@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Auth fixture: protected page</title>
+  <script>
+    // The session is a plain cookie: the static server has no way to set one,
+    // and a cookie (unlike localStorage) is not tied to the ephemeral port the
+    // fixture is served on. Without it this page sends the visitor to login
+    // before anything renders, the way a real app's guard does.
+    if (!document.cookie.split('; ').includes('ffsession=ok')) location.replace('/login.html');
+  </script>
+</head>
+<body>
+  <main>
+    <h1>Protected page</h1>
+
+    <!-- planted: image-alt (critical). Reaching this page is what the
+         expected exit 1 proves: a scan of the login page finds nothing. -->
+    <img src="logo.png">
+  </main>
+</body>
+</html>

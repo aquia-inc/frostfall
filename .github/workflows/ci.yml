@@ -43,6 +43,36 @@ jobs:
             exit 1
           fi
 
+      - name: Integration test (auth fixture, signed in)
+        # The fixture's protected page redirects to login unless the session
+        # cookie from the storage state is present, and carries one planted
+        # violation. Exit 1 therefore proves the session was applied AND the
+        # page was actually reached; a scan of the login page would find
+        # nothing and exit 0.
+        run: |
+          set +e
+          /tmp/frostfall --config testdata/auth/frostfall.yml
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (protected page reached, violation found), got $code"
+            exit 1
+          fi
+
+      - name: Integration test (auth fixture, no session)
+        # Same page with an empty storage state: the page redirects to login,
+        # and the run must stop with exit 3 (login-redirect guard) rather than
+        # scan the login page and pass.
+        run: |
+          set +e
+          /tmp/frostfall --config testdata/auth/frostfall-nosession.yml
+          code=$?
+          set -e
+          if [ "$code" -ne 3 ]; then
+            echo "expected exit 3 (landed on the login page), got $code"
+            exit 1
+          fi
+
       - name: Upload fixture scan evidence
         # Screenshots auto-capture in Actions; without this they evaporated
         # with the runner. Evidence is most useful when the scan misbehaves.
