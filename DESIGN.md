@@ -163,10 +163,10 @@ auth:                          # optional; see §7.5
       - fill: { "#email": "${A11Y_USER}" }
       - fill: { "#password": "${A11Y_PASS}" }
       - click: "button[type=submit]"
-      - waitFor: "[data-testid=app-shell]"
+      - waitFor: "[data-testid=account-menu]"
   reuse: true                  # persist cookies+storage once, restore per test (default true)
   # storageState: .auth/state.json   # alternative: inject pre-captured state, skip setup
-  signedIn: "[data-testid=app-shell]"   # REQUIRED: present on every signed-in page, on no login page
+  signedIn: "[data-testid=account-menu]"   # REQUIRED: present on every signed-in page, on no login page
   # loginPath: /login            # optional, no default: where a signed-out visitor lands, relative to
                                # the base URL
   # allowedOrigins: ["https://login.example.com"]   # SSO origins a setup flow may pass through
@@ -348,9 +348,15 @@ route can be renamed. A marker in the page can, so the selector is required and 
 signed-in page and on no login page. `loginPath` is a second signal and the source of clearer
 messages; it is optional and has no default (`setup.path` is often a protected page that bounces
 through SSO and back, which is not a login page). The marker is verified before anything is
-scanned: the base URL (and `loginPath`, when set) is loaded in a fresh context with no session and
-no seed, and a marker that matches there fails the run (exit 3), as does one that already matches
-the setup page before the setup steps run. One load each, the usual readiness, no wait.
+scanned (`Auth.probeSignedOut`): the base URL, `loginPath` (when set), the setup page and the first
+explicit test that uses auth are loaded in parallel in fresh contexts with no session and no seed,
+and a marker that matches on any of them fails the run (exit 3). The readiness is the configured one
+except that a selector `waitFor` becomes `load` (the same holds for the setup flow's first load), and
+the marker is waited for with the guard's own wait (`has`, `min(5s, defaults.timeout / 4)`), so a
+marker drawn a moment after load is seen. A page that lands off the app's origin cannot be checked
+and warns; so does a run where no probed page landed on the app's origin, and an unreachable base
+URL (a failure to load any other probed page is fatal). The probe and the login flow are skipped when
+every selected test has `auth: false` and discovery is off; the run keeps only the redaction.
 
 **Setup.** `setup.path` and a non-empty list of interaction steps (`scan`, `keyboard`, `transcript`
 and `expectFocus` are rejected: setup has no result to report them to). With `reuse: true`
@@ -366,7 +372,7 @@ through `Page.addScriptToEvaluateOnNewDocument`. Each storage block is guarded b
 already holds is left alone. The script is removed once the first load is ready: left registered it
 would re-run on every later navigation and restore a token the page had deliberately removed (a
 logout step). With `reuse: false` each test runs the flow inside its own context, before loading
-its page; discovery still captures once (`Auth.ForCrawl`) and crawls with that state. `reuse` is
+its page; discovery honors that too (see Discovery below). `reuse` is
 meaningless with `storageState` and rejected there.
 
 **Setup success is checked.** After the steps the flow must be on the base origin, not on the login
@@ -405,7 +411,9 @@ auth config (`Auth.Anonymous`). Discovered tests use the configured auth. `auth:
 `auth` block is a config error; `auth: false` there is a no-op. With auth configured, a test whose
 `url:` is not on the base URL's origin is a config error (exit 2) unless it sets `auth: false`: the
 session's cookies are injected into the whole context, so they would go to a host the guard cannot
-judge (`CheckTestOrigins`, run once the base URL is known).
+judge (`CheckTestOrigins`, over the tests the run selects with `--id`/`--path`). It runs under
+`--validate` when the base URL is known without starting a server (`server.baseUrl`, `--base-url`),
+and at scan time otherwise (`serve:` binds an ephemeral port).
 
 **Allowed origins.** `allowedOrigins` lists absolute http(s) origins (validated; `NormalizeOrigin`
 lower-cases the host and drops a default port) that a *setup flow* may pass through, an SSO identity
@@ -422,12 +430,18 @@ or without the marker is dropped, not recorded, and a root that does so fails th
 drop logs a hint that covers both causes (a public page: add it as a test with `auth: false`; a
 signed-in page without the marker: choose a marker every signed-in page renders), and the crawl always
 ends with `discover: dropped N of M pages (not signed in)`. Signed out, depth-limit pages are not
-loaded. With `reuse: false` the crawl logs in once per page loaded (a session captured once would
-be dead after the first page for an app with single-use or rotating sessions), and a stderr warning
-says so at the start. Discovered paths are test ids in reports, baselines and issues, so with auth
-on they are cleaned: `;params`, a hash route's query and any nested fragment are dropped, and a path
-that still carries `token=`, `access_token`, `sig=` or `code=` is skipped; without auth the output
-is unchanged.
+loaded. With `reuse: false` the crawl logs in once per page loaded, up to `discover.maxPages` loads
+(a session captured once would be dead after the first page for an app with single-use or rotating
+sessions), each discovered test logs in again when it runs, and a stderr warning says so at the
+start. `maxPages` caps pages found when signed out (unchanged) and page loads, dropped pages
+included, when signed in. Discovered paths are test ids in reports, baselines and issues, so with auth
+on they are cleaned before the excludes and the dedupe see them: a `?` in the path and `;params` are
+cut, a hash route's query and any nested fragment are dropped, and a path is skipped when it still
+names a credential (`credentialMarks`: `token=`, `access_token`, `sig=`, `code=`, `password=`,
+`passwd=`, `key=`, `api_key`, `apikey`, `session=`, `sessionid`, `ticket=`, `signature`, `x-amz-`,
+`auth=`, `otp=`, case-insensitive substrings) or has a segment that looks like a secret
+(`tokenLike`: a JWT, 32+ hex characters, or 24+ base64url characters with a digit or mixed case and
+no word between separators); without auth the output is unchanged.
 
 **Secrets.** Only through `${ENV}` interpolation. A `fill` into a password-looking selector
 (`password`, `passwd`, `type=password`, case-insensitive) whose raw text has no `${...}` is a
@@ -437,7 +451,8 @@ Verbose logging of setup steps names the action and selector, never a value. Wit
 URLs in errors and logs go through `RedactURL`: userinfo, query, `;params` and fragment are dropped,
 a percent-encoded `?` or `#` in the path is cut like a real one, and a hash route is kept only up to
 the first `#`, `?`, `&` or `=` (OAuth implicit flows put the token there), so a token in
-`setup.path` cannot leak; without auth the output is unchanged. The captured cookies and storage exist only in memory: never written to disk,
+`setup.path` cannot leak; without auth the output is unchanged. With auth configured, `PageURL` in results and transcripts (SARIF locations, the HTML report) is
+redacted the same way. The captured cookies and storage exist only in memory: never written to disk,
 reports or logs, and the state type redacts itself under `%v`. That is about the session itself:
 element screenshots, the HTML report and transcripts of signed-in pages can contain account data,
 and screenshots default on under GitHub Actions, so sensitive accounts should run with
