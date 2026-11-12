@@ -12,6 +12,7 @@ defaults:
 tests:
   - id: fixture-initial
     path: /
+    keyboard: true
 
   - id: fixture-dialog
     path: /
@@ -22,3 +23,14 @@ tests:
       - scan:
           label: dialog-open
           scope: "#dialog"
+      - keyboard:
+          label: dialog-open
+          scope: "#dialog"
+      - transcript:
+          label: dialog-open
+          scope: "#dialog"
+      # planted: frostfall/focus-expectation - opening the dialog leaves
+      # focus on its trigger
+      - expectFocus:
+          label: dialog-open
+          within: "#dialog"

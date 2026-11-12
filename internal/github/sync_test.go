@@ -50,7 +50,7 @@ func plan(t *testing.T, groups []Group, existing []Issue, ran ...string) []Actio
 	for _, id := range ran {
 		testsRun[id] = true
 	}
-	return Plan(groups, existing, testsRun)
+	return Plan(groups, existing, func(page, _ string) bool { return testsRun[page] })
 }
 
 func TestPlanCreatesOnlyMissing(t *testing.T) {

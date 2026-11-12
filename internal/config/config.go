@@ -5,13 +5,18 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/aquia-inc/frostfall/internal/keyboard"
 )
 
 // Duration wraps time.Duration for "60s"/"500ms" YAML values.
@@ -69,6 +74,19 @@ type ProfileDefaults struct {
 	Timeout    *Duration       `yaml:"timeout"`
 	Rules      map[string]bool `yaml:"rules"`
 	Expect     *Expect         `yaml:"expect"`
+	Keyboard   *KeyboardStep   `yaml:"keyboard"`
+}
+
+// UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
+func (d *ProfileDefaults) UnmarshalYAML(node *yaml.Node) error {
+	type plain ProfileDefaults
+	if err := decodeStrict(node, (*plain)(d)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"keyboard": func() { d.Keyboard = cmp.Or(d.Keyboard, &KeyboardStep{}) },
+	})
+	return nil
 }
 
 type Server struct {
@@ -100,6 +118,48 @@ type Defaults struct {
 	Timeout    Duration        `yaml:"timeout"`
 	Rules      map[string]bool `yaml:"rules"`
 	Expect     Expect          `yaml:"expect"`
+	// Keyboard audits every test's initial state, discovered ones included,
+	// unless a test sets its own keyboard (false opts it out). Opt-in per
+	// config, never a binary default: turning it on in a release would fail
+	// every enforcing pipeline on findings nobody asked for.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
+}
+
+// UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
+func (d *Defaults) UnmarshalYAML(node *yaml.Node) error {
+	type plain Defaults
+	if err := decodeStrict(node, (*plain)(d)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"keyboard": func() { d.Keyboard = cmp.Or(d.Keyboard, &KeyboardStep{}) },
+	})
+	return nil
+}
+
+// KeyboardFor is the keyboard audit t's initial state gets, nil for none.
+// The test's own setting wins (keyboard: false opts out), layered over the
+// default like rules are everywhere else: maxTabs falls back to the
+// default's, and the default's rules apply under the test's.
+func (c *Config) KeyboardFor(t Test) *KeyboardStep {
+	d, k := c.Defaults.Keyboard, t.Keyboard
+	if k == nil {
+		k = d
+	}
+	if k == nil || k.Off {
+		return nil
+	}
+	if d == nil || d == k {
+		return k
+	}
+	merged := *k
+	merged.MaxTabs = cmp.Or(k.MaxTabs, d.MaxTabs)
+	merged.Rules = maps.Clone(d.Rules)
+	if merged.Rules == nil {
+		merged.Rules = map[string]bool{}
+	}
+	maps.Copy(merged.Rules, k.Rules)
+	return &merged
 }
 
 // Expect is the enforcement contract. When no expect block is configured
@@ -158,6 +218,10 @@ type Test struct {
 	Steps   []Step          `yaml:"steps"`
 	Rules   map[string]bool `yaml:"rules"`
 	Expect  *Expect         `yaml:"expect"`
+	// Keyboard opts the initial state into a keyboard audit.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
+	// Transcript records the initial state's screen reader transcript.
+	Transcript *TranscriptStep `yaml:"transcript"`
 }
 
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
@@ -172,6 +236,12 @@ type Step struct {
 	Wait    Duration  `yaml:"wait"`
 	Scan    *ScanStep `yaml:"scan"`
 	Goto    string    `yaml:"goto"`
+	// Keyboard audits the state the preceding steps reached.
+	Keyboard *KeyboardStep `yaml:"keyboard"`
+	// Transcript records what a screen reader would announce now.
+	Transcript *TranscriptStep `yaml:"transcript"`
+	// ExpectFocus asserts where focus is now.
+	ExpectFocus *ExpectFocus `yaml:"expectFocus"`
 }
 
 // Field is one selector/value pair of a fill or select step.
@@ -209,7 +279,117 @@ func (f *Fields) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// ScanStep supports both bare `- scan` / `scan: {}` and the full form.
+// decodeStrict decodes node into v, rejecting unknown keys. A custom
+// UnmarshalYAML must use it instead of node.Decode, which does not inherit
+// the outer decoder's KnownFields: a typo'd scope would otherwise be dropped
+// and the scan would silently cover the whole page. The keys are checked
+// against v's yaml tags rather than by re-decoding a marshalled copy, which
+// would lose anchors defined elsewhere in the file.
+func decodeStrict(node *yaml.Node, v any) error {
+	if err := checkKeys(node, reflect.TypeOf(v).Elem()); err != nil {
+		return err
+	}
+	return node.Decode(v)
+}
+
+var unmarshalerType = reflect.TypeFor[yaml.Unmarshaler]()
+
+// checkKeys rejects mapping keys with no yaml-tagged field in t, recursing
+// into struct fields that have no UnmarshalYAML of their own (those check
+// themselves), so a nested block like expectFocus is covered too.
+func checkKeys(node *yaml.Node, t reflect.Type) error {
+	if node.Kind != yaml.MappingNode || t.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := map[string]reflect.Type{}
+	for i := range t.NumField() {
+		if name, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ","); name != "-" {
+			fields[name] = t.Field(i).Type
+		}
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i]
+		if key.Tag == "!!merge" {
+			continue
+		}
+		ft, ok := fields[key.Value]
+		if !ok {
+			return fmt.Errorf("line %d: field %s not found", key.Line, key.Value)
+		}
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if !reflect.PointerTo(ft).Implements(unmarshalerType) {
+			if err := checkKeys(node.Content[i+1], ft); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalYAML gives a null `scan:`, `keyboard:`, or `transcript:` step its
+// documented meaning, all defaults.
+func (s *Step) UnmarshalYAML(node *yaml.Node) error {
+	type plain Step
+	if err := decodeStrict(node, (*plain)(s)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"scan":       func() { s.Scan = cmp.Or(s.Scan, &ScanStep{}) },
+		"keyboard":   func() { s.Keyboard = cmp.Or(s.Keyboard, &KeyboardStep{}) },
+		"transcript": func() { s.Transcript = cmp.Or(s.Transcript, &TranscriptStep{}) },
+	})
+	return nil
+}
+
+// defaultNulls runs fill for each key of the mapping whose value is null,
+// following aliases and merge keys (<<) as the decoder does. yaml.v3 never
+// calls a field's own UnmarshalYAML for null; it leaves the pointer nil,
+// which reads as "not configured" rather than the documented defaults. Each
+// fill leaves an already-decoded value alone, so an explicit key still wins
+// over a merged one.
+func defaultNulls(node *yaml.Node, fill map[string]func()) {
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, val := node.Content[i], node.Content[i+1]
+		if val.Kind == yaml.AliasNode {
+			val = val.Alias
+		}
+		if key.Tag == "!!merge" || key.Value == "<<" {
+			merged := []*yaml.Node{val}
+			if val.Kind == yaml.SequenceNode {
+				merged = val.Content
+			}
+			for _, m := range merged {
+				defaultNulls(m, fill)
+			}
+			continue
+		}
+		if f, ok := fill[key.Value]; ok && val.Tag == "!!null" {
+			f()
+		}
+	}
+}
+
+// decodeToggle decodes a block that also takes a bare boolean, in any form
+// the rule toggles accept (true/false, on/off, yes/no): off sets *off, on
+// means all defaults.
+func decodeToggle(node *yaml.Node, v any, off *bool) error {
+	if node.Kind == yaml.ScalarNode && node.Tag != "!!null" {
+		var on bool
+		if err := node.Decode(&on); err != nil {
+			return fmt.Errorf("line %d: want true, false, or a mapping: %w", node.Line, err)
+		}
+		*off = !on
+		return nil
+	}
+	return decodeStrict(node, v)
+}
+
+// ScanStep supports both bare `- scan:` / `scan: {}` and the full form.
 type ScanStep struct {
 	Label string          `yaml:"label"`
 	Scope string          `yaml:"scope"`
@@ -223,7 +403,104 @@ func (s *ScanStep) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	}
 	type plain ScanStep
-	return node.Decode((*plain)(s))
+	return decodeStrict(node, (*plain)(s))
+}
+
+// UnmarshalYAML gives a bare `keyboard:` or `transcript:` on a test the
+// meaning the same key has on a step - on - rather than silently skipping
+// the check the config asked for.
+func (t *Test) UnmarshalYAML(node *yaml.Node) error {
+	type plain Test
+	if err := decodeStrict(node, (*plain)(t)); err != nil {
+		return err
+	}
+	defaultNulls(node, map[string]func(){
+		"keyboard":   func() { t.Keyboard = cmp.Or(t.Keyboard, &KeyboardStep{}) },
+		"transcript": func() { t.Transcript = cmp.Or(t.Transcript, &TranscriptStep{}) },
+	})
+	return nil
+}
+
+// KeyboardStep configures a keyboard traversal audit. As a test field it
+// accepts true/false or the full form (without label: it is the initial
+// state); as a step, bare `- keyboard:` or the full form.
+type KeyboardStep struct {
+	Label   string          `yaml:"label"`
+	Scope   string          `yaml:"scope"`
+	MaxTabs int             `yaml:"maxTabs"`
+	Rules   map[string]bool `yaml:"rules"`
+	// Off records an explicit `keyboard: false`.
+	Off bool `yaml:"-"`
+}
+
+func (k *KeyboardStep) UnmarshalYAML(node *yaml.Node) error {
+	type plain KeyboardStep
+	return decodeToggle(node, (*plain)(k), &k.Off)
+}
+
+func (k *KeyboardStep) validate() error {
+	if k.MaxTabs < 0 {
+		return fmt.Errorf("keyboard.maxTabs: must not be negative")
+	}
+	if err := validateRules("keyboard.rules", k.Rules); err != nil {
+		return err
+	}
+	return onlyRules("keyboard.rules", k.Rules, true)
+}
+
+// onlyRules rejects ids the block's check never reads: a keyboard step's
+// rules only reach the keyboard audit, a scan step's only axe, so a toggle
+// for the other would validate and silently do nothing. Defaults and test
+// rules feed both, so they take either.
+func onlyRules(where string, rules map[string]bool, kb bool) error {
+	for id := range rules {
+		// expectFocus reads only the defaults' and test's rules.
+		if kb && id == keyboard.RuleFocusExpectation {
+			return fmt.Errorf("%s: %q applies to expectFocus steps; set it in the test's rules", where, id)
+		}
+		if keyboard.IsRule(id) != kb {
+			if kb {
+				return fmt.Errorf("%s: %q is an axe rule; set it in a scan step or the test's rules", where, id)
+			}
+			return fmt.Errorf("%s: %q is a frostfall/ rule; set it in a keyboard step or the test's rules", where, id)
+		}
+	}
+	return nil
+}
+
+// validateRules rejects frostfall/ rule ids this binary does not implement:
+// a typo there would silently leave a keyboard check on. Axe ids are not
+// checked here - axe itself rejects unknown ones at scan time.
+func validateRules(where string, rules map[string]bool) error {
+	for id := range rules {
+		if keyboard.IsRule(id) && !keyboard.Known(id) {
+			return fmt.Errorf("%s: unknown rule %q", where, id)
+		}
+	}
+	return nil
+}
+
+// TranscriptStep records a screen reader transcript. Like KeyboardStep, the
+// test-level form takes true/false or the full form without a label.
+type TranscriptStep struct {
+	Label string `yaml:"label"`
+	Scope string `yaml:"scope"`
+	// Off records an explicit `transcript: false`.
+	Off bool `yaml:"-"`
+}
+
+func (t *TranscriptStep) UnmarshalYAML(node *yaml.Node) error {
+	type plain TranscriptStep
+	return decodeToggle(node, (*plain)(t), &t.Off)
+}
+
+// ExpectFocus asserts where focus is: every field set must hold. Role and
+// name are the accessible role and name a screen reader would announce.
+type ExpectFocus struct {
+	Label  string `yaml:"label"`
+	Within string `yaml:"within"`
+	Role   string `yaml:"role"`
+	Name   string `yaml:"name"`
 }
 
 var validStandards = map[string]bool{
@@ -327,6 +604,9 @@ func (c *Config) applyProfile(profile string) error {
 		// report-only (e.g. a "local" profile under an enforcing default).
 		if d.Expect != nil {
 			c.Defaults.Expect = *d.Expect
+		}
+		if d.Keyboard != nil {
+			c.Defaults.Keyboard = d.Keyboard
 		}
 	}
 	return nil
@@ -451,6 +731,17 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	if err := validateRules("defaults.rules", c.Defaults.Rules); err != nil {
+		return err
+	}
+	if k := c.Defaults.Keyboard; k != nil {
+		if k.Label != "" || k.Scope != "" {
+			return fmt.Errorf("defaults.keyboard: label and scope are per test; set them on a keyboard step")
+		}
+		if err := k.validate(); err != nil {
+			return fmt.Errorf("defaults: %w", err)
+		}
+	}
 	if s := c.Defaults.Expect.Severity; s != "" && !validSeverities[s] {
 		return fmt.Errorf("defaults.expect.severity: must be minor, moderate, serious, or critical")
 	}
@@ -472,6 +763,20 @@ func (c *Config) validate() error {
 		if t.Expect != nil && t.Expect.Severity != "" && !validSeverities[t.Expect.Severity] {
 			return fmt.Errorf("test %q: invalid expect.severity", t.ID)
 		}
+		if err := validateRules("rules", t.Rules); err != nil {
+			return fmt.Errorf("test %q: %w", t.ID, err)
+		}
+		if tr := t.Transcript; tr != nil && tr.Label != "" {
+			return fmt.Errorf("test %q: transcript.label: the test-level transcript is always labelled initial; use a transcript step to name one", t.ID)
+		}
+		if k := t.Keyboard; k != nil {
+			if k.Label != "" {
+				return fmt.Errorf("test %q: keyboard.label: the test-level audit is always labelled initial; use a keyboard step to name one", t.ID)
+			}
+			if err := k.validate(); err != nil {
+				return fmt.Errorf("test %q: %w", t.ID, err)
+			}
+		}
 		for j, s := range t.Steps {
 			if err := s.validate(); err != nil {
 				return fmt.Errorf("test %q steps[%d]: %w", t.ID, j, err)
@@ -486,6 +791,7 @@ func (s *Step) validate() error {
 	for _, set := range []bool{
 		s.Click != "", len(s.Fill) > 0, s.Press != "", s.Hover != "",
 		len(s.Select) > 0, s.WaitFor != "", s.Wait != 0, s.Scan != nil, s.Goto != "",
+		s.Keyboard != nil, s.Transcript != nil, s.ExpectFocus != nil,
 	} {
 		if set {
 			actions++
@@ -493,6 +799,26 @@ func (s *Step) validate() error {
 	}
 	if actions != 1 {
 		return fmt.Errorf("each step must have exactly one action")
+	}
+	if s.Scan != nil {
+		if err := validateRules("scan.rules", s.Scan.Rules); err != nil {
+			return err
+		}
+		if err := onlyRules("scan.rules", s.Scan.Rules, false); err != nil {
+			return err
+		}
+	}
+	if t := s.Transcript; t != nil && t.Off {
+		return fmt.Errorf("transcript: false is only meaningful on a test; drop the step instead")
+	}
+	if e := s.ExpectFocus; e != nil && e.Within == "" && e.Role == "" && e.Name == "" {
+		return fmt.Errorf("expectFocus: set at least one of within, role, name")
+	}
+	if k := s.Keyboard; k != nil {
+		if k.Off {
+			return fmt.Errorf("keyboard: false is only meaningful on a test; drop the step instead")
+		}
+		return k.validate()
 	}
 	return nil
 }

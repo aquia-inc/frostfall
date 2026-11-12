@@ -26,11 +26,16 @@ func Fingerprint(testID, scanLabel, ruleID, rawTarget string) string {
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
+// GeneratedIDPattern matches ids that regenerate per build or session. It
+// is exported for the keyboard audit's page script, whose selectors must not
+// anchor on an id this package would strip.
+const GeneratedIDPattern = `[0-9a-f]{8,}|[0-9]{4,}$|^:r[a-z0-9]+:?$`
+
 var (
 	// Generated-looking ids: a run of 8+ hex chars, a purely numeric suffix
 	// of 4+ digits, or a React useId (":r1a:", seen with CSS escaping
 	// stripped). CSS-module hashes and React ids regenerate per build/session.
-	generatedIDRe     = regexp.MustCompile(`[0-9a-f]{8,}|[0-9]{4,}$|^:r[a-z0-9]+:?$`)
+	generatedIDRe     = regexp.MustCompile(GeneratedIDPattern)
 	// Hash-like class names that churn between builds.
 	hashClassRes = []*regexp.Regexp{
 		// Emotion/MUI: css-10u3qtx and css-10u3qtx-MuiChip-root. The Mui*

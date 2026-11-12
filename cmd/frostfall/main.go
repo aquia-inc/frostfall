@@ -357,9 +357,9 @@ func writeGitHubOutputs(res *runner.Run, flagged func(runner.Result) bool, forma
 
 // syncIssues reconciles GitHub issues against this run's failing violations —
 // the shared enforcement predicate, so filed issues always match what the
-// exit code and reports flag. Close scoping uses the tests that actually
-// executed a scan — a configured test whose scan never ran must not close its
-// issues as "fixed".
+// exit code and reports flag. Close scoping uses the checks that actually
+// ran on each page — a configured test whose check never ran must not close
+// its issues as "fixed".
 func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) error {
 	var failing []runner.Result
 	for _, r := range res.Results {
@@ -368,12 +368,12 @@ func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) 
 		}
 	}
 	groups := github.BuildGroups(failing)
-	testsRun := res.Scanned
+	covered := res.Covered
 
 	if dryRun {
 		// Without credentials we cannot see existing issues, so a dry run
 		// plans against an empty set: it shows the full desired state.
-		for _, a := range github.Plan(groups, nil, testsRun) {
+		for _, a := range github.Plan(groups, nil, covered) {
 			fmt.Println("gh-issues (dry-run):", a)
 		}
 		return nil
@@ -395,7 +395,7 @@ func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) 
 	if server, run := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_RUN_ID"); server != "" && run != "" {
 		runContext = fmt.Sprintf("Filed by Frostfall ([run](%s/%s/actions/runs/%s)).", server, repo, run)
 	}
-	actions, err := github.Sync(client, groups, existing, testsRun, runContext)
+	actions, err := github.Sync(client, groups, existing, covered, runContext)
 	for _, a := range actions {
 		fmt.Println("gh-issues:", a)
 	}

@@ -211,6 +211,9 @@ defaults:                        # applied to every test unless overridden
   timeout: 30s                   # per-test budget: load + steps + scans
   rules:                         # per-rule toggles for every scan
     color-contrast: on
+  keyboard: true                 # keyboard-audit every test's initial state,
+                                 # discovered ones included (default off;
+                                 # a test opts out with keyboard: false)
   expect:                        # ABSENT = report-only, always exit 0
     severity: serious            # fail on new violations at this impact or worse:
                                  #   minor | moderate | serious | critical
@@ -241,6 +244,10 @@ tests:
     waitFor: "[data-testid=app]" # per-test readiness override
     rules:                       # per-test rule toggles (merged over defaults)
       color-contrast: off
+    keyboard: true               # also run a keyboard audit on the initial
+                                 # state (default false; see Keyboard audit)
+    transcript: true             # also record a screen reader transcript of
+                                 # the initial state (default false)
     expect:                      # per-test enforcement override
       severity: critical
     steps: []                    # see the step table below
@@ -262,6 +269,9 @@ scanning, not a general E2E framework.
 | `wait` | `wait: 500ms` | fixed sleep - escape hatch of last resort |
 | `goto` | `goto: /settings` | navigate to another path mid-test |
 | `scan` | `scan: { label: modal, scope: "[role=dialog]" }` | run the audit now; `label` names the scan point, `scope` limits it to a subtree, `rules` overrides per-scan |
+| `keyboard` | `keyboard: { label: modal, scope: "[role=dialog]" }` | run a [keyboard audit](#keyboard-audit) now; `label` and `scope` as for `scan`, plus `maxTabs` and `rules` |
+| `transcript` | `transcript: { label: modal, scope: "[role=dialog]" }` | record what a [screen reader would announce](#screen-reader-transcripts-and-focus-assertions) now; `label` and `scope` as for `scan` |
+| `expectFocus` | `expectFocus: { within: "[role=dialog]", name: Close }` | [assert where focus is](#screen-reader-transcripts-and-focus-assertions): `within` a selector, with accessible `role` and `name`; at least one, all must hold |
 
 A step that fails (selector never appears within the test timeout) is an
 environment error (exit 3), not a violation.
@@ -269,6 +279,107 @@ environment error (exit 3), not a violation.
 If a page's results are flaky, replace `waitFor: networkIdle` with a CSS
 selector that only exists when the page is genuinely ready - that is almost
 always the fix.
+
+### Keyboard audit
+
+axe inspects the DOM; it cannot press keys. A keyboard audit does: it presses
+Tab through the page until focus cycles back to where it started, then
+reports what a keyboard user would hit. It is opt-in, so upgrading Frostfall
+never fails a pipeline on findings nobody asked for. Turn it on for every
+test, discovered ones included, with `defaults: { keyboard: true }` (a test
+opts out with `keyboard: false`, and a test's own `keyboard` settings layer
+over the default's `maxTabs` and `rules`); per test with `keyboard: true` (audits the
+initial state); or with a `keyboard` step (audits the state the steps
+reached - an open dialog, say):
+
+```yaml
+  - id: checkout
+    path: /cart
+    keyboard: true
+    steps:
+      - click: "#open-checkout"
+      - waitFor: "[role=dialog]"
+      - keyboard: { label: modal-open, scope: "[role=dialog]" }
+```
+
+| rule | impact | WCAG | fails when |
+|------|--------|------|------------|
+| `frostfall/keyboard-trap` | critical | 2.1.2 | Tab stops moving focus, or cycles through part of the page and never returns to where it began |
+| `frostfall/focus-unreachable` | serious | 2.1.1 | a visible element in the tab order is never reached by Tab |
+| `frostfall/focus-not-visible` | serious | 2.4.7 | nothing visibly changes around an element when it gains focus |
+| `frostfall/focus-hidden` | serious | 2.4.3, 2.4.7 | focus lands on an element that is 1px or smaller, clipped, or off-screen |
+| `frostfall/dialog-focus` | serious | 2.4.3 | a modal dialog is open but focus is outside it, or Tab moves focus out of it |
+
+Findings are ordinary violations: they fingerprint, baseline, gate on
+`expect`, and report to SARIF and the HTML report exactly like axe rules, and
+toggle the same way (`rules: { frostfall/focus-not-visible: off }`). `scope`
+limits which elements can be reported; the traversal still covers the whole
+page, since focus order is a property of the whole page.
+
+How the checks decide:
+
+- **Visible focus** is judged from screenshots: each stop's region (the
+  element, plus close-fitting wrappers where design systems draw input rings)
+  is captured while focused and again after Tab moves on. A region that did not
+  visibly change is re-checked on a second lap with a longer wait before it is
+  reported, so focus effects that mount late (MUI's ripple inside a DataGrid
+  row) are not mistaken for missing ones. Changes too faint to see - under
+  about 5% in every channel - do not count as an indicator.
+- **Modal dialogs** are `aria-modal="true"` elements and open modal
+  `<dialog>`s, or a portal whose page siblings are all `aria-hidden`/`inert`
+  (how MUI and Radix modals wall off the page). While one is open, only its
+  contents count as reachable.
+- **Focus guards** - the zero-size `tabindex="0"` sentinels focus traps use -
+  are not expected to be reached.
+
+An audit presses Tab once per stop, at roughly 150ms each, inside the test's
+`timeout`: a page with 150 tab stops needs about 25 seconds, so raise
+`defaults.timeout` (or a profile's) when auditing large pages. It leaves focus and scroll where
+it found them, so steps after a `keyboard` step run against the state the
+config reached. Returning focus to a dialog's trigger when it closes is
+checked with [`expectFocus`](#screen-reader-transcripts-and-focus-assertions).
+
+### Screen reader transcripts and focus assertions
+
+A `transcript` records what a screen reader would announce, in reading order,
+read from the browser's accessibility tree - the same roles, names, and
+states JAWS, NVDA, and VoiceOver get:
+
+```text
+dialog "Answer history" (modal)
+  heading "Answer history" (level 2)
+  button "Close"
+  checkbox "Remember me" (checked)
+  button (no accessible name)
+```
+
+Transcripts are evidence for a reviewer, never pass/fail: they appear in the
+text output, as collapsible sections in the HTML report, and in the SARIF
+run's `properties.transcripts`. They are not a screen reader - no speech
+rules or verbosity settings - so keep testing with a real one; they make it
+quick to spot a missing name or a wrong state without launching one. A
+transcript stops at 2000 lines; `scope` it to the part of the page under
+review.
+
+`expectFocus` turns focus management into a regression test. Each field set
+must hold: `within` (focus is inside this selector), `role` and `name` (the
+focused element's accessible role and name, as the transcript shows them).
+A miss is a `frostfall/focus-expectation` violation (serious, WCAG 2.4.3)
+that gates and baselines like any other, with a message saying where focus
+actually is:
+
+```yaml
+  - id: delete-dialog
+    path: /items
+    scan: false
+    steps:
+      - click: "#delete"
+      - waitFor: "[role=dialog]"
+      - expectFocus: { label: open, within: "[role=dialog]" }   # focus moved in
+      - transcript: { label: open, scope: "[role=dialog]" }
+      - press: Escape
+      - expectFocus: { label: closed, name: Delete }            # and came back
+```
 
 ## Command-line reference
 
@@ -519,7 +630,8 @@ standard you configure, with per-rule control on top.
 Frostfall automates the automatable part of accessibility conformance. axe-core
 is the same engine behind Lighthouse's accessibility score and most accessibility tooling,
 and running it against real rendered states - including keyboard-driven ones -
-catches far more than static analysis. But no automated tool verifies that alt
+catches far more than static analysis; the keyboard audit adds the tab-order
+and focus checks axe cannot make. But no automated tool verifies that alt
 text is meaningful, that a screen reader announces things sensibly, or that a
 human can actually complete your flows with assistive technology. Use Frostfall
 to catch regressions continuously; keep manual testing for what it's uniquely
