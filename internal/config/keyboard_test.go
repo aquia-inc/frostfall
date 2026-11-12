@@ -27,6 +27,8 @@ tests:
       - click: "#open"
       - keyboard:
       - keyboard: { label: dialog, scope: "[role=dialog]" }
+      - transcript:
+      - expectFocus: { within: "[role=dialog]", name: Close }
 `
 
 func TestKeyboardForms(t *testing.T) {
@@ -46,6 +48,12 @@ func TestKeyboardForms(t *testing.T) {
 	}
 	if step.Steps[1].Keyboard == nil {
 		t.Error("bare - keyboard: step decoded as no action")
+	}
+	if step.Steps[3].Transcript == nil {
+		t.Error("bare - transcript: step decoded as no action")
+	}
+	if e := step.Steps[4].ExpectFocus; e == nil || e.Within != "[role=dialog]" || e.Name != "Close" {
+		t.Errorf("expectFocus decoded as %+v", e)
 	}
 	if step.Steps[2].Keyboard.Label != "dialog" {
 		t.Errorf("keyboard step decoded as %+v", step.Steps[2].Keyboard)
@@ -80,6 +88,23 @@ tests:
     path: /
     steps:
       - keyboard: { scop: main }`, `field scop not found`},
+		"expectFocus with nothing to check": {`
+tests:
+  - id: a
+    path: /
+    steps:
+      - expectFocus: { label: x }`, "at least one of within, role, name"},
+		"unknown key in expectFocus": {`
+tests:
+  - id: a
+    path: /
+    steps:
+      - expectFocus: { whithin: main }`, "field whithin not found"},
+		"transcript false as a step": {`
+tests:
+  - id: a
+    path: /
+    steps: [{transcript: false}]`, "only meaningful on a test"},
 		"negative maxTabs": {`
 tests: [{id: a, path: /, keyboard: {maxTabs: -1}}]`, "must not be negative"},
 	}

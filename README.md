@@ -243,6 +243,8 @@ tests:
       color-contrast: off
     keyboard: true               # also run a keyboard audit on the initial
                                  # state (default false; see Keyboard audit)
+    transcript: true             # also record a screen reader transcript of
+                                 # the initial state (default false)
     expect:                      # per-test enforcement override
       severity: critical
     steps: []                    # see the step table below
@@ -265,6 +267,8 @@ scanning, not a general E2E framework.
 | `goto` | `goto: /settings` | navigate to another path mid-test |
 | `scan` | `scan: { label: modal, scope: "[role=dialog]" }` | run the audit now; `label` names the scan point, `scope` limits it to a subtree, `rules` overrides per-scan |
 | `keyboard` | `keyboard: { label: modal, scope: "[role=dialog]" }` | run a [keyboard audit](#keyboard-audit) now; `label` and `scope` as for `scan`, plus `maxTabs` and `rules` |
+| `transcript` | `transcript: { label: modal, scope: "[role=dialog]" }` | record what a [screen reader would announce](#screen-reader-transcripts-and-focus-assertions) now; `label` and `scope` as for `scan` |
+| `expectFocus` | `expectFocus: { within: "[role=dialog]", name: Close }` | [assert where focus is](#screen-reader-transcripts-and-focus-assertions): `within` a selector, with accessible `role` and `name`; at least one, all must hold |
 
 A step that fails (selector never appears within the test timeout) is an
 environment error (exit 3), not a violation.
@@ -325,8 +329,50 @@ An audit presses Tab once per stop, at roughly 150ms each, inside the test's
 `timeout`: a page with 150 tab stops needs about 25 seconds, so raise
 `timeout` on keyboard tests for large pages. It leaves focus and scroll where
 it found them, so steps after a `keyboard` step run against the state the
-config reached. Returning focus to a dialog's trigger when it closes is not
-checked yet.
+config reached. Returning focus to a dialog's trigger when it closes is
+checked with [`expectFocus`](#screen-reader-transcripts-and-focus-assertions).
+
+### Screen reader transcripts and focus assertions
+
+A `transcript` records what a screen reader would announce, in reading order,
+read from the browser's accessibility tree - the same roles, names, and
+states JAWS, NVDA, and VoiceOver get:
+
+```text
+dialog "Answer history" (modal)
+  heading "Answer history" (level 2)
+  button "Close"
+  checkbox "Remember me" (checked)
+  button (no accessible name)
+```
+
+Transcripts are evidence for a reviewer, never pass/fail: they appear in the
+text output, as collapsible sections in the HTML report, and in the SARIF
+run's `properties.transcripts`. They are not a screen reader - no speech
+rules or verbosity settings - so keep testing with a real one; they make it
+quick to spot a missing name or a wrong state without launching one. A
+transcript stops at 2000 lines; `scope` it to the part of the page under
+review.
+
+`expectFocus` turns focus management into a regression test. Each field set
+must hold: `within` (focus is inside this selector), `role` and `name` (the
+focused element's accessible role and name, as the transcript shows them).
+A miss is a `frostfall/focus-expectation` violation (serious, WCAG 2.4.3)
+that gates and baselines like any other, with a message saying where focus
+actually is:
+
+```yaml
+  - id: delete-dialog
+    path: /items
+    scan: false
+    steps:
+      - click: "#delete"
+      - waitFor: "[role=dialog]"
+      - expectFocus: { label: open, within: "[role=dialog]" }   # focus moved in
+      - transcript: { label: open, scope: "[role=dialog]" }
+      - press: Escape
+      - expectFocus: { label: closed, name: Delete }            # and came back
+```
 
 ## Command-line reference
 

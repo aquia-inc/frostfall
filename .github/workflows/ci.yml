@@ -29,7 +29,7 @@ jobs:
         run: go test ./...
 
       - name: Integration test (fixture scan)
-        # Runners ship Chrome; the fixture has 5 planted violations, so the
+        # Runners ship Chrome; the fixture has 6 planted violations, so the
         # enforcing profile of this config must exit 1 - anything else means
         # the scan or the exit-code contract broke.
         run: |

@@ -94,20 +94,7 @@ func (a *audit) report(rule, target, html, summary string) {
 		return
 	}
 	a.found[rule+"\x00"+target] = true
-	r := rules[rule]
-	if summary == "" {
-		summary = r.Summary
-	}
-	a.out = append(a.out, engine.Violation{
-		RuleID:  r.ID,
-		Impact:  r.Impact,
-		Target:  target,
-		Summary: summary,
-		Help:    r.Help,
-		HelpURL: r.HelpURL,
-		HTML:    html,
-		Tags:    r.Tags,
-	})
+	a.out = append(a.out, NewViolation(rule, target, html, summary))
 }
 
 func (a *audit) call(fn string, out any, args ...any) error {

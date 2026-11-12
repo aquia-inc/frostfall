@@ -26,6 +26,10 @@ const (
 	RuleNotVisible  = Prefix + "focus-not-visible"
 	RuleHidden      = Prefix + "focus-hidden"
 	RuleDialog      = Prefix + "dialog-focus"
+	// RuleFocusExpectation is an expectFocus step that did not hold. It is
+	// registered here, with the other frostfall/ rules, so it validates and
+	// toggles like them.
+	RuleFocusExpectation = Prefix + "focus-expectation"
 )
 
 var rules = map[string]Rule{
@@ -61,6 +65,14 @@ var rules = map[string]Rule{
 		HelpURL: "https://www.w3.org/WAI/WCAG22/Understanding/focus-order.html",
 		Tags:    []string{"wcag2a", "wcag243", "wcag2aa", "wcag247"},
 	},
+	RuleFocusExpectation: {
+		ID:      RuleFocusExpectation,
+		Impact:  engine.Serious,
+		Summary: "Focus must be where the config's expectFocus step says it is",
+		Help:    "Focus must move where the interaction should send it",
+		HelpURL: "https://www.w3.org/WAI/WCAG22/Understanding/focus-order.html",
+		Tags:    []string{"wcag2a", "wcag243"},
+	},
 	RuleDialog: {
 		ID:      RuleDialog,
 		Impact:  engine.Serious,
@@ -69,6 +81,19 @@ var rules = map[string]Rule{
 		HelpURL: "https://www.w3.org/WAI/WCAG22/Understanding/focus-order.html",
 		Tags:    []string{"wcag2a", "wcag243"},
 	},
+}
+
+// NewViolation builds a finding for one of these rules; summary replaces the
+// rule's generic one when set.
+func NewViolation(rule, target, html, summary string) engine.Violation {
+	r := rules[rule]
+	if summary == "" {
+		summary = r.Summary
+	}
+	return engine.Violation{
+		RuleID: r.ID, Impact: r.Impact, Target: target, Summary: summary,
+		Help: r.Help, HelpURL: r.HelpURL, HTML: html, Tags: r.Tags,
+	}
 }
 
 // IsRule reports whether id names a keyboard rule (namespaced or not).

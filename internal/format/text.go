@@ -100,6 +100,14 @@ func Text(w io.Writer, run *runner.Run, flagged func(runner.Result) bool, label 
 		}
 	}
 
+	for _, tr := range run.Transcripts {
+		fmt.Fprintf(w, "\n%s %s %s\n", styleTestID.Render(tr.TestID),
+			styleScanLabel.Render("("+tr.Label+")"), styleMeta.Render("screen reader transcript"))
+		for _, line := range tr.Lines {
+			fmt.Fprintf(w, "    %s\n", line)
+		}
+	}
+
 	fmt.Fprintf(w, "\n%s\n", styleTotals.Render(fmt.Sprintf(
 		"%d tests, %d new violation(s) %s, %d baselined",
 		run.TestsRun, newTotal, label, baselinedTotal)))

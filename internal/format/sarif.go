@@ -37,6 +37,9 @@ type sarifLog struct {
 type sarifRun struct {
 	Tool    sarifTool     `json:"tool"`
 	Results []sarifResult `json:"results"`
+	// Properties carries screen reader transcripts: evidence, not results,
+	// so they belong in the run's property bag rather than as alerts.
+	Properties map[string]any `json:"properties,omitempty"`
 }
 
 type sarifTool struct {
@@ -197,11 +200,25 @@ func SARIF(w io.Writer, run *runner.Run, meta RunMeta, flagged func(runner.Resul
 					"mode":       meta.Mode,
 				},
 			}},
-			Results: results,
+			Results:    results,
+			Properties: sarifTranscripts(run.Transcripts),
 		}},
 	}
 
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(log)
+}
+
+func sarifTranscripts(ts []runner.Transcript) map[string]any {
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, map[string]any{
+			"testId": t.TestID, "scanLabel": t.Label, "pageUrl": t.PageURL, "lines": t.Lines,
+		})
+	}
+	return map[string]any{"transcripts": out}
 }

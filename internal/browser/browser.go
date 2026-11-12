@@ -267,6 +267,30 @@ func (s *Session) CaptureRegion(x, y, w, h float64) ([]byte, error) {
 	return res.Data, nil
 }
 
+// AXTree implements screenreader.Page: Chrome's computed accessibility
+// tree for the page, the same roles and names assistive technology reads.
+func (s *Session) AXTree() ([]*proto.AccessibilityAXNode, error) {
+	res, err := proto.AccessibilityGetFullAXTree{}.Call(s.page)
+	if err != nil {
+		return nil, err
+	}
+	return res.Nodes, nil
+}
+
+// BackendNodeID implements screenreader.Page. A short timeout: a scope that
+// matches nothing is a config error to report, not something to wait on.
+func (s *Session) BackendNodeID(selector string) (proto.DOMBackendNodeID, error) {
+	el, err := s.page.Timeout(3 * time.Second).Element(selector)
+	if err != nil {
+		return 0, err
+	}
+	node, err := el.Describe(0, false)
+	if err != nil {
+		return 0, err
+	}
+	return node.BackendNodeID, nil
+}
+
 // Eval implements engine.Page.
 func (s *Session) Eval(js string, args ...any) (json.RawMessage, error) {
 	res, err := s.page.Eval(js, args...)

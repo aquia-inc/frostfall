@@ -163,6 +163,8 @@ type Test struct {
 	Expect  *Expect         `yaml:"expect"`
 	// Keyboard opts the initial state into a keyboard audit.
 	Keyboard *KeyboardStep `yaml:"keyboard"`
+	// Transcript records the initial state's screen reader transcript.
+	Transcript *TranscriptStep `yaml:"transcript"`
 }
 
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
@@ -179,6 +181,10 @@ type Step struct {
 	Goto    string    `yaml:"goto"`
 	// Keyboard audits the state the preceding steps reached.
 	Keyboard *KeyboardStep `yaml:"keyboard"`
+	// Transcript records what a screen reader would announce now.
+	Transcript *TranscriptStep `yaml:"transcript"`
+	// ExpectFocus asserts where focus is now.
+	ExpectFocus *ExpectFocus `yaml:"expectFocus"`
 }
 
 // Field is one selector/value pair of a fill or select step.
@@ -223,24 +229,50 @@ func (f *Fields) UnmarshalYAML(node *yaml.Node) error {
 // against v's yaml tags rather than by re-decoding a marshalled copy, which
 // would lose anchors defined elsewhere in the file.
 func decodeStrict(node *yaml.Node, v any) error {
-	if node.Kind == yaml.MappingNode {
-		known := map[string]bool{}
-		t := reflect.TypeOf(v).Elem()
-		for i := range t.NumField() {
-			name, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ",")
-			known[name] = name != "-"
-		}
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			if key := node.Content[i]; key.Tag != "!!merge" && !known[key.Value] {
-				return fmt.Errorf("line %d: field %s not found", key.Line, key.Value)
-			}
-		}
+	if err := checkKeys(node, reflect.TypeOf(v).Elem()); err != nil {
+		return err
 	}
 	return node.Decode(v)
 }
 
-// UnmarshalYAML gives a null `scan:` or `keyboard:` step its documented
-// meaning, all defaults. yaml.v3 never calls a field's own UnmarshalYAML for
+var unmarshalerType = reflect.TypeFor[yaml.Unmarshaler]()
+
+// checkKeys rejects mapping keys with no yaml-tagged field in t, recursing
+// into struct fields that have no UnmarshalYAML of their own (those check
+// themselves), so a nested block like expectFocus is covered too.
+func checkKeys(node *yaml.Node, t reflect.Type) error {
+	if node.Kind != yaml.MappingNode || t.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := map[string]reflect.Type{}
+	for i := range t.NumField() {
+		if name, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ","); name != "-" {
+			fields[name] = t.Field(i).Type
+		}
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i]
+		if key.Tag == "!!merge" {
+			continue
+		}
+		ft, ok := fields[key.Value]
+		if !ok {
+			return fmt.Errorf("line %d: field %s not found", key.Line, key.Value)
+		}
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if !reflect.PointerTo(ft).Implements(unmarshalerType) {
+			if err := checkKeys(node.Content[i+1], ft); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalYAML gives a null `scan:`, `keyboard:`, or `transcript:` step its
+// documented meaning, all defaults. yaml.v3 never calls a field's own UnmarshalYAML for
 // a null value; it leaves the pointer nil, which reads as no action at all.
 func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 	type plain Step
@@ -256,6 +288,8 @@ func (s *Step) UnmarshalYAML(node *yaml.Node) error {
 			s.Scan = &ScanStep{}
 		case "keyboard":
 			s.Keyboard = &KeyboardStep{}
+		case "transcript":
+			s.Transcript = &TranscriptStep{}
 		}
 	}
 	return nil
@@ -323,6 +357,37 @@ func validateRules(where string, rules map[string]bool) error {
 		}
 	}
 	return nil
+}
+
+// TranscriptStep records a screen reader transcript. Like KeyboardStep, the
+// test-level form takes true/false or the full form without a label.
+type TranscriptStep struct {
+	Label string `yaml:"label"`
+	Scope string `yaml:"scope"`
+	// Off records an explicit `transcript: false`.
+	Off bool `yaml:"-"`
+}
+
+func (t *TranscriptStep) UnmarshalYAML(node *yaml.Node) error {
+	if node.Tag == "!!bool" {
+		var on bool
+		if err := node.Decode(&on); err != nil {
+			return err
+		}
+		t.Off = !on
+		return nil
+	}
+	type plain TranscriptStep
+	return decodeStrict(node, (*plain)(t))
+}
+
+// ExpectFocus asserts where focus is: every field set must hold. Role and
+// name are the accessible role and name a screen reader would announce.
+type ExpectFocus struct {
+	Label  string `yaml:"label"`
+	Within string `yaml:"within"`
+	Role   string `yaml:"role"`
+	Name   string `yaml:"name"`
 }
 
 var validStandards = map[string]bool{
@@ -577,6 +642,9 @@ func (c *Config) validate() error {
 		if err := validateRules("rules", t.Rules); err != nil {
 			return fmt.Errorf("test %q: %w", t.ID, err)
 		}
+		if tr := t.Transcript; tr != nil && tr.Label != "" {
+			return fmt.Errorf("test %q: transcript.label: the test-level transcript is always labelled initial; use a transcript step to name one", t.ID)
+		}
 		if k := t.Keyboard; k != nil {
 			if k.Label != "" {
 				return fmt.Errorf("test %q: keyboard.label: the test-level audit is always labelled initial; use a keyboard step to name one", t.ID)
@@ -599,7 +667,7 @@ func (s *Step) validate() error {
 	for _, set := range []bool{
 		s.Click != "", len(s.Fill) > 0, s.Press != "", s.Hover != "",
 		len(s.Select) > 0, s.WaitFor != "", s.Wait != 0, s.Scan != nil, s.Goto != "",
-		s.Keyboard != nil,
+		s.Keyboard != nil, s.Transcript != nil, s.ExpectFocus != nil,
 	} {
 		if set {
 			actions++
@@ -612,6 +680,12 @@ func (s *Step) validate() error {
 		if err := validateRules("scan.rules", s.Scan.Rules); err != nil {
 			return err
 		}
+	}
+	if t := s.Transcript; t != nil && t.Off {
+		return fmt.Errorf("transcript: false is only meaningful on a test; drop the step instead")
+	}
+	if e := s.ExpectFocus; e != nil && e.Within == "" && e.Role == "" && e.Name == "" {
+		return fmt.Errorf("expectFocus: set at least one of within, role, name")
 	}
 	if k := s.Keyboard; k != nil {
 		if k.Off {

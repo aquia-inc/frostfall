@@ -26,3 +26,11 @@ tests:
       - keyboard:
           label: dialog-open
           scope: "#dialog"
+      - transcript:
+          label: dialog-open
+          scope: "#dialog"
+      # planted: frostfall/focus-expectation - opening the dialog leaves
+      # focus on its trigger
+      - expectFocus:
+          label: dialog-open
+          within: "#dialog"
