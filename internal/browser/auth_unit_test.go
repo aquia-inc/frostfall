@@ -42,17 +42,59 @@ func TestOriginOf(t *testing.T) {
 		"https://example.com:443/": "https://example.com",
 		"http://example.com:80":    "http://example.com",
 		"https://Example.com":      "https://example.com",
+		"https://APP.example.com/": "https://app.example.com",
+		"HTTP://Host:8080":         "http://host:8080",
 		"http://[::1]:3000/":       "http://[::1]:3000",
 	}
 	for raw, want := range cases {
 		got, err := originOf(raw)
-		// url.Parse keeps host case; browsers lower-case it. Compare folded.
-		if err != nil || !strings.EqualFold(got, want) {
+		// Browsers report location.origin lower-cased, so the comparisons
+		// that capture, seed and guard on it must be exact on a lower-cased
+		// form: an upper-case host in a config must still match.
+		if err != nil || got != want {
 			t.Errorf("originOf(%q) = %q, %v; want %q", raw, got, err, want)
 		}
 	}
 	if _, err := originOf("example.com"); err == nil {
 		t.Error("a bare host is not an origin")
+	}
+}
+
+func TestGuardKeyIgnoresHashRouteQuery(t *testing.T) {
+	cases := map[string]string{
+		"http://x/#/login?redirect=/x": "/#/login",
+		"http://x/#/login?a=1&b=2":     "/#/login",
+		"http://x/app#/login?next=%2F": "/app#/login",
+		"http://x/login?next=/a":       "/login",
+		"http://x/#/login/":            "/#/login",
+		"http://x/#section":            "/",
+	}
+	for raw, want := range cases {
+		u, _ := url.Parse(raw)
+		if got := guardKey(u); got != want {
+			t.Errorf("guardKey(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	// Discovery's identity is untouched: two hash queries are two pages.
+	u, _ := url.Parse("http://x/#/login?redirect=/x")
+	if got := RouteKey(u); got != "/#/login?redirect=/x" {
+		t.Errorf("RouteKey changed: %q", got)
+	}
+}
+
+func TestRedactURLDropsQuery(t *testing.T) {
+	for in, want := range map[string]string{
+		"/login?token=abc":    "/login",
+		"/#/login?token=abc":  "/#/login",
+		"http://h/app?x=1#/y": "http://h/app",
+		"/plain":              "/plain",
+	} {
+		if got := RedactURL(in); got != want {
+			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := describeStep(config.Step{Goto: "/next?token=abc"}); strings.Contains(got, "abc") {
+		t.Errorf("describeStep leaks a query: %q", got)
 	}
 }
 

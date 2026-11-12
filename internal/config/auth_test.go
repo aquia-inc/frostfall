@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -57,9 +58,19 @@ func TestAuthValidation(t *testing.T) {
 		{"transcript in setup", "  setup:\n    path: /login\n    steps:\n      - transcript:\n", "transcript is not allowed"},
 		{"expectFocus in setup", "  setup:\n    path: /login\n    steps:\n      - expectFocus: { role: button }\n", "expectFocus is not allowed"},
 		{"invalid step", "  setup:\n    path: /login\n    steps:\n      - click: a\n        press: Enter\n", "exactly one action"},
-		{"reuse with storageState", "  storageState: state.json\n  reuse: true\n", "auth.reuse: only applies to setup"},
-		{"missing storageState file", "  storageState: nope.json\n", "auth.storageState nope.json"},
-		{"malformed JSON", "  storageState: bad.json\n", "not a storage-state JSON file"},
+		{"reuse with storageState", "  storageState: state.json\n  loginPath: /login\n  reuse: true\n", "auth.reuse: only applies to setup"},
+		{"missing storageState file", "  storageState: nope.json\n  loginPath: /login\n", "auth.storageState nope.json"},
+		{"malformed JSON", "  storageState: bad.json\n  loginPath: /login\n", "not a storage-state JSON file"},
+		{"storageState without loginPath", "  storageState: state.json\n", "auth.loginPath: required with storageState"},
+		{"login route at the base root without signedIn", validSetup + "  loginPath: /\n", "auth.signedIn: required"},
+		{"hash root without signedIn", validSetup + "  loginPath: \"/#/\"\n", "auth.signedIn: required"},
+		{"setup at the base root without signedIn", "  setup:\n    path: /\n    steps:\n      - click: a\n", "auth.signedIn: required"},
+		{"login route at the root with signedIn", validSetup + "  loginPath: /\n  signedIn: \"#shell\"\n", ""},
+		{"allowedOrigins", validSetup + "  allowedOrigins: [\"https://login.example.com\", \"http://localhost:9000\"]\n", ""},
+		{"allowedOrigins relative", validSetup + "  allowedOrigins: [\"/sso\"]\n", "auth.allowedOrigins[0]"},
+		{"allowedOrigins with a path", validSetup + "  allowedOrigins: [\"https://idp.example.com/realm\"]\n", "auth.allowedOrigins[0]"},
+		{"allowedOrigins wrong scheme", validSetup + "  allowedOrigins: [\"ftp://idp.example.com\"]\n", "auth.allowedOrigins[0]"},
+		{"allowedOrigins bare host", validSetup + "  allowedOrigins: [\"idp.example.com\"]\n", "auth.allowedOrigins[0]"},
 		{"loginPath needs a slash", validSetup + "  loginPath: login\n", "auth.loginPath"},
 		{"unknown auth key", validSetup + "  logInPath: /x\n", "field logInPath not found"},
 	}
@@ -96,7 +107,7 @@ func TestStorageStateRelativeToConfigDir(t *testing.T) {
 		t.Errorf("state not loaded from the config's directory: %v", st)
 	}
 	if len(cfg.Warnings) != 0 {
-		t.Errorf("unexpected warnings with loginPath set: %v", cfg.Warnings)
+		t.Errorf("unexpected warnings: %v", cfg.Warnings)
 	}
 }
 
@@ -111,7 +122,7 @@ func TestStorageStateContentErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			os.WriteFile(filepath.Join(dir, "s.json"), []byte(content), 0o600)
-			_, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n"), "")
+			_, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n  loginPath: /login\n"), "")
 			if err == nil {
 				t.Fatal("want a config error")
 			}
@@ -122,15 +133,27 @@ func TestStorageStateContentErrors(t *testing.T) {
 	}
 }
 
-func TestStorageStateWithoutLoginPathWarns(t *testing.T) {
-	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "s.json"), []byte(goodState), 0o600)
-	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n"), "")
+func TestAllowedOriginsAreNormalized(t *testing.T) {
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+
+		"  allowedOrigins: [\"HTTPS://Login.Example.com:443\", \"http://localhost:80/\", \"https://idp.example.com:8443\"]\n"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "loginPath") {
-		t.Errorf("warnings = %v, want one about loginPath", cfg.Warnings)
+	want := []string{"https://login.example.com", "http://localhost", "https://idp.example.com:8443"}
+	if !slices.Equal(cfg.Auth.AllowedOrigins, want) {
+		t.Errorf("allowedOrigins = %v, want %v", cfg.Auth.AllowedOrigins, want)
+	}
+}
+
+func TestStorageStateWithoutLoginPathIsAConfigError(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "s.json"), []byte(goodState), 0o600)
+	cfg, err := Load(writeConfigIn(t, dir, authPrefix+"  storageState: s.json\n"), "")
+	if err == nil || !strings.Contains(err.Error(), "auth.loginPath") {
+		t.Fatalf("err = %v, want a loginPath config error", err)
+	}
+	if cfg != nil {
+		t.Errorf("a config was returned alongside the error")
 	}
 }
 

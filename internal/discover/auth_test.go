@@ -66,7 +66,7 @@ func authFor(t *testing.T, b *browser.Browser, base string, withSession bool) *b
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := browser.NewAuth(b, cfg, base, nil)
+	a, err := browser.NewAuth(b, cfg, base, browser.AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,5 +122,58 @@ func TestCrawlFailsWhenRootRedirectsToLogin(t *testing.T) {
 	_, err = crawler(b, authFor(t, b, srv.URL, false), srv.URL).Run()
 	if !errors.Is(err, browser.ErrLoginRedirect) {
 		t.Errorf("err = %v, want the login redirect error", err)
+	}
+}
+
+// richSite links, from its root, to pages a signed-in crawl must not turn
+// into tests: logout links in several spellings, the login page, and a page
+// that sends this user to login anyway (a role it does not have).
+func richSite(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>login</body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" || r.URL.Path == "/secret" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>`)
+		if r.URL.Path == "/" {
+			for _, l := range []string{"/about", "/reports", "/logout", "/sign-out", "/Log_Off", "/signoff", "/login", "/secret"} {
+				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+			}
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestCrawlWhenSignedInSkipsLogoutLoginAndRedirectedPages(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := richSite(t)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	c := crawler(b, authFor(t, b, srv.URL, true), srv.URL)
+	c.Options.MaxDepth = 1 // every link is at the depth limit
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	got, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/", "/about", "/reports"}; !slices.Equal(got, want) {
+		t.Errorf("found = %v, want %v (no logout links, no login page, no page that redirected to it)", got, want)
+	}
+	if len(logs) == 0 {
+		t.Error("the dropped page was not logged")
 	}
 }

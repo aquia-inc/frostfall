@@ -25,6 +25,11 @@ import (
 type authApp struct {
 	*httptest.Server
 	logins atomic.Int32
+	// idp is another app's URL that /sso-start sends the browser to, and
+	// bounceTo where /bounce redirects; loginTo where GET /login redirects
+	// instead of rendering the form. loginDelay slows POST /login.
+	idp, bounceTo, loginTo string
+	loginDelay             time.Duration
 }
 
 func newAuthApp(t *testing.T) *authApp {
@@ -33,9 +38,14 @@ func newAuthApp(t *testing.T) *authApp {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			time.Sleep(app.loginDelay)
 			app.logins.Add(1)
 			http.SetCookie(w, &http.Cookie{Name: "sid", Value: "valid", Path: "/", HttpOnly: true})
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if app.loginTo != "" {
+			http.Redirect(w, r, app.loginTo+"/login", http.StatusFound)
 			return
 		}
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>login</title></head><body>
@@ -67,7 +77,41 @@ func newAuthApp(t *testing.T) *authApp {
 	// without any HTTP redirect.
 	mux.HandleFunc("/spa", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>spa</title></head><body>
-			<script>if (!localStorage.getItem('token')) location.hash = '#/login'</script></body></html>`)
+			<script>if (!localStorage.getItem('token')) location.hash = location.search.includes('withquery') ? '#/login?redirect=/x' : '#/login'</script></body></html>`)
+	})
+	// The app side of an SSO round trip: /sso-start sends the browser to the
+	// identity provider, which stores something of its own and comes back to
+	// /cb, where the session cookie is issued.
+	mux.HandleFunc("/sso-start", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>sso</title></head><body>
+			<button id="go" onclick="location.href='%[1]s/idp?cb=' + encodeURIComponent(location.origin + '/cb')">sign in</button>
+			<button id="stay" onclick="location.href='%[1]s/idp-end'">stay at the provider</button></body></html>`, app.idp)
+	})
+	mux.HandleFunc("/cb", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "sid", Value: "valid", Path: "/", HttpOnly: true})
+		http.Redirect(w, r, "/app", http.StatusFound)
+	})
+	mux.HandleFunc("/idp", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>idp</title></head><body><script>
+			localStorage.setItem('idp', 'idp-tok'); location.href = new URLSearchParams(location.search).get('cb')</script></body></html>`)
+	})
+	mux.HandleFunc("/idp-end", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>idp</title></head><body><main id="idp-end">idp</main></body></html>`)
+	})
+	mux.HandleFunc("/idp-probe", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>p</title></head><body>
+			<pre id="t"></pre><script>t.textContent = 'idp=' + localStorage.getItem('idp')</script></body></html>`)
+	})
+	mux.HandleFunc("/bounce", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, app.bounceTo+"/probe", http.StatusFound)
+	})
+	// A login rendered in place at the root: same URL signed in and out.
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		shell := ""
+		if c, err := r.Cookie("sid"); err == nil && c.Value == "valid" {
+			shell = `<div id="shell">app</div>`
+		}
+		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>home</title></head><body><main>%s<form><button>sign in</button></form></main></body></html>`, shell)
 	})
 	app.Server = httptest.NewServer(mux)
 	t.Cleanup(app.Close)
@@ -140,7 +184,7 @@ func TestSetupReuseRunsOnceAndSeedsEveryTest(t *testing.T) {
 	b := launch(t)
 	cfg := loadAuthConfig(t, app.URL, setupYAML)
 
-	a, err := NewAuth(b, cfg, app.URL, nil)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +211,7 @@ func TestSetupWithoutReuseRunsPerTest(t *testing.T) {
 	b := launch(t)
 	cfg := loadAuthConfig(t, app.URL, setupYAML+"  reuse: false\n")
 
-	a, err := NewAuth(b, cfg, app.URL, nil)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +259,7 @@ func TestStorageStateInjection(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, expires, true)+"\n  loginPath: /login\n")
-			a, err := NewAuth(b, cfg, app.URL, nil)
+			a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -243,7 +287,7 @@ func TestLoginRedirectGuard(t *testing.T) {
 
 	t.Run("expired cookie in storage state", func(t *testing.T) {
 		cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", true)+"\n  loginPath: /login\n")
-		a, err := NewAuth(b, cfg, app.URL, nil)
+		a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -257,22 +301,9 @@ func TestLoginRedirectGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("no session at all, loginPath defaults to setup.path", func(t *testing.T) {
-		// Setup that "succeeds" without ever logging in: its last step is a
-		// no-op wait on the login page itself.
-		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /login\n    steps:\n      - waitFor: \"#email\"\n")
-		a, err := NewAuth(b, cfg, app.URL, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := openAuthed(t, b, a, cfg, app.URL, "/app"); !errors.Is(err, ErrLoginRedirect) {
-			t.Errorf("err = %v, want ErrLoginRedirect", err)
-		}
-	})
-
 	t.Run("a test that targets the login page is allowed to be there", func(t *testing.T) {
 		cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /login\n")
-		a, err := NewAuth(b, cfg, app.URL, nil)
+		a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -285,7 +316,7 @@ func TestLoginRedirectGuard(t *testing.T) {
 
 	t.Run("hash route", func(t *testing.T) {
 		cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /spa#/login\n")
-		a, err := NewAuth(b, cfg, app.URL, nil)
+		a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -293,11 +324,16 @@ func TestLoginRedirectGuard(t *testing.T) {
 		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "/spa#/login") {
 			t.Errorf("err = %v, want a login redirect naming /spa#/login", err)
 		}
+		// A query on the hash route is not part of which route it is.
+		_, err = openAuthed(t, b, a, cfg, app.URL, "/spa?withquery")
+		if !errors.Is(err, ErrLoginRedirect) {
+			t.Errorf("/spa?withquery lands on #/login?redirect=/x: err = %v, want a login redirect", err)
+		}
 		// The same document is fine when the hash route it lands on is not
 		// the login route: /spa itself without a token only ever reaches
 		// #/login, so point the guard elsewhere.
 		cfg = loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /spa#/signin\n")
-		a, err = NewAuth(b, cfg, app.URL, nil)
+		a, err = NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -314,7 +350,7 @@ func TestStorageNotInjectedOnOtherOrigin(t *testing.T) {
 	other := newAuthApp(t) // another port is another origin
 	b := launch(t)
 	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n  loginPath: /login\n")
-	a, err := NewAuth(b, cfg, app.URL, nil)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +380,7 @@ func TestSeedDoesNotOutliveFirstLoad(t *testing.T) {
 	app := newAuthApp(t)
 	b := launch(t)
 	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n  loginPath: /login\n")
-	a, err := NewAuth(b, cfg, app.URL, nil)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +436,7 @@ func TestSetupFailureNamesStepAndHidesValues(t *testing.T) {
 		}
 	}
 
-	_, err := NewAuth(b, cfg, app.URL, logf)
+	_, err := NewAuth(b, cfg, app.URL, AuthOptions{Log: logf})
 	check(t, err)
 	if !strings.Contains(strings.Join(logs, "\n"), `fill "#email"`) {
 		t.Errorf("setup steps were not logged by action and selector: %q", logs)
@@ -410,7 +446,7 @@ func TestSetupFailureNamesStepAndHidesValues(t *testing.T) {
 	logs = nil
 	cfg = loadAuthConfig(t, app.URL, yaml+"  reuse: false\n")
 	cfg.Defaults.Timeout = config.Duration(2 * time.Second)
-	a, err := NewAuth(b, cfg, app.URL, logf)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{Log: logf})
 	if err != nil {
 		t.Fatal(err)
 	}
