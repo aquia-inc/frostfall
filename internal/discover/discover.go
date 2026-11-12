@@ -27,8 +27,11 @@ type Crawler struct {
 }
 
 // Run crawls breadth-first from the root path and returns discovered paths in
-// visit order, root first. Pages that fail to load are skipped, not fatal:
-// partial discovery beats none.
+// visit order, root first. A page that fails to load is not fatal and is not
+// expanded, but it stays in the result: its failure is then reported when it
+// is scanned, rather than the page going unmentioned. Signed in, a page that
+// turns out to be the login page (or an unallowed origin) is dropped from the
+// result instead, and the crawl fails if that is the root.
 func (c *Crawler) Run() ([]string, error) {
 	base, err := url.Parse(c.BaseURL)
 	if err != nil {
@@ -41,6 +44,12 @@ func (c *Crawler) Run() ([]string, error) {
 			return nil, fmt.Errorf("discover.exclude %q: %w", pat, err)
 		}
 		excludes = append(excludes, re)
+	}
+	if c.Auth != nil {
+		// A crawl that follows a logout link signs itself out and reads every
+		// later page as the login page; the login page itself is no page to
+		// scan. Neither is configurable away, both are always wrong.
+		excludes = append(excludes, c.Auth.DiscoverExcludes()...)
 	}
 
 	type node struct {
@@ -55,22 +64,34 @@ func (c *Crawler) Run() ([]string, error) {
 	for len(queue) > 0 && len(found) < c.Options.MaxPages {
 		n := queue[0]
 		queue = queue[1:]
+		// Signed in, pages at the depth limit are still loaded once: their
+		// links are not followed, but a page that redirects to login must not
+		// become a test that fails the run.
+		var links []string
+		var err error
+		if n.depth < c.Options.MaxDepth || c.Auth != nil {
+			links, err = c.collectLinks(n.path)
+		}
+		if errors.Is(err, browser.ErrLoginRedirect) {
+			// A root that redirects to the login page means the session was not
+			// applied: every link on it would be the login page's, and the crawl
+			// would quietly cover nothing. Deeper pages that do it are dropped,
+			// never recorded as pages.
+			if n.depth == 0 {
+				return nil, err
+			}
+			if c.Log != nil {
+				c.Log("discover: dropping %s: %s", browser.RedactURL(n.path), err)
+			}
+			continue
+		}
 		found = append(found, n.path)
 		if n.depth >= c.Options.MaxDepth {
 			continue
 		}
-
-		links, err := c.collectLinks(n.path)
-		// A root that redirects to the login page means the session was not
-		// applied: every link on it would be the login page's, and the crawl
-		// would quietly cover nothing. Deeper pages that do it (a /logout
-		// link) are just skipped like any page that fails to load.
-		if errors.Is(err, browser.ErrLoginRedirect) && n.depth == 0 {
-			return nil, err
-		}
 		if err != nil {
 			if c.Log != nil {
-				c.Log("discover: skipping %s: %v", n.path, err)
+				c.Log("discover: not following links of %s: %v", browser.RedactURL(n.path), err)
 			}
 			continue
 		}
@@ -87,6 +108,8 @@ func (c *Crawler) Run() ([]string, error) {
 }
 
 func (c *Crawler) collectLinks(path string) ([]string, error) {
+	// The 15s is the crawl's per-page budget; a login flow (reuse: false)
+	// runs under its own, not inside it.
 	session, err := c.Browser.NewAuthSession(c.Auth, c.BaseURL+path, c.Defaults.Viewport,
 		c.Defaults.WaitFor, c.Defaults.SettleTime.Std(), 15*time.Second)
 	if err != nil {

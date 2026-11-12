@@ -199,7 +199,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		waitFor = d.WaitFor
 	}
 
-	r.logf("test %s: loading %s", t.ID, url)
+	r.logf("test %s: loading %s", t.ID, browser.RedactURL(url))
 	session, err := r.Browser.NewAuthSession(r.Auth, url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
 	if err != nil {
 		return nil, nil, nil, err
@@ -235,6 +235,14 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 
 	for i, step := range t.Steps {
 		label := "step-" + strconv.Itoa(i)
+		// A goto or click can walk into the login page after the first load
+		// passed its check. Every step that reports on the page re-checks
+		// first, so nothing is ever scanned, audited or transcribed from it.
+		if reports(step) {
+			if err := session.CheckLanding(); err != nil {
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
+			}
+		}
 		if tr := step.Transcript; tr != nil {
 			if tr.Label != "" {
 				label = tr.Label
@@ -286,6 +294,12 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		}
 	}
 	return results, transcripts, cov, nil
+}
+
+// reports is whether a step produces findings or evidence from the page, as
+// opposed to driving it.
+func reports(st config.Step) bool {
+	return st.Scan != nil || st.Keyboard != nil || st.Transcript != nil || st.ExpectFocus != nil
 }
 
 // mergeRules layers rule toggles (defaults, then test, then step) and keeps

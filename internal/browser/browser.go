@@ -55,11 +55,26 @@ func (b *Browser) Close() {
 // Session is one test's page in its own incognito browser context.
 // It implements engine.Page.
 type Session struct {
+	// raw is the page with no deadline; page is raw under the current
+	// budget. They are kept apart so the budget can be restarted (a login
+	// flow runs under its own, then the test's starts fresh).
+	raw     *rod.Page
 	page    *rod.Page
 	ctx     *rod.Browser
 	timeout time.Duration
 	// seed unregisters the auth storage script; nil when there is none.
 	seed func() error
+	// auth and testURL let a step re-check that the session is still
+	// signed in; auth is nil for an unauthenticated run.
+	auth    *Auth
+	testURL string
+}
+
+// setTimeout restarts the session's time budget at d.
+func (s *Session) setTimeout(d time.Duration) {
+	s.page.CancelTimeout()
+	s.timeout = d
+	s.page = s.raw.Timeout(d)
 }
 
 // NewSession opens a page at url in a fresh incognito context and waits for
@@ -81,7 +96,7 @@ func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) 
 		// SetCookies(nil) would clear instead; the guard above keeps it non-nil.
 		if err := ctx.SetCookies(state.cookies); err != nil {
 			ctx.Close()
-			return nil, fmt.Errorf("injecting auth cookies (check secure and sameSite combinations): %w", err)
+			return nil, fmt.Errorf("injecting auth cookies (the browser rejected one: check each cookie's name, domain and path): %w", err)
 		}
 	}
 	page, err := ctx.Page(proto.TargetCreateTarget{URL: ""})
@@ -96,7 +111,7 @@ func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) 
 		ctx.Close()
 		return nil, err
 	}
-	s := &Session{page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
+	s := &Session{raw: page, page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
 	if state != nil && len(state.origins) > 0 {
 		src, err := state.seedScript()
 		if err == nil {
@@ -165,7 +180,7 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 		idle = s.newIdleWaiter()
 	}
 	if err := s.page.Navigate(url); err != nil {
-		return fmt.Errorf("navigating to %s: %w", url, err)
+		return fmt.Errorf("navigating to %s: %w", RedactURL(url), err)
 	}
 	if idle != nil {
 		return s.finishIdle(idle, settle)

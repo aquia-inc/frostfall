@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -13,11 +15,38 @@ import (
 	"github.com/aquia-inc/frostfall/internal/config"
 )
 
-// ErrLoginRedirect marks a test that was sent to the login page: its session
-// was not applied or has expired. It is an environment failure, never a
-// finding, because scanning the login page and passing is the one outcome
-// this tool must not produce quietly.
-var ErrLoginRedirect = errors.New("landed on the login page")
+// ErrLoginRedirect marks a test or a setup that ended somewhere other than
+// the signed-in app: the login page, or an origin nobody allowed. It is an
+// environment failure, never a finding, because scanning a login page and
+// passing is the one outcome this tool must not produce quietly. Test with
+// errors.Is; the error's own text says where the page landed.
+var ErrLoginRedirect = errors.New("login redirect")
+
+type redirectError struct{ msg string }
+
+func (e *redirectError) Error() string        { return e.msg }
+func (e *redirectError) Is(target error) bool { return target == ErrLoginRedirect }
+
+// signedInWaitMax caps how long a signedIn selector is waited for after a
+// page is ready. The page has already loaded and settled, so the selector is
+// either there or the session is missing; a quarter of the test budget is
+// the ceiling for a short budget.
+const signedInWaitMax = 5 * time.Second
+
+// logoutRe matches paths that end a session when visited. A crawler that
+// follows one signs itself out and every later page is scanned as the login
+// page.
+var logoutRe = regexp.MustCompile(`(?i)/(log|sign)[-_]?(out|off)\b`)
+
+// RedactURL drops a URL's query string. Setup paths and navigation targets
+// are printed in errors and logs, and a query can carry a token
+// (/login?token=...); the path alone says where without saying who.
+func RedactURL(u string) string {
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		return u[:i]
+	}
+	return u
+}
 
 // State is the session a test's context starts with: cookies, plus the
 // local and session storage of the origins that have any. It exists only in
@@ -37,12 +66,25 @@ type originStorage struct {
 func (s *State) String() string   { return "State{redacted}" }
 func (s *State) GoString() string { return s.String() }
 
+// AuthOptions are where NewAuth reports. Both may be nil.
+type AuthOptions struct {
+	// Log receives one line per setup step naming the action and selector,
+	// never a value. The caller decides whether that is shown (--verbose).
+	Log func(format string, args ...any)
+	// Warn receives findings that do not stop the run but should always be
+	// seen, such as a setup that left no session behind.
+	Warn func(format string, args ...any)
+}
+
 // Auth carries everything a new test context needs to start signed in.
 type Auth struct {
 	baseURL  string
+	basePath string
 	origin   string
+	allowed  map[string]bool
+	signedIn string
 	defaults config.Defaults
-	log      func(format string, args ...any)
+	opts     AuthOptions
 
 	// state is restored into every context: the file's, or what the one
 	// setup run captured. Nil when setup runs per context.
@@ -50,33 +92,55 @@ type Auth struct {
 	// setup is the login flow each context runs for itself (reuse: false).
 	setup *config.AuthSetup
 
-	// loginRoute is the configured login path, loginKey its RouteKey; both
-	// empty when nothing says where the login page is.
-	loginRoute string
-	loginKey   string
+	// loginDisplay is the configured login path without its query, safe to
+	// print; loginKey is its page identity under the base path.
+	loginDisplay string
+	loginKey     string
+	// loginAtRoot is a login route that is the base root itself. Signed in
+	// and out share a URL there, so being "on" it says nothing and no test is
+	// "about the login page": only signedIn decides.
+	loginAtRoot bool
 }
 
 // NewAuth prepares the config's auth block: it loads a storage-state file's
 // contents or, with setup and reuse, runs the login flow once now, before any
 // test, in a context of its own. It returns nil for a config without auth. A
-// setup failure is an environment error. log receives one line per setup
-// step naming the action and selector, never a value.
-func NewAuth(b *Browser, cfg *config.Config, baseURL string, log func(format string, args ...any)) (*Auth, error) {
+// setup failure is an environment error.
+func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (*Auth, error) {
 	if cfg.Auth == nil {
 		return nil, nil
+	}
+	bu, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("auth: base url: %w", err)
 	}
 	origin, err := originOf(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("auth: base url: %w", err)
 	}
-	a := &Auth{baseURL: baseURL, origin: origin, defaults: cfg.Defaults, log: log, loginRoute: cfg.Auth.LoginRoute()}
-	if a.loginRoute != "" {
-		u, err := url.Parse(a.loginRoute)
-		if err != nil {
-			return nil, fmt.Errorf("auth: login path: %w", err)
-		}
-		a.loginKey = RouteKey(u)
+	a := &Auth{
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		basePath: strings.TrimRight(bu.Path, "/"),
+		origin:   origin,
+		allowed:  map[string]bool{},
+		signedIn: cfg.Auth.SignedIn,
+		defaults: cfg.Defaults,
+		opts:     opts,
 	}
+	for _, o := range cfg.Auth.AllowedOrigins {
+		a.allowed[o] = true
+	}
+	route := cfg.Auth.LoginRoute()
+	lu, err := url.Parse(route)
+	if err != nil {
+		return nil, fmt.Errorf("auth: login path: %w", err)
+	}
+	a.loginDisplay = RedactURL(route)
+	// The login path is relative to the base URL, so an app served under a
+	// prefix (http://host/app) has its login page at /app/login.
+	lu.Path = a.basePath + lu.Path
+	a.loginKey = guardKey(lu)
+	a.loginAtRoot = a.loginKey == RouteKey(&url.URL{Path: a.basePath + "/"})
 
 	switch {
 	case cfg.Auth.State != nil:
@@ -94,8 +158,14 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, log func(format str
 }
 
 func (a *Auth) logf(format string, args ...any) {
-	if a.log != nil {
-		a.log(format, args...)
+	if a.opts.Log != nil {
+		a.opts.Log(format, args...)
+	}
+}
+
+func (a *Auth) warnf(format string, args ...any) {
+	if a.opts.Warn != nil {
+		a.opts.Warn(format, args...)
 	}
 }
 
@@ -110,25 +180,28 @@ func (a *Auth) captureOnce(b *Browser, setup *config.AuthSetup) (*State, error) 
 		return nil, fmt.Errorf("auth setup: %w", err)
 	}
 	defer s.Close()
+	track := s.trackOrigins()
+	defer track.stop()
 	if err := a.runSetup(s, setup); err != nil {
 		return nil, err
 	}
-	st, err := s.captureState(a.origin)
+	st, err := a.capture(s, track.origins())
 	if err != nil {
 		return nil, fmt.Errorf("auth setup: capturing session: %w", err)
 	}
 	if len(st.cookies) == 0 && len(st.origins) == 0 {
-		a.logf("auth setup: the flow left no cookies or storage behind")
+		a.warnf("auth setup: the flow left no cookies or storage behind, so no session can be restored; every test will start signed out")
 	}
 	return st, nil
 }
 
-// runSetup drives the login flow in s through the ordinary step machinery.
-// Errors name the step index and the action's selector, and never a filled
-// value, so a failed login cannot leak a credential into CI logs.
+// runSetup drives the login flow in s through the ordinary step machinery,
+// then checks that it actually ended signed in. Errors name the step index
+// and the action's selector, and never a filled value or a URL query, so a
+// failed login cannot leak a credential into CI logs.
 func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
 	settle := a.defaults.SettleTime.Std()
-	a.logf("auth setup: loading %s", setup.Path)
+	a.logf("auth setup: loading %s", RedactURL(setup.Path))
 	if err := s.navigate(a.baseURL+setup.Path, a.defaults.WaitFor, settle); err != nil {
 		return fmt.Errorf("auth setup: %w", err)
 	}
@@ -137,6 +210,32 @@ func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
 		if err := s.Step(st, a.baseURL, a.defaults.WaitFor, settle); err != nil {
 			return fmt.Errorf("auth setup: steps[%d]: %w", i, err)
 		}
+	}
+	return a.checkSetupEnd(s)
+}
+
+// checkSetupEnd fails a setup that did not end signed in. A flow that
+// finishes on the login page, on an origin nobody named, or without the
+// signedIn marker has produced no session, and capturing it anyway would
+// start every test signed out.
+func (a *Auth) checkSetupEnd(s *Session) error {
+	landed, err := s.landedAt()
+	if err != nil {
+		return fmt.Errorf("auth setup: %w", err)
+	}
+	o := originOf2(landed)
+	switch {
+	case o != a.origin && !a.allowed[o]:
+		return &redirectError{fmt.Sprintf("auth setup: the flow ended on %s, which is neither the base URL's origin (%s) nor in auth.allowedOrigins; "+
+			"set baseUrl to the app's real origin, or add %s to auth.allowedOrigins", o, a.origin, o)}
+	case o != a.origin:
+		return nil // ended at an allowed identity provider: the steps decide
+	case a.onLogin(landed) && !a.loginAtRoot:
+		return &redirectError{fmt.Sprintf("auth setup: still on the login page %s after the steps: the credentials were rejected, "+
+			"or the steps need a final waitFor for something only the signed-in app shows", a.loginDisplay)}
+	case a.signedIn != "" && !s.has(a.signedIn):
+		return &redirectError{fmt.Sprintf("auth setup: signedIn selector %q not found after the steps (waited up to %s): the login did not complete",
+			a.signedIn, s.signedInWait())}
 	}
 	return nil
 }
@@ -167,15 +266,15 @@ func describeStep(st config.Step) string {
 	case st.Wait != 0:
 		return "wait " + st.Wait.Std().String()
 	case st.Goto != "":
-		return fmt.Sprintf("goto %q", st.Goto)
+		return fmt.Sprintf("goto %q", RedactURL(st.Goto))
 	}
 	return "step"
 }
 
 // NewAuthSession is NewSession for an authenticated run: the context is
 // seeded with a's state before its first navigation, or runs a's setup flow
-// first (reuse: false), and the landing page is checked against the login
-// route. A nil a is plain NewSession.
+// first (reuse: false), and the landing page is checked. A nil a is plain
+// NewSession.
 func (b *Browser) NewAuthSession(a *Auth, url string, vp config.Viewport, waitFor string, settle, timeout time.Duration) (*Session, error) {
 	var state *State
 	if a != nil {
@@ -185,21 +284,24 @@ func (b *Browser) NewAuthSession(a *Auth, url string, vp config.Viewport, waitFo
 	if err != nil {
 		return nil, err
 	}
+	s.auth, s.testURL = a, url
 	if a != nil && a.setup != nil {
+		// A login is not part of the test: it runs under the budget a login
+		// gets anywhere else, and the test's own budget starts after it.
+		s.setTimeout(a.defaults.Timeout.Std())
 		if err := a.runSetup(s, a.setup); err != nil {
 			s.Close()
 			return nil, err
 		}
+		s.setTimeout(timeout)
 	}
 	if err := s.navigate(url, waitFor, settle); err != nil {
 		s.Close()
 		return nil, err
 	}
-	if a != nil {
-		if err := a.checkLanding(s, url); err != nil {
-			s.Close()
-			return nil, err
-		}
+	if err := s.CheckLanding(); err != nil {
+		s.Close()
+		return nil, err
 	}
 	// The storage seed is for the first load only. Left registered it would
 	// run again on every later navigation and put back a token the page had
@@ -208,81 +310,159 @@ func (b *Browser) NewAuthSession(a *Auth, url string, vp config.Viewport, waitFo
 	return s, nil
 }
 
-// checkLanding fails with ErrLoginRedirect when s ended up on the login
-// route of the app without the test having asked for it. A cross-origin page
-// is never the app's login page, and a test that targets the login page
-// itself is allowed to be there.
-func (a *Auth) checkLanding(s *Session, testURL string) error {
-	if a.loginKey == "" {
+// CheckLanding fails with ErrLoginRedirect when the session's page is not
+// the signed-in app: it is on the login route without the test having asked
+// for it, on an origin neither the app's nor allowed, or (with signedIn set)
+// missing the signed-in marker. A nil error for an unauthenticated session.
+// It runs after the first load and again before every check that would
+// report on the page, because a goto step can walk into the login page
+// after the first load passed.
+func (s *Session) CheckLanding() error {
+	a := s.auth
+	if a == nil {
 		return nil
 	}
+	landed, err := s.landedAt()
+	if err != nil {
+		return err
+	}
+	var want *url.URL
+	if u, err := url.Parse(s.testURL); err == nil && u.Host != "" {
+		want = u
+	}
+	landedOrigin := originOf2(landed)
+	testOrigin := ""
+	if want != nil {
+		testOrigin = originOf2(want)
+	}
+	switch {
+	case landedOrigin == a.origin:
+	case a.allowed[landedOrigin], testOrigin == landedOrigin:
+		return nil // an identity provider the config named, or where the test asked to be
+	case testOrigin == a.origin:
+		return &redirectError{fmt.Sprintf("landed on %s, which is neither the app's origin nor in auth.allowedOrigins: "+
+			"the auth session was not applied or has expired (if the app legitimately redirects there, add it to auth.allowedOrigins)", landedOrigin)}
+	default:
+		return nil // a cross-origin test sent elsewhere is not judged by the app's session
+	}
+	if a.onLogin(landed) && !a.loginAtRoot {
+		if want != nil && a.onLogin(want) {
+			return nil // the test is about the login page itself
+		}
+		return &redirectError{fmt.Sprintf("landed on the login page %s: the auth session was not applied or has expired", a.loginDisplay)}
+	}
+	if a.signedIn != "" && !s.has(a.signedIn) {
+		return &redirectError{fmt.Sprintf("landed on %s without the signedIn selector %q (waited up to %s): "+
+			"the auth session was not applied or has expired", guardKey(landed), a.signedIn, s.signedInWait())}
+	}
+	return nil
+}
+
+func (s *Session) landedAt() (*url.URL, error) {
 	res, err := s.page.Eval(`() => location.href`)
 	if err != nil {
-		return fmt.Errorf("reading landing url: %w", err)
+		return nil, fmt.Errorf("reading landing url: %w", err)
 	}
-	landed, err := url.Parse(res.Value.Str())
-	if err != nil || !a.onLogin(landed) {
-		return nil
-	}
-	if want, err := url.Parse(testURL); err == nil && a.onLogin(want) {
-		return nil
-	}
-	return fmt.Errorf("%w %s: the auth session was not applied or has expired", ErrLoginRedirect, a.loginRoute)
+	return url.Parse(res.Value.Str())
+}
+
+func (s *Session) signedInWait() time.Duration { return min(signedInWaitMax, s.timeout/4) }
+
+// has reports whether selector matches within the short signedIn wait.
+func (s *Session) has(selector string) bool {
+	p := s.page.Timeout(s.signedInWait())
+	defer p.CancelTimeout()
+	_, err := p.Element(selector)
+	return err == nil
 }
 
 // onLogin reports whether u is the app's login route: same origin as the
-// base URL and the same path plus hash route.
+// base URL and the same path (under the base path) plus hash route.
 func (a *Auth) onLogin(u *url.URL) bool {
-	if o, err := originOf(u.String()); err != nil || o != a.origin {
-		return false
-	}
-	return RouteKey(u) == a.loginKey
+	return originOf2(u) == a.origin && guardKey(u) == a.loginKey
 }
 
-// RouteKey is a URL's page identity: the path with a trailing slash trimmed
-// (root stays "/"), plus a hash-router fragment (#/users) kept as part of it,
-// because dropping that would collapse a whole HashRouter app into "/".
-// Queries and plain fragments are not identity. Discovery and the login
-// guard share it so they cannot disagree about what counts as one page.
-func RouteKey(u *url.URL) string {
-	p := u.Path
-	if p == "" {
-		p = "/"
+// guardKey is RouteKey with the query of a hash route removed, so
+// /#/login?redirect=/x is the login route. RouteKey itself keeps that query
+// (discovery treats two such routes as two pages); only the guard, which asks
+// "is this the login page", ignores it.
+func guardKey(u *url.URL) string {
+	c := *u
+	if i := strings.IndexByte(c.Fragment, '?'); i >= 0 {
+		c.Fragment = c.Fragment[:i]
 	}
-	if p != "/" {
-		p = strings.TrimSuffix(p, "/")
-	}
-	if frag := u.Fragment; strings.HasPrefix(frag, "/") && frag != "/" {
-		p += "#" + strings.TrimSuffix(frag, "/")
-	}
-	return p
+	return RouteKey(&c)
 }
+
+// DiscoverExcludes are the paths a crawl must not follow when signed in:
+// anything that looks like a logout (visiting one ends the session and the
+// rest of the crawl reads the login page), and the login page itself.
+func (a *Auth) DiscoverExcludes() []*regexp.Regexp {
+	return []*regexp.Regexp{
+		logoutRe,
+		regexp.MustCompile(`^` + regexp.QuoteMeta(a.loginKey) + `(\?.*)?$`),
+	}
+}
+
+// RouteKey is a URL's page identity; see config.RouteKey.
+func RouteKey(u *url.URL) string { return config.RouteKey(u) }
 
 // originOf is the scheme://host[:port] a browser reports as location.origin,
-// with a scheme's default port dropped.
+// lower-cased, with a scheme's default port dropped.
 func originOf(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", err
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", fmt.Errorf("%q is not an http(s) URL", raw)
+		return "", fmt.Errorf("%q is not an http(s) URL", RedactURL(raw))
 	}
-	host := u.Hostname()
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
+	return config.OriginOfURL(u), nil
+}
+
+func originOf2(u *url.URL) string { return config.OriginOfURL(u) }
+
+// originTracker records the origin of each main-frame navigation, so storage
+// can be captured for every identity provider a flow passed through and not
+// only the page it ended on.
+type originTracker struct {
+	mu   sync.Mutex
+	seen map[string]bool
+	stop func()
+}
+
+func (s *Session) trackOrigins() *originTracker {
+	t := &originTracker{seen: map[string]bool{}}
+	p, cancel := s.page.WithCancel()
+	t.stop = cancel
+	go p.EachEvent(func(e *proto.PageFrameNavigated) {
+		if e.Frame == nil || e.Frame.ParentID != "" {
+			return
+		}
+		if o, err := originOf(e.Frame.URL); err == nil {
+			t.mu.Lock()
+			t.seen[o] = true
+			t.mu.Unlock()
+		}
+	})()
+	return t
+}
+
+func (t *originTracker) origins() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, 0, len(t.seen))
+	for o := range t.seen {
+		out = append(out, o)
 	}
-	port := u.Port()
-	if port == "" || (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
-		return u.Scheme + "://" + host, nil
-	}
-	return u.Scheme + "://" + host + ":" + port, nil
+	return out
 }
 
 // stateFromFile converts a Playwright storage-state file into browser state.
-// Cookies already expired are dropped rather than sent: Chrome rejects a
-// batch containing one, and the expired session then shows up where it
-// should, as the login-redirect guard.
+// Cookies already expired are left out: Chrome silently drops an expired
+// cookie from Storage.setCookies without failing the batch, so this changes
+// no outcome, it only makes the intent plain. The expired session then shows
+// up where it should, as the login-redirect guard.
 func stateFromFile(f *config.StorageState) (*State, error) {
 	st := &State{}
 	now := float64(time.Now().Unix())
@@ -328,11 +508,38 @@ func stateFromFile(f *config.StorageState) (*State, error) {
 	return st, nil
 }
 
-// captureState reads everything the login left in s's browser context: all
-// of the context's cookies, plus local and session storage of the app origin
-// (storage is per origin, and only the app's is the session). If the flow
-// ended on another origin its storage is not captured, never guessed at.
-func (s *Session) captureState(appOrigin string) (*State, error) {
+// storageSnapshot is the local and session storage of the page s is on.
+type storageSnapshot struct {
+	Origin  string      `json:"origin"`
+	Local   [][2]string `json:"local"`
+	Session [][2]string `json:"session"`
+}
+
+func (s *Session) snapshotStorage() (*storageSnapshot, error) {
+	raw, err := s.Eval(`() => {
+		const dump = (name) => {
+			try { const s = window[name]; return Object.keys(s).map(k => [k, s.getItem(k)]) }
+			catch (e) { return [] }
+		};
+		return { origin: location.origin, local: dump('localStorage'), session: dump('sessionStorage') };
+	}`)
+	if err != nil {
+		return nil, err
+	}
+	var snap storageSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// capture reads everything the login left in s's browser context: all of
+// the context's cookies, plus local and session storage of the app origin
+// and of every allowed origin the flow passed through (storage is per origin
+// and an identity provider's may be part of the session). The page the flow
+// ended on is read in place; a visited origin it left is revisited at its
+// root to read it, and skipped, never guessed at, if that fails.
+func (a *Auth) capture(s *Session, visited []string) (*State, error) {
 	cookies, err := s.ctx.GetCookies()
 	if err != nil {
 		return nil, err
@@ -350,26 +557,35 @@ func (s *Session) captureState(appOrigin string) (*State, error) {
 		st.cookies = append(st.cookies, p)
 	}
 
-	raw, err := s.Eval(`() => {
-		const dump = (name) => {
-			try { const s = window[name]; return Object.keys(s).map(k => [k, s.getItem(k)]) }
-			catch (e) { return [] }
-		};
-		return { origin: location.origin, local: dump('localStorage'), session: dump('sessionStorage') };
-	}`)
+	add := func(snap *storageSnapshot) {
+		if len(snap.Local) > 0 || len(snap.Session) > 0 {
+			st.origins = append(st.origins, originStorage{origin: snap.Origin, local: snap.Local, session: snap.Session})
+		}
+	}
+	final, err := s.snapshotStorage()
 	if err != nil {
 		return nil, err
 	}
-	var snap struct {
-		Origin  string      `json:"origin"`
-		Local   [][2]string `json:"local"`
-		Session [][2]string `json:"session"`
+	done := map[string]bool{}
+	if final.Origin == a.origin || a.allowed[final.Origin] {
+		add(final)
+		done[final.Origin] = true
 	}
-	if err := json.Unmarshal(raw, &snap); err != nil {
-		return nil, err
-	}
-	if snap.Origin == appOrigin && (len(snap.Local) > 0 || len(snap.Session) > 0) {
-		st.origins = append(st.origins, originStorage{origin: appOrigin, local: snap.Local, session: snap.Session})
+	for _, o := range visited {
+		if done[o] || (o != a.origin && !a.allowed[o]) {
+			continue
+		}
+		done[o] = true
+		if err := s.navigate(o+"/", "load", 0); err != nil {
+			a.logf("auth setup: not capturing storage of %s: %v", o, err)
+			continue
+		}
+		snap, err := s.snapshotStorage()
+		if err != nil || snap.Origin != o {
+			a.logf("auth setup: not capturing storage of %s: could not read it", o)
+			continue
+		}
+		add(snap)
 	}
 	return st, nil
 }

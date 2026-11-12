@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
@@ -133,6 +134,9 @@ func run(args []string) int {
 		return code
 	}
 	defer cleanup()
+	// "path relative to the base URL" is base + path everywhere, so a
+	// trailing slash on the base would put a double slash in every URL.
+	base = strings.TrimRight(base, "/")
 
 	bp := cfg.Baseline
 	if *baselinePath != "" {
@@ -185,11 +189,13 @@ func run(args []string) int {
 	// Auth runs its login flow (reuse: true) here, once, before the first test
 	// or the crawl: both need the session, and a broken login should stop the
 	// run before any page is scanned signed out.
-	var authLog func(string, ...any)
-	if *verbose {
-		authLog = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+	authOpts := browser.AuthOptions{
+		Warn: func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) },
 	}
-	authn, err := browser.NewAuth(b, cfg, base, authLog)
+	if *verbose {
+		authOpts.Log = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+	}
+	authn, err := browser.NewAuth(b, cfg, base, authOpts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "auth error:", err)
 		return exitEnvironment

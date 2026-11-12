@@ -27,8 +27,18 @@ type Auth struct {
 	StorageState string `yaml:"storageState"`
 	// LoginPath is the path, relative to the base URL, that a signed-out
 	// visitor is sent to. A test that lands there without having asked for
-	// it fails instead of being scanned. Defaults to Setup.Path.
+	// it fails instead of being scanned. Defaults to Setup.Path; required
+	// with StorageState, which has no path of its own to fall back on.
 	LoginPath string `yaml:"loginPath"`
+	// SignedIn is an optional CSS selector that exists on every page a
+	// signed-in session shows. Where it is absent the test failed to sign
+	// in. It is the only guard for a login rendered in place at the base
+	// root, which no path comparison can see.
+	SignedIn string `yaml:"signedIn"`
+	// AllowedOrigins are the origins, besides the base URL's, a flow or a
+	// test may legitimately end on (an SSO identity provider). A landing on
+	// any other origin is treated as a login redirect.
+	AllowedOrigins []string `yaml:"allowedOrigins"`
 
 	// State is the parsed StorageState file, held in memory only.
 	State *StorageState `yaml:"-"`
@@ -120,7 +130,7 @@ func LoadStorageState(path string) (*StorageState, error) {
 		}
 	}
 	for i, o := range st.Origins {
-		if u, err := url.Parse(o.Origin); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		if _, err := NormalizeOrigin(o.Origin); err != nil {
 			return nil, fmt.Errorf("origins[%d]: origin must be an http(s) origin", i)
 		}
 	}
@@ -142,8 +152,20 @@ func (c *Config) validateAuth() error {
 	if a.LoginPath != "" && !strings.HasPrefix(a.LoginPath, "/") {
 		return errors.New("auth.loginPath: must be a path starting with /")
 	}
+	for i, o := range a.AllowedOrigins {
+		norm, err := NormalizeOrigin(o)
+		if err != nil {
+			return fmt.Errorf("auth.allowedOrigins[%d]: %w", i, err)
+		}
+		a.AllowedOrigins[i] = norm
+	}
 
 	if a.StorageState != "" {
+		// Without a login route the guard has nothing to compare against, and
+		// an expired session in the file would be scanned as the login page.
+		if a.LoginPath == "" {
+			return errors.New("auth.loginPath: required with storageState; without it a session that has expired cannot be told from a valid one")
+		}
 		if a.Reuse != nil {
 			return errors.New("auth.reuse: only applies to setup; a storageState file is restored into every test")
 		}
@@ -156,11 +178,7 @@ func (c *Config) validateAuth() error {
 			return fmt.Errorf("auth.storageState %s: %w", a.StorageState, err)
 		}
 		a.State = st
-		if a.LoginPath == "" {
-			c.Warnings = append(c.Warnings, "auth.storageState without auth.loginPath: an expired session in the file cannot be recognised, "+
-				"so a test redirected to your login page would be scanned as if it were the page; set loginPath")
-		}
-		return nil
+		return a.requireSignedInAtRoot()
 	}
 
 	s := a.Setup
@@ -188,7 +206,77 @@ func (c *Config) validateAuth() error {
 			return fmt.Errorf("auth.setup.steps[%d]: %w", i, err)
 		}
 	}
+	return a.requireSignedInAtRoot()
+}
+
+// requireSignedInAtRoot rejects a login route that is the base root: a login
+// rendered at / (or in place, with no URL change) leaves no path to compare,
+// so only a selector for the signed-in app can tell the two apart.
+func (a *Auth) requireSignedInAtRoot() error {
+	u, err := url.Parse(a.LoginRoute())
+	if err != nil {
+		return fmt.Errorf("auth.loginPath: %w", err)
+	}
+	if RouteKey(u) == "/" && a.SignedIn == "" {
+		return errors.New("auth.signedIn: required when the login route is the base root (/): the login page and the app share a URL, " +
+			"so only a selector that exists on every signed-in page can tell them apart")
+	}
 	return nil
+}
+
+// NormalizeOrigin returns the scheme://host[:port] a browser reports as
+// location.origin for raw: scheme and host lower-cased, a scheme's default
+// port dropped. raw must be an absolute http(s) URL; anything past the origin
+// (a path, query, credentials) is an error, since an origin that silently
+// dropped it would mean something other than what was written.
+func NormalizeOrigin(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("%q is not an absolute http(s) origin", raw)
+	}
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("%q has more than an origin: drop the path, query and credentials", raw)
+	}
+	return originOfURL(u), nil
+}
+
+// OriginOfURL is the normalized origin of u, as NormalizeOrigin writes it,
+// without requiring u to be a bare origin.
+func OriginOfURL(u *url.URL) string { return originOfURL(u) }
+
+func originOfURL(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := u.Port()
+	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return scheme + "://" + host
+	}
+	return scheme + "://" + host + ":" + port
+}
+
+// RouteKey is a URL's page identity: the path with a trailing slash trimmed
+// (root stays "/"), plus a hash-router fragment (#/users) kept as part of it,
+// because dropping that would collapse a whole HashRouter app into "/".
+// Queries and plain fragments are not identity. Discovery and the login
+// guard share it so they cannot disagree about what counts as one page.
+func RouteKey(u *url.URL) string {
+	p := u.Path
+	if p == "" {
+		p = "/"
+	}
+	if p != "/" {
+		p = strings.TrimSuffix(p, "/")
+	}
+	if frag := u.Fragment; strings.HasPrefix(frag, "/") && frag != "/" {
+		p += "#" + strings.TrimSuffix(frag, "/")
+	}
+	return p
 }
 
 var (
