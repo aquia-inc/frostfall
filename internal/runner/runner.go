@@ -300,7 +300,7 @@ func mergeRules(kb bool, layers ...map[string]bool) map[string]bool {
 func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t config.Test, url, label string, k config.KeyboardStep, cov *coverage) ([]Result, error) {
 	r.logf("test %s: keyboard audit (%s)", t.ID, label)
 	rules := mergeRules(true, r.Config.Defaults.Rules, t.Rules, k.Rules)
-	violations, err := keyboard.Audit(ctx, session, keyboard.Options{
+	audit, err := keyboard.Audit(ctx, session, keyboard.Options{
 		Scope:   k.Scope,
 		MaxTabs: k.MaxTabs,
 		Rules:   rules,
@@ -311,8 +311,22 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 	if err != nil {
 		return nil, fmt.Errorf("keyboard audit %q: %w", label, err)
 	}
-	cov.record(checkKeyboard, rules)
-	return r.results(session, t, url, label, violations), nil
+	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
+	return r.results(session, t, url, label, audit.Violations), nil
+}
+
+// withUnchecked marks the rules an audit could not fully evaluate as off,
+// for coverage: their absence is not a fix (a page regressing into a trap
+// must not close its focus-not-visible issues).
+func withUnchecked(rules map[string]bool, unchecked []string) map[string]bool {
+	out := maps.Clone(rules)
+	if out == nil {
+		out = map[string]bool{}
+	}
+	for _, id := range unchecked {
+		out[id] = false
+	}
+	return out
 }
 
 // expectFocus turns a failed focus assertion into a finding, so it gates and

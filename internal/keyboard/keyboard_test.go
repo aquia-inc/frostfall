@@ -17,6 +17,15 @@ import (
 // audit serves body as a page, runs the audit, and returns rule id -> targets.
 func audit(t *testing.T, body string, opts keyboard.Options) map[string][]string {
 	t.Helper()
+	got := map[string][]string{}
+	for _, v := range auditResult(t, body, opts).Violations {
+		got[v.RuleID] = append(got[v.RuleID], v.Target)
+	}
+	return got
+}
+
+func auditResult(t *testing.T, body string, opts keyboard.Options) *keyboard.Result {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(`<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>` + body + `</body></html>`))
@@ -34,15 +43,39 @@ func audit(t *testing.T, body string, opts keyboard.Options) map[string][]string
 	}
 	t.Cleanup(s.Close)
 
-	vs, err := keyboard.Audit(context.Background(), s, opts)
+	res, err := keyboard.Audit(context.Background(), s, opts)
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
-	got := map[string][]string{}
-	for _, v := range vs {
-		got[v.RuleID] = append(got[v.RuleID], v.Target)
+	return res
+}
+
+// The repro from review on #61: a ring-less button before a trap is never judged.
+// The audit must say so, or coverage would treat its rule as checked and a
+// regression into a trap would read as the ring being fixed.
+func TestTrapReportsUncheckedRules(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
 	}
-	return got
+	res := auditResult(t, `<style>#bare:focus { outline: none }</style>
+		<button id="ok">ok</button><button id="bare">bare</button><button id="c">c</button><button id="far">far</button>
+		<script>c.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })</script>`, keyboard.Options{})
+	if len(res.Violations) != 1 || res.Violations[0].RuleID != keyboard.RuleTrap {
+		t.Errorf("violations = %+v, want only the trap", res.Violations)
+	}
+	for _, rule := range []string{keyboard.RuleNotVisible, keyboard.RuleUnreachable, keyboard.RuleHidden, keyboard.RuleDialog} {
+		if !slices.Contains(res.Unchecked, rule) {
+			t.Errorf("%s not reported unchecked after a trap: %v", rule, res.Unchecked)
+		}
+	}
+	if slices.Contains(res.Unchecked, keyboard.RuleTrap) {
+		t.Error("the trap rule itself was evaluated, but is reported unchecked")
+	}
+
+	clean := auditResult(t, `<button id="a">a</button><button id="b">b</button>`, keyboard.Options{})
+	if len(clean.Unchecked) != 0 {
+		t.Errorf("a complete audit reported unchecked rules: %v", clean.Unchecked)
+	}
 }
 
 func TestKeyboardAudit(t *testing.T) {

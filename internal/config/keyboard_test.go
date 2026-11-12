@@ -149,6 +149,8 @@ server:
   baseUrl: http://x
 defaults:
   keyboard:
+    maxTabs: 400
+    rules: { frostfall/focus-hidden: off, frostfall/dialog-focus: off }
 profiles:
   quick:
     defaults:
@@ -161,7 +163,10 @@ tests:
     keyboard: false
   - id: own
     path: /
-    keyboard: { maxTabs: 50 }
+    keyboard: { maxTabs: 50, rules: { frostfall/dialog-focus: on } }
+  - id: bare
+    path: /
+    keyboard: true
 `), "")
 	if err != nil {
 		t.Fatal(err)
@@ -176,8 +181,16 @@ tests:
 	if cfg.KeyboardFor(cfg.Tests[1]) != nil {
 		t.Error("keyboard: false did not opt the test out")
 	}
-	if k := cfg.KeyboardFor(cfg.Tests[2]); k == nil || k.MaxTabs != 50 {
-		t.Errorf("the test's own setting lost to the default: %+v", k)
+	// A test's own setting layers over the default rather than replacing it.
+	if k := cfg.KeyboardFor(cfg.Tests[2]); k == nil || k.MaxTabs != 50 ||
+		k.Rules["frostfall/focus-hidden"] || !k.Rules["frostfall/dialog-focus"] {
+		t.Errorf("own setting over the default: %+v", k)
+	}
+	if k := cfg.KeyboardFor(cfg.Tests[3]); k == nil || k.MaxTabs != 400 || k.Rules["frostfall/focus-hidden"] {
+		t.Errorf("keyboard: true lost the default's maxTabs and rules: %+v", k)
+	}
+	if cfg.Defaults.Keyboard.Rules["frostfall/dialog-focus"] {
+		t.Error("layering a test's rules mutated the default's")
 	}
 
 	quick, err := Load(writeConfig(t, `version: 1

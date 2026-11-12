@@ -287,7 +287,8 @@ Tab through the page until focus cycles back to where it started, then
 reports what a keyboard user would hit. It is opt-in, so upgrading Frostfall
 never fails a pipeline on findings nobody asked for. Turn it on for every
 test, discovered ones included, with `defaults: { keyboard: true }` (a test
-opts out with `keyboard: false`); per test with `keyboard: true` (audits the
+opts out with `keyboard: false`, and a test's own `keyboard` settings layer
+over the default's `maxTabs` and `rules`); per test with `keyboard: true` (audits the
 initial state); or with a `keyboard` step (audits the state the steps
 reached - an open dialog, say):
 

@@ -207,11 +207,21 @@ func sameOutside(a, b *image.RGBA, mask image.Rectangle) bool {
 	return true
 }
 
+// Result is an audit's outcome.
+type Result struct {
+	Violations []engine.Violation
+	// Unchecked lists rules the audit could not fully evaluate, so a missing
+	// finding is not a fixed one: everything but the trap when a trap cut the
+	// traversal short, focus-not-visible when a suspect could not be
+	// re-checked. Coverage treats them like rules switched off.
+	Unchecked []string
+}
+
 // Audit presses Tab until focus cycles back to the first element it reached,
 // then reports traps, unreachable controls, invisible or hidden focus, and
 // modal dialogs that do not hold focus. It leaves focus and scroll where it
 // found them.
-func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, error) {
+func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 	if opts.MaxTabs == 0 {
 		opts.MaxTabs = DefaultMaxTabs
 	}
@@ -402,14 +412,30 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 			a.report(RuleUnreachable, m.Sel, m.HTML, "")
 		}
 	}
+	res := &Result{Violations: a.out}
+	if !cycleEnded {
+		// The traversal stopped at a trap: stops past it were never
+		// visited and the suspects before it go unconfirmed.
+		for id := range rules {
+			if id != RuleTrap && id != RuleFocusExpectation {
+				res.Unchecked = append(res.Unchecked, id)
+			}
+		}
+		return res, nil
+	}
 	// Last: the confirming lap can re-render what it scrolls past (a
 	// virtualized grid's rows), which would make reached elements look new.
-	if cycleEnded && len(suspects) > 0 {
-		if err := a.confirm(ctx, last, suspects); err != nil {
+	if len(suspects) > 0 {
+		complete, err := a.confirm(ctx, last, suspects)
+		if err != nil {
 			return nil, err
 		}
+		res.Violations = a.out
+		if !complete {
+			res.Unchecked = append(res.Unchecked, RuleNotVisible)
+		}
 	}
-	return a.out, nil
+	return res, nil
 }
 
 // confirmDelay is how long confirm gives a suspect to show, and then drop,
@@ -420,10 +446,13 @@ const confirmDelay = 400
 
 // confirm makes a second lap from cur, the first stop, and re-compares each
 // suspect with confirmDelay on both sides, reporting only those that still
-// look unchanged. A suspect the lap cannot find again (a virtualized row
-// re-rendered) is dropped: a gate must not fail on a guess.
-func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) error {
+// look unchanged. A suspect the lap cannot judge (a virtualized row
+// re-rendered, focus moved on by itself) is dropped, since a gate must not
+// fail on a guess, and complete reports false: the rule was not fully
+// evaluated, so its absence must not read as fixed.
+func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (complete bool, err error) {
 	first := cur.ID
+	complete = true
 	// next presses Tab, waiting confirmDelay first only when slow: getting
 	// from one suspect to the next needs no settling at all.
 	next := func(slow bool) (stop, error) {
@@ -440,35 +469,37 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) er
 	}
 	for range a.opts.MaxTabs {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		s, ok := suspects[cur.ID]
 		if !ok || cur.Out {
-			var err error
 			if cur, err = next(false); err != nil {
-				return err
+				return false, err
 			}
+			// Back at the start with suspects left: the lap could not find
+			// them again.
 			if !cur.Out && cur.ID == first {
-				return nil
+				return complete && len(suspects) == 0, nil
 			}
 			continue
 		}
 		delete(suspects, cur.ID)
 		if err := a.call("settle", nil, confirmDelay); err != nil {
-			return err
+			return false, err
 		}
 		if err := a.call("state", &cur); err != nil {
-			return err
+			return false, err
 		}
 		// Focus may have moved on by itself during the wait (a grid moving
 		// it into a row): then this capture is not the suspect's to judge.
 		if cur.Out || cur.ID != s.ID {
+			complete = false
 			continue
 		}
 		before := region(cur.Box, cur.View)
 		focused, err := newFrame(a.page, cur.View, before).pixels(before)
 		if err != nil {
-			return err
+			return false, err
 		}
 		// Off the page and back if the suspect was the last stop: see the
 		// fast pass on why a page without focus cannot be compared. Twice
@@ -478,26 +509,28 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) er
 			cur, err = next(true)
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
 		if cur.Out {
-			return nil
+			return false, nil
 		}
-		if cur.ID != s.ID && before.In(viewport(cur.View)) {
+		if cur.ID == s.ID || !before.In(viewport(cur.View)) {
+			complete = false
+		} else {
 			after := region(cur.Box, cur.View)
 			blurred, err := newFrame(a.page, cur.View, before, after).pixels(before)
 			if err != nil {
-				return err
+				return false, err
 			}
 			if sameOutside(focused, blurred, after.Intersect(before).Sub(before.Min)) {
 				a.report(RuleNotVisible, s.Sel, s.HTML, "")
 			}
 		}
 		if len(suspects) == 0 || cur.ID == first {
-			return nil
+			return complete && len(suspects) == 0, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // reenter gives the page focus back if the audit left it in the browser UI

@@ -24,6 +24,24 @@ func TestStaleOnlyWhereTheRulesCheckRan(t *testing.T) {
 	}
 }
 
+// A keyboard audit cut short by a trap evaluated only the trap: baselined
+// focus-not-visible and focus-unreachable entries on that page are unchecked,
+// not fixed, and must not go stale (or have their issues closed).
+func TestTrapLeavesRulesUnchecked(t *testing.T) {
+	r := &Runner{Baseline: &baseline.File{Violations: []baseline.Violation{
+		{Fingerprint: "ring", TestID: "page", RuleID: keyboard.RuleNotVisible},
+		{Fingerprint: "unreached", TestID: "page", RuleID: keyboard.RuleUnreachable},
+		{Fingerprint: "trap", TestID: "page", RuleID: keyboard.RuleTrap},
+	}}}
+	cov := newCoverage()
+	cov.record(checkKeyboard, withUnchecked(nil, []string{keyboard.RuleNotVisible, keyboard.RuleUnreachable}))
+	run := &Run{ran: map[string]*coverage{"page": cov}}
+	r.classify(run)
+	if len(run.Stale) != 1 || run.Stale[0].Fingerprint != "trap" {
+		t.Errorf("stale = %+v, want only the trap entry", run.Stale)
+	}
+}
+
 // A rule switched off was not looked for: its entries are not fixed. One
 // step switching it off does not hide another that checked it.
 func TestRuleSwitchedOffIsNotCovered(t *testing.T) {

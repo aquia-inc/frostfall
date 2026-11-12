@@ -7,6 +7,7 @@ package config
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"regexp"
@@ -136,17 +137,29 @@ func (d *Defaults) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// KeyboardFor is the keyboard audit t's initial state gets, nil for none: the
-// test's own setting when it has one, else the default.
+// KeyboardFor is the keyboard audit t's initial state gets, nil for none.
+// The test's own setting wins (keyboard: false opts out), layered over the
+// default like rules are everywhere else: maxTabs falls back to the
+// default's, and the default's rules apply under the test's.
 func (c *Config) KeyboardFor(t Test) *KeyboardStep {
-	k := t.Keyboard
+	d, k := c.Defaults.Keyboard, t.Keyboard
 	if k == nil {
-		k = c.Defaults.Keyboard
+		k = d
 	}
 	if k == nil || k.Off {
 		return nil
 	}
-	return k
+	if d == nil || d == k {
+		return k
+	}
+	merged := *k
+	merged.MaxTabs = cmp.Or(k.MaxTabs, d.MaxTabs)
+	merged.Rules = maps.Clone(d.Rules)
+	if merged.Rules == nil {
+		merged.Rules = map[string]bool{}
+	}
+	maps.Copy(merged.Rules, k.Rules)
+	return &merged
 }
 
 // Expect is the enforcement contract. When no expect block is configured
