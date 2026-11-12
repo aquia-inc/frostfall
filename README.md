@@ -220,6 +220,18 @@ defaults:                        # applied to every test unless overridden
     maxViolations: 0             # tolerated count of failing violations (default 0)
     rules: [image-alt]           # also fail on these rule ids at ANY impact
 
+auth:                            # optional: sign in before testing (see Auth below)
+  setup:                         # a login flow, run through the normal steps
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER}" }
+      - fill: { "#password": "${A11Y_PASS}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=app-shell]"
+  reuse: true                    # log in once, restore into every test (default)
+  # storageState: .auth/state.json   # or: a Playwright storage-state file
+  # loginPath: /login            # where signed-out visitors land (default setup.path)
+
 baseline: .frostfall-baseline.json   # known-debt file; see step 6 above
 
 profiles:                        # named overlays for environment differences
@@ -461,6 +473,90 @@ then profile, then command-line flags.
 
 For values rather than structure, environment interpolation is often enough:
 `baseUrl: ${APP_URL:-http://localhost:5173}`.
+
+## Auth: scan pages behind a login
+
+Most real apps put their interesting pages behind a login. Frostfall signs in
+once and starts every test with that session, in one of two ways. A config
+sets exactly one of them (both or neither is exit 2).
+
+**A login flow (`setup`).** Frostfall opens `setup.path`, runs the steps, and
+captures what the login left behind: every cookie of the browser context
+(`HttpOnly` ones included) plus the app origin's `localStorage` and
+`sessionStorage`. Each test's fresh context gets that state before its first
+navigation, so the page sees a signed-in session from its first request.
+
+```yaml
+auth:
+  setup:
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER}" }
+      - fill: { "#password": "${A11Y_PASS}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=app-shell]"
+  reuse: true      # default
+```
+
+Setup steps are the interaction steps only (`click`, `fill`, `press`, `hover`,
+`select`, `waitFor`, `wait`, `goto`). `scan`, `keyboard`, `transcript` and
+`expectFocus` are rejected there. End the steps with a `waitFor` for something
+only the signed-in app shows, so the capture happens after the login finished.
+
+With `reuse: true` the flow runs once, before the first test (and before
+`--discover` crawls), and the state is restored into each test. With
+`reuse: false` each test runs the flow itself inside its own context before
+loading its page. That is slower and logs in once per test, so use it only
+when the session cannot be shared (single-use tokens, per-session server
+state). `reuse` only applies to `setup`.
+
+**A storage-state file (`storageState`).** Point at a Playwright-compatible
+storage-state JSON (`cookies` plus `origins[].localStorage`) captured
+elsewhere, and Frostfall injects it the same way and skips the flow. This is
+the path for CI when credentials should not be near this config. A relative
+path resolves against the config file's directory, and a missing or malformed
+file is a config error.
+
+```yaml
+auth:
+  storageState: .auth/state.json
+  loginPath: /login
+```
+
+**The redirect guard.** Scanning a login page and passing is the worst thing
+an authenticated scan can do, so Frostfall checks. After each test's first
+navigation settles, if the page's path is the login route and the test's own
+path is not, the test fails as an environment error (exit 3):
+
+```
+run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired
+```
+
+The login route is `loginPath`, or `setup.path` when `loginPath` is unset. Set
+`loginPath` with `storageState`, since there is no setup path to fall back on
+(Frostfall warns if you do not). Hash-router routes count as part of the path,
+the same way discovery treats them, so `loginPath: "/#/login"` guards a
+HashRouter app. A test that targets the login page itself is allowed to be
+there. The guard looks at where the page is once it is ready; an app that
+redirects a few seconds later is not caught, so use a `waitFor` selector for
+those.
+
+**Secrets.** Put credentials in environment variables and reference them as
+`${A11Y_PASS}`. Frostfall prints a warning to stderr (it does not fail) when a
+`fill` into a field whose selector contains `password`, `passwd` or
+`type=password` has a literal value in the file. Setup steps are logged under
+`--verbose` as the action and selector only, never the value, and error
+messages never include a filled value. The captured session lives only in
+memory for the run: it is never written to disk, reports, screenshots, SARIF
+or logs. A `storageState` file is a credential in itself; keep it out of
+version control (for example `.auth/` in `.gitignore`).
+
+A failed login (a step times out, a selector is missing) stops the run with
+exit 3 and a message naming the step: `auth setup: steps[1]: fill "#email": ...`.
+
+`--discover` crawls with the same session, so it sees the app and not the
+login page. If the root page itself redirects to the login page, the crawl
+fails the same way a test does.
 
 ## Discovery: scan pages you didn't list
 

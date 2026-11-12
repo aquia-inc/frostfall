@@ -9,7 +9,7 @@ contracts — config schema, violation fingerprinting, engine interface, exit co
 Everything else is guidance the implementer may adapt.
 
 Not yet implemented (config for these is rejected or flagged, never silently ignored):
-server spawn mode (`server.command`), `auth:`, `--watch`, `--parallel`, and the
+server spawn mode (`server.command`), `--watch`, `--parallel`, and the
 json/junit formatters.
 
 ---
@@ -166,6 +166,7 @@ auth:                          # optional; see §7.5
       - waitFor: "[data-testid=app-shell]"
   reuse: true                  # persist cookies+storage once, restore per test (default true)
   # storageState: .auth/state.json   # alternative: inject pre-captured state, skip setup
+  # loginPath: /login            # where a signed-out visitor lands; default setup.path
 
 baseline: .frostfall-baseline.json
 
@@ -333,11 +334,45 @@ that test with exit 3 semantics.
 
 ### 7.5 Auth
 
-`setup` runs once against the first browser context; on success, cookies + localStorage +
-sessionStorage are captured and injected into every subsequent context (`reuse: true`). Alternative:
-`storageState` points at a Playwright-compatible storage-state JSON captured elsewhere, skipping the
-flow entirely — the CI-friendly path when credentials shouldn't be near this config. Secrets only via
-`${ENV}` interpolation; a literal-looking password in `auth` is a lint warning.
+Exactly one of `setup` and `storageState` is set (both or neither is exit 2).
+
+**Setup.** `setup.path` and a non-empty list of interaction steps (`scan`, `keyboard`, `transcript`
+and `expectFocus` are rejected: setup has no result to report them to). With `reuse: true`
+(default) the flow runs once, before the first test and before discovery, in a throwaway incognito
+context. Everything it left behind is captured in memory: every cookie of that context (CDP
+`Storage.getCookies`, so `HttpOnly` ones too) plus `localStorage` and `sessionStorage` of the app
+origin (storage of any other origin the flow ended on is not captured). Every test's context is
+seeded before its first navigation: cookies through `Storage.setCookies` on the context, storage
+through `Page.addScriptToEvaluateOnNewDocument`. Each storage block is guarded by
+`location.origin === <origin>`, so a value never lands on another origin, and a key the page
+already holds is left alone. The script is removed once the first load is ready: left registered it
+would re-run on every later navigation and restore a token the page had deliberately removed (a
+logout step). With `reuse: false` each test runs the flow inside its own context, before loading
+its page. `reuse` is meaningless with `storageState` and rejected there.
+
+**storageState.** A Playwright-compatible file (`cookies[]`, `origins[].localStorage[]`), the
+CI-friendly path when credentials shouldn't be near this config. Relative paths resolve against the
+config file's directory; a missing or malformed file is a config error (the error never echoes a
+cookie or storage value). `expires: -1` maps to a session cookie, `sameSite` Strict/Lax/None maps
+to the CDP enum, and cookies already expired are dropped (Chrome rejects a batch containing one).
+
+**Redirect guard.** The worst failure for this tool is quietly scanning a login page and passing.
+After each test's initial navigation and readiness, if the login route (`loginPath`, else
+`setup.path`) is set, the page is on the base origin, and its path plus hash route equals the login
+route while the test's own does not, the test fails as an environment error (exit 3):
+`test "x": landed on the login page /login: the auth session was not applied or has expired`.
+Path identity is the same as discovery's (`browser.RouteKey`): trailing slash trimmed, query and
+plain fragments dropped, a `#/route` fragment kept. A `storageState` config without `loginPath`
+gets a warning, since the guard has nothing to compare against. Discovery crawls through the same
+seeding, and fails if the root itself redirects to the login page.
+
+**Secrets.** Only through `${ENV}` interpolation. A `fill` into a password-looking selector
+(`password`, `passwd`, `type=password`, case-insensitive) whose raw text has no `${...}` is a
+warning on stderr (never an error, never echoing the value), checked against the text before
+interpolation. Setup failures are exit 3 and name the step index (`auth setup: steps[1]: ...`).
+Verbose logging of setup steps names the action and selector, never a value. The captured state
+exists only in memory: never written to disk, reports, screenshots, SARIF or logs, and the state
+type redacts itself under `%v`.
 
 ### 7.6 Discovery
 
