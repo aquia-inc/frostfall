@@ -109,6 +109,9 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "config error:", err)
 		return exitBadConfig
 	}
+	for _, w := range cfg.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
 	if *validateOnly {
 		fmt.Println("config OK")
 		return exitOK
@@ -179,8 +182,21 @@ func run(args []string) int {
 	if (*screenshots || os.Getenv("GITHUB_ACTIONS") == "true") && !*noScreenshots {
 		shotDir = *screenshotDir
 	}
+	// Auth runs its login flow (reuse: true) here, once, before the first test
+	// or the crawl: both need the session, and a broken login should stop the
+	// run before any page is scanned signed out.
+	var authLog func(string, ...any)
+	if *verbose {
+		authLog = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+	}
+	authn, err := browser.NewAuth(b, cfg, base, authLog)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "auth error:", err)
+		return exitEnvironment
+	}
 	r := &runner.Runner{
 		Browser:       b,
+		Auth:          authn,
 		Engine:        eng,
 		Config:        cfg,
 		BaseURL:       base,
@@ -190,7 +206,7 @@ func run(args []string) int {
 		Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
 	if *discoverFlag {
-		discovered, derr := discoverTests(b, base, cfg, tests)
+		discovered, derr := discoverTests(b, authn, base, cfg, tests)
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "discover error:", derr)
 			return exitEnvironment
@@ -440,13 +456,14 @@ func activeProfileName(req string, cfg *config.Config) string {
 // discoverTests crawls from the root and synthesizes fresh-load tests for
 // pages no explicit test covers. Explicit tests always win on a path
 // collision — discovery adds breadth, never overrides depth.
-func discoverTests(b *browser.Browser, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
 	opts := config.Discover{MaxDepth: 3, MaxPages: 100}
 	if cfg.Discover != nil {
 		opts = *cfg.Discover
 	}
 	crawler := &discover.Crawler{
 		Browser:  b,
+		Auth:     authn,
 		BaseURL:  base,
 		Options:  opts,
 		Defaults: cfg.Defaults,

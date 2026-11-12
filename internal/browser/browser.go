@@ -58,34 +58,73 @@ type Session struct {
 	page    *rod.Page
 	ctx     *rod.Browser
 	timeout time.Duration
+	// seed unregisters the auth storage script; nil when there is none.
+	seed func() error
 }
 
 // NewSession opens a page at url in a fresh incognito context and waits for
 // per-page readiness.
 func (b *Browser) NewSession(url string, vp config.Viewport, waitFor string, settle, timeout time.Duration) (*Session, error) {
+	return b.NewAuthSession(nil, url, vp, waitFor, settle, timeout)
+}
+
+// open creates a session in a fresh incognito context, seeded with state
+// (nil for none) but not yet navigated anywhere. Cookies go in on the
+// context and storage through a script that runs before any page script of
+// the first load, so the page sees its session from its very first request.
+func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) (*Session, error) {
 	ctx, err := b.rod.Incognito()
 	if err != nil {
 		return nil, fmt.Errorf("creating browser context: %w", err)
 	}
+	if state != nil && len(state.cookies) > 0 {
+		// SetCookies(nil) would clear instead; the guard above keeps it non-nil.
+		if err := ctx.SetCookies(state.cookies); err != nil {
+			ctx.Close()
+			return nil, fmt.Errorf("injecting auth cookies (check secure and sameSite combinations): %w", err)
+		}
+	}
 	page, err := ctx.Page(proto.TargetCreateTarget{URL: ""})
 	if err != nil {
+		ctx.Close()
 		return nil, err
 	}
 	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width: vp.Width, Height: vp.Height, DeviceScaleFactor: 1,
 	}); err != nil {
 		page.Close()
+		ctx.Close()
 		return nil, err
 	}
 	s := &Session{page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
-	if err := s.navigate(url, waitFor, settle); err != nil {
-		page.Close()
-		return nil, err
+	if state != nil && len(state.origins) > 0 {
+		src, err := state.seedScript()
+		if err == nil {
+			s.seed, err = page.EvalOnNewDocument(src)
+		}
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("injecting auth storage: %w", err)
+		}
 	}
 	return s, nil
 }
 
-func (s *Session) Close() { s.page.CancelTimeout().Close() }
+// Close closes the page and disposes its context, so a signed-in context's
+// cookies do not outlive its test.
+func (s *Session) Close() {
+	s.page.CancelTimeout().Close()
+	s.ctx.Close()
+}
+
+// dropSeed stops the auth storage script from running on later documents.
+// Best effort: the page is closing soon either way.
+func (s *Session) dropSeed() {
+	if s.seed != nil {
+		_ = s.seed()
+		s.seed = nil
+	}
+}
 
 // idleWindow is how long the network must be quiet before networkIdle
 // readiness completes. Shared by the navigation and step paths so they

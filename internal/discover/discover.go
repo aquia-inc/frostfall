@@ -5,11 +5,11 @@
 package discover
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/browser"
@@ -21,7 +21,9 @@ type Crawler struct {
 	BaseURL  string
 	Options  config.Discover
 	Defaults config.Defaults
-	Log      func(format string, args ...any)
+	// Auth seeds every crawled page's context; nil crawls signed out.
+	Auth *browser.Auth
+	Log  func(format string, args ...any)
 }
 
 // Run crawls breadth-first from the root path and returns discovered paths in
@@ -59,6 +61,13 @@ func (c *Crawler) Run() ([]string, error) {
 		}
 
 		links, err := c.collectLinks(n.path)
+		// A root that redirects to the login page means the session was not
+		// applied: every link on it would be the login page's, and the crawl
+		// would quietly cover nothing. Deeper pages that do it (a /logout
+		// link) are just skipped like any page that fails to load.
+		if errors.Is(err, browser.ErrLoginRedirect) && n.depth == 0 {
+			return nil, err
+		}
 		if err != nil {
 			if c.Log != nil {
 				c.Log("discover: skipping %s: %v", n.path, err)
@@ -78,7 +87,7 @@ func (c *Crawler) Run() ([]string, error) {
 }
 
 func (c *Crawler) collectLinks(path string) ([]string, error) {
-	session, err := c.Browser.NewSession(c.BaseURL+path, c.Defaults.Viewport,
+	session, err := c.Browser.NewAuthSession(c.Auth, c.BaseURL+path, c.Defaults.Viewport,
 		c.Defaults.WaitFor, c.Defaults.SettleTime.Std(), 15*time.Second)
 	if err != nil {
 		return nil, err
@@ -115,16 +124,7 @@ func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []str
 		if u.Host != base.Host {
 			continue
 		}
-		p := u.Path
-		if p == "" {
-			p = "/"
-		}
-		if p != "/" {
-			p = strings.TrimSuffix(p, "/")
-		}
-		if frag := u.Fragment; strings.HasPrefix(frag, "/") && frag != "/" {
-			p += "#" + strings.TrimSuffix(frag, "/")
-		}
+		p := browser.RouteKey(u)
 		if seen[p] || excluded(p, excludes) {
 			continue
 		}

@@ -139,9 +139,12 @@ func (r *Run) EnforcedFailures(def config.Expect, perTest map[string]config.Expe
 }
 
 type Runner struct {
-	Browser  *browser.Browser
-	Engine   engine.Engine
-	Config   *config.Config
+	Browser *browser.Browser
+	Engine  engine.Engine
+	Config  *config.Config
+	// Auth seeds every test's context with the configured session; nil runs
+	// signed out.
+	Auth     *browser.Auth
 	BaseURL  string
 	Baseline *baseline.File
 	// ScreenshotDir enables element screenshots for new (non-baselined)
@@ -197,7 +200,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	}
 
 	r.logf("test %s: loading %s", t.ID, url)
-	session, err := r.Browser.NewSession(url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
+	session, err := r.Browser.NewAuthSession(r.Auth, url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
 	if err != nil {
 		return nil, nil, nil, err
 	}
