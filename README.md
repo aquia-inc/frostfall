@@ -232,8 +232,8 @@ auth:                            # optional: sign in before testing (see Auth be
                                  # signed-in page and on no login page
   reuse: true                    # log in once, restore into every test (default)
   # storageState: .auth/state.json   # or: a Playwright storage-state file
-  # loginPath: /login            # optional: the login URL, for clearer messages
-                               # (default setup.path; "" = no separate login URL)
+  # loginPath: /login            # optional, no default: the login URL, for clearer
+                               # messages and so discovery skips it
   # allowedOrigins: ["https://login.example.com"]   # SSO providers a setup flow
                                # passes through (never excuses a test)
 
@@ -500,6 +500,15 @@ the ones that are public, below). The wait is up to 5 seconds (a quarter of
 `defaults.timeout` if that is smaller), so a missing session costs that long,
 not the whole test timeout.
 
+*Choosing it.* Pick a test id or element that only the signed-in app renders,
+for example the account menu or `[data-testid=app-shell]` on content that needs
+the user. Do not use `main`, `nav`, `header` or a layout shell: those render
+before authentication resolves, on the login page too, and the guard would pass
+a login form. Frostfall checks this at startup. Before anything is scanned it
+loads the base URL (and `loginPath`, when set) in a fresh context with no
+session, and in setup mode the setup page before the steps run; if `signedIn`
+matches any of them the run stops with exit 3 and says which.
+
 **A login flow (`setup`).** Frostfall opens `setup.path`, runs the steps, and
 captures what the login left behind: every cookie of the browser context
 (`HttpOnly` ones included) plus the app origin's `localStorage` and
@@ -534,7 +543,9 @@ With `reuse: true` the flow runs once, before the first test (and before
 `reuse: false` each test runs the flow itself inside its own context before
 loading its page. That is slower and logs in once per test, so use it only
 when the session cannot be shared (single-use tokens, per-session server
-state). Discovery still logs in only once. `reuse` only applies to `setup`.
+state). `--discover` honors it too: it logs in once per page it loads, up to
+`discover.maxPages` times, and warns about that when the crawl starts. `reuse`
+only applies to `setup`.
 
 **A storage-state file (`storageState`).** Point at a Playwright-compatible
 storage-state JSON (`cookies` plus `origins[].localStorage`) captured
@@ -560,20 +571,26 @@ absent. The login route is a second signal and gives a clearer message:
 run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired
 ```
 
-- **`loginPath` (optional).** The path, relative to the base URL, that a
-  signed-out visitor lands on; it defaults to `setup.path`, and `loginPath: ""`
-  says there is none (a login rendered in place). With a base URL of
+- **`loginPath` (optional, no default).** The path, relative to the base URL,
+  that a signed-out visitor lands on. Landing there fails the test with a
+  clearer message, and `--discover` never follows it. `setup.path` is not a
+  default: it is often a protected page that bounces through your identity
+  provider and back, which is not a login page. With a base URL of
   `http://host/app` a `loginPath` of `/login` means `/app/login`; a trailing
   slash on the base changes nothing. Hash-router routes count as part of the
   path, the same way discovery treats them, so `loginPath: "/#/login"` guards a
   HashRouter app, and a query on the hash route (`/#/login?redirect=/x`) is still
-  the login route. A test whose own path is the login route is allowed to land
-  there, with no `signedIn` required, so you can scan the login page on purpose.
-  It is also excluded from `--discover`.
+  the login route. If your login is rendered in place at the same URL as the
+  app, leave it out: `signedIn` alone tells them apart.
+- **No exemptions.** Every guarded test is checked the same way, including one
+  whose own path is the login page. To test the login page itself, or any
+  signed-out state, set `auth: false` on that test.
 - **Other origins.** A test on the app's origin that ends up on any other origin
   was bounced somewhere, usually an identity provider, and fails as a redirect.
-  `allowedOrigins` does not change that. A test whose own URL is on another
-  origin is judged only against where it asked to go.
+  `allowedOrigins` does not change that. The session's cookies are sent to every
+  host a test loads, so with auth configured a test whose `url:` is not on the
+  base URL's origin (`localhost` is not `127.0.0.1`) is a config error (exit 2)
+  unless it sets `auth: false`.
 - **Later in the test.** The guard runs again before and after every `scan`,
   `keyboard`, `transcript` and `expectFocus` step, so a `goto` or click that
   walks into the login page, or a page that redirects while it is being
@@ -582,8 +599,10 @@ run error: test "dashboard": landed on the login page /login: the auth session w
   few seconds later is not caught between checks, so use a `waitFor` selector
   for those.
 
-**Public pages: `auth: false`.** A test with `auth: false` gets a fresh context
-with no session and no guard, for a public page or a signed-out state:
+**Public pages and the login page: `auth: false`.** A test with `auth: false`
+gets a fresh context with no session and no guard, for a public page, a
+signed-out state, the login page itself, or a page on another origin. It is a
+no-op without an `auth` block, and `auth: true` without one is a config error:
 
 ```yaml
 tests:
@@ -592,9 +611,13 @@ tests:
     auth: false
 ```
 
-Discovered tests use the configured auth. A page `--discover` finds that lacks
-the `signedIn` marker is dropped with a log line telling you to add it as an
-explicit test with `auth: false`.
+Discovered tests use the configured auth. A page `--discover` finds that is not
+signed in (it lands on the login page or another origin, or lacks the `signedIn`
+marker) is dropped with a log line, and the crawl ends with `discover: dropped N
+of M pages (not signed in)`, printed even when N is 0. The cause is one of two:
+a public page, which you add as an explicit test with `auth: false`, or a
+signed-in page that does not render the marker, in which case pick a marker
+every signed-in page renders.
 
 **SSO and `allowedOrigins`.** If sign-in goes through an identity provider on
 another origin (Okta, Entra, Keycloak), list that origin so the setup flow may
@@ -703,7 +726,11 @@ skips paths that look like a logout (`/logout`, `/sign-out`, `/log_off`,
 your `discover.exclude`. A page that turns out to be the login page, another
 origin, or unmarked when the crawl loads it is dropped rather than recorded as a
 page. If the root page itself does that, the crawl fails the same way a test
-does.
+does. Discovered paths become test ids in reports, baselines and issues, so with
+auth on they are cleaned first: `;params` and a hash route's query and any
+nested fragment are dropped (`/#/home#access_token=...` becomes `/#/home`), and
+a link whose path still carries a credential (`token=`, `access_token`, `sig=`,
+`code=`) is skipped. Without auth discovery output is unchanged.
 
 ## Discovery: scan pages you didn't list
 
