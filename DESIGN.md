@@ -166,7 +166,11 @@ auth:                          # optional; see §7.5
       - waitFor: "[data-testid=app-shell]"
   reuse: true                  # persist cookies+storage once, restore per test (default true)
   # storageState: .auth/state.json   # alternative: inject pre-captured state, skip setup
-  # loginPath: /login            # where a signed-out visitor lands; default setup.path
+  # loginPath: /login            # where a signed-out visitor lands; default setup.path,
+                               # required with storageState; relative to the base URL
+  # signedIn: "[data-testid=app-shell]"   # present on every signed-in page; required when
+                               # the login route is the base root
+  # allowedOrigins: ["https://login.example.com"]   # SSO origins a flow or landing may use
 
 baseline: .frostfall-baseline.json
 
@@ -334,14 +338,17 @@ that test with exit 3 semantics.
 
 ### 7.5 Auth
 
-Exactly one of `setup` and `storageState` is set (both or neither is exit 2).
+Exactly one of `setup` and `storageState` is set (both or neither is exit 2). The whole block is
+validated at load: every mistake in it is a config error, because silently ignoring auth means
+scanning a login page and passing.
 
 **Setup.** `setup.path` and a non-empty list of interaction steps (`scan`, `keyboard`, `transcript`
 and `expectFocus` are rejected: setup has no result to report them to). With `reuse: true`
 (default) the flow runs once, before the first test and before discovery, in a throwaway incognito
 context. Everything it left behind is captured in memory: every cookie of that context (CDP
 `Storage.getCookies`, so `HttpOnly` ones too) plus `localStorage` and `sessionStorage` of the app
-origin (storage of any other origin the flow ended on is not captured). Every test's context is
+origin and of every allowed origin (below) the flow visited. The page the flow ended on is read in
+place; a visited origin it left is revisited at its root to read it. Every test's context is
 seeded before its first navigation: cookies through `Storage.setCookies` on the context, storage
 through `Page.addScriptToEvaluateOnNewDocument`. Each storage block is guarded by
 `location.origin === <origin>`, so a value never lands on another origin, and a key the page
@@ -350,29 +357,65 @@ would re-run on every later navigation and restore a token the page had delibera
 logout step). With `reuse: false` each test runs the flow inside its own context, before loading
 its page. `reuse` is meaningless with `storageState` and rejected there.
 
+**Setup success is checked.** After the steps, the flow must be on the base origin or an allowed
+origin, not on the login route, and (with `signedIn`) must show the marker; otherwise setup fails
+(exit 3). Ending on an unnamed origin tells the user to set `baseUrl` to the app's real origin or
+add the origin to `allowedOrigins`, which is also what makes a base URL that redirects (to https,
+to www) fail loudly instead of silently dropping storage. A flow that leaves no cookies or storage
+behind warns on stderr regardless of `--verbose`.
+
 **storageState.** A Playwright-compatible file (`cookies[]`, `origins[].localStorage[]`), the
-CI-friendly path when credentials shouldn't be near this config. Relative paths resolve against the
-config file's directory; a missing or malformed file is a config error (the error never echoes a
-cookie or storage value). `expires: -1` maps to a session cookie, `sameSite` Strict/Lax/None maps
-to the CDP enum, and cookies already expired are dropped (Chrome rejects a batch containing one).
+CI-friendly path when credentials shouldn't be near this config. `loginPath` is required with it
+(there is no setup path to fall back on, and without it an expired session could not be told from a
+valid one). Relative paths resolve against the config file's directory; a missing or malformed file
+is a config error (the error never echoes a cookie or storage value). `expires: -1` maps to a
+session cookie and `sameSite` Strict/Lax/None to the CDP enum. Cookies already expired are left out;
+Chrome silently drops an expired cookie from `Storage.setCookies` without failing the batch, so
+skipping them changes no outcome.
 
 **Redirect guard.** The worst failure for this tool is quietly scanning a login page and passing.
-After each test's initial navigation and readiness, if the login route (`loginPath`, else
-`setup.path`) is set, the page is on the base origin, and its path plus hash route equals the login
-route while the test's own does not, the test fails as an environment error (exit 3):
-`test "x": landed on the login page /login: the auth session was not applied or has expired`.
-Path identity is the same as discovery's (`browser.RouteKey`): trailing slash trimmed, query and
-plain fragments dropped, a `#/route` fragment kept. A `storageState` config without `loginPath`
-gets a warning, since the guard has nothing to compare against. Discovery crawls through the same
-seeding, and fails if the root itself redirects to the login page.
+After each test's initial navigation and readiness (`Session.CheckLanding`), the test fails as an
+environment error (exit 3) when, on the app's origin:
+
+- the path plus hash route equals the login route and the test's own does not:
+  `test "x": landed on the login page /login: the auth session was not applied or has expired`;
+- `signedIn` is set and its selector is absent after a short wait: `min(5s, defaults.timeout / 4)`,
+  never the whole test budget.
+
+A test on the app's origin that lands on any other origin not in `allowedOrigins` fails too. A
+test whose own URL is on another origin is judged only by where it asked to go. The login route is
+`loginPath`, else `setup.path`, resolved under the base URL's path (base `http://h/app` and
+`loginPath /login` is `/app/login`; a trailing slash on the base is ignored). Path identity is
+discovery's (`RouteKey`: trailing slash trimmed, query and plain fragments dropped, a `#/route`
+fragment kept) with one difference in the guard only: the query of a hash route is dropped
+too, so `/#/login?redirect=/x` is the login route. A login rendered at the base root cannot be
+compared by path, so `signedIn` is required there (exit 2), and no test is exempt as "about the
+login page". Otherwise a test that targets the login route itself is allowed to be on it. The
+check runs again before every `scan`, `keyboard`, `transcript` and `expectFocus` step, naming the
+step index, so a `goto` into the login page cannot be scanned.
+
+**Allowed origins.** `allowedOrigins` lists absolute http(s) origins (validated, host lower-cased,
+default port dropped) that a flow or a landing may legitimately use, an SSO identity provider.
+`originOf` lower-cases hostnames: a browser reports `location.origin` lower-cased, and capture,
+seed and guard all compare against it.
+
+**Timeouts.** With `reuse: false` the flow runs under its own `defaults.timeout` and the test's
+budget (or discovery's 15s per page) is restarted after it.
+
+**Discovery.** The crawl uses the same seeding. With auth on it excludes logout-like paths
+(`(?i)/(log|sign)[-_]?(out|off)\b`) and the login route, on top of `discover.exclude`; pages at the
+depth limit are still loaded once so that a page that lands on login is dropped, not recorded; and
+a root that lands on login fails the crawl.
 
 **Secrets.** Only through `${ENV}` interpolation. A `fill` into a password-looking selector
 (`password`, `passwd`, `type=password`, case-insensitive) whose raw text has no `${...}` is a
 warning on stderr (never an error, never echoing the value), checked against the text before
 interpolation. Setup failures are exit 3 and name the step index (`auth setup: steps[1]: ...`).
-Verbose logging of setup steps names the action and selector, never a value. The captured state
-exists only in memory: never written to disk, reports, screenshots, SARIF or logs, and the state
-type redacts itself under `%v`.
+Verbose logging of setup steps names the action and selector, never a value. URLs in errors and
+logs are printed without their query string, so a token in `setup.path` cannot leak. The captured
+state exists only in memory: never written to disk, reports, screenshots, SARIF or logs, and the
+state type redacts itself under `%v`. `Session.Close` disposes the incognito context so a
+signed-in context does not outlive its test.
 
 ### 7.6 Discovery
 

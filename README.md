@@ -230,7 +230,11 @@ auth:                            # optional: sign in before testing (see Auth be
       - waitFor: "[data-testid=app-shell]"
   reuse: true                    # log in once, restore into every test (default)
   # storageState: .auth/state.json   # or: a Playwright storage-state file
-  # loginPath: /login            # where signed-out visitors land (default setup.path)
+  # loginPath: /login            # where signed-out visitors land (default setup.path;
+                               # required with storageState)
+  # signedIn: "[data-testid=app-shell]"   # a selector that exists on signed-in pages
+                               # (required when the login route is /)
+  # allowedOrigins: ["https://login.example.com"]   # SSO provider origins
 
 baseline: .frostfall-baseline.json   # known-debt file; see step 6 above
 
@@ -503,6 +507,12 @@ Setup steps are the interaction steps only (`click`, `fill`, `press`, `hover`,
 `expectFocus` are rejected there. End the steps with a `waitFor` for something
 only the signed-in app shows, so the capture happens after the login finished.
 
+Frostfall checks that the flow worked. A setup that ends on the login page,
+or on an origin you did not name (see SSO below), or (with `signedIn` set)
+without the signed-in marker, fails with exit 3 instead of handing every test
+an empty session. A flow that finishes but leaves no cookies or storage behind
+prints a `warning:` line even without `--verbose`.
+
 With `reuse: true` the flow runs once, before the first test (and before
 `--discover` crawls), and the state is restored into each test. With
 `reuse: false` each test runs the flow itself inside its own context before
@@ -515,7 +525,10 @@ storage-state JSON (`cookies` plus `origins[].localStorage`) captured
 elsewhere, and Frostfall injects it the same way and skips the flow. This is
 the path for CI when credentials should not be near this config. A relative
 path resolves against the config file's directory, and a missing or malformed
-file is a config error.
+file is a config error. `loginPath` is required with it (see the guard below).
+Cookies in the file that have already expired are not sent; the browser would
+drop them anyway, and the expired session then shows up as the login redirect
+below.
 
 ```yaml
 auth:
@@ -525,38 +538,129 @@ auth:
 
 **The redirect guard.** Scanning a login page and passing is the worst thing
 an authenticated scan can do, so Frostfall checks. After each test's first
-navigation settles, if the page's path is the login route and the test's own
-path is not, the test fails as an environment error (exit 3):
+navigation settles, the test fails as an environment error (exit 3) if the
+page is on the login route and the test did not ask for it:
 
 ```
 run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired
 ```
 
-The login route is `loginPath`, or `setup.path` when `loginPath` is unset. Set
-`loginPath` with `storageState`, since there is no setup path to fall back on
-(Frostfall warns if you do not). Hash-router routes count as part of the path,
-the same way discovery treats them, so `loginPath: "/#/login"` guards a
-HashRouter app. A test that targets the login page itself is allowed to be
-there. The guard looks at where the page is once it is ready; an app that
-redirects a few seconds later is not caught, so use a `waitFor` selector for
-those.
+- **Where the login route is.** `loginPath` is relative to the base URL, so
+  with a base URL of `http://host/app` a `loginPath` of `/login` means
+  `/app/login`; a trailing slash on the base changes nothing. It defaults to
+  `setup.path`. Hash-router routes count as part of the path, the same way
+  discovery treats them, so `loginPath: "/#/login"` guards a HashRouter app,
+  and a query on the hash route (`/#/login?redirect=/x`) is still the login
+  route. A test that targets the login page itself is allowed to be there.
+- **A login rendered in place.** If signed-out visitors see the login at the
+  same URL as the app (the base root, or a form swapped in without a URL
+  change), no path comparison can tell the pages apart. Set `signedIn` to a CSS
+  selector that exists on every signed-in page. Where it is absent, the test
+  fails the same way. Frostfall waits for it for up to 5 seconds after the page
+  is ready (a quarter of `defaults.timeout` if that is smaller), so a missing
+  session costs that long, not the whole test timeout. It is required when the
+  login route is the base root (`/`), and every test must show the selector.
+- **Other origins.** A test on the app's origin that ends up on a different
+  origin was bounced somewhere, usually an identity provider, and fails as a
+  redirect. A test whose own URL is on another origin is judged only against
+  where it asked to go.
+- **Later in the test.** The guard runs again before every `scan`,
+  `keyboard`, `transcript` and `expectFocus` step, so a `goto` or click that
+  walks into the login page after the first load fails there, naming the step
+  index, rather than scanning it. The check looks at where the page is once it
+  is ready; an app that redirects a few seconds later is not caught, so use a
+  `waitFor` selector for those.
+
+**SSO and `allowedOrigins`.** If sign-in goes through an identity provider on
+another origin (Okta, Entra, Keycloak), list that origin so a flow that passes
+through it, or a test the app legitimately redirects there, is accepted:
+
+```yaml
+auth:
+  setup:
+    path: /login
+    steps: [...]
+  allowedOrigins: ["https://login.example.com"]
+```
+
+Entries are absolute `http(s)` origins (no path); the host is lower-cased and a
+default port dropped. Frostfall captures the storage of the base origin and of
+every allowed origin the flow visited. The setup flow must end on the base
+origin or an allowed one, which also catches a base URL that redirects (to
+`https`, or to `www`): set `baseUrl` to the app's real origin.
+
+**Timeouts.** With `reuse: false` the login flow has its own `defaults.timeout`
+budget and the test's budget starts after it, so a slow login does not eat
+into the test. The same holds for `--discover`, whose pages get 15 seconds
+each apart from any login.
 
 **Secrets.** Put credentials in environment variables and reference them as
 `${A11Y_PASS}`. Frostfall prints a warning to stderr (it does not fail) when a
 `fill` into a field whose selector contains `password`, `passwd` or
 `type=password` has a literal value in the file. Setup steps are logged under
 `--verbose` as the action and selector only, never the value, and error
-messages never include a filled value. The captured session lives only in
-memory for the run: it is never written to disk, reports, screenshots, SARIF
-or logs. A `storageState` file is a credential in itself; keep it out of
-version control (for example `.auth/` in `.gitignore`).
+messages never include a filled value. URLs in errors and logs are printed
+without their query string, so `setup.path: /login?token=...` cannot leak
+the token. The captured session lives only in memory for the run: it is never
+written to disk, reports, screenshots, SARIF or logs. A `storageState` file is
+a credential in itself; keep it out of version control (for example `.auth/`
+in `.gitignore`).
 
 A failed login (a step times out, a selector is missing) stops the run with
 exit 3 and a message naming the step: `auth setup: steps[1]: fill "#email": ...`.
 
+**Credentials in CI.** The GitHub Action runs the binary in your job, so it
+reads whatever environment the job has. Map secrets to variables at job level
+(or workflow level) and reference them with `${...}` in the config:
+
+```yaml
+jobs:
+  a11y:
+    runs-on: ubuntu-latest
+    env:
+      A11Y_USER: ${{ secrets.A11Y_USER }}
+      A11Y_PASS: ${{ secrets.A11Y_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquia-inc/frostfall@v1
+        with:
+          base-url: https://staging.example.com
+```
+
+With the Docker image, pass the variables by name so the values stay out of the
+command line and shell history:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -e A11Y_USER -e A11Y_PASS \
+  -v "$PWD:/work" ghcr.io/aquia-inc/frostfall:v1 --base-url https://staging.example.com
+```
+
+To use a `storageState` from a CI secret, store the file's JSON in the secret
+and write it to disk before the scan, through `env` (never interpolated into
+the script):
+
+```yaml
+- name: Write storage state
+  env:
+    FROSTFALL_STATE: ${{ secrets.FROSTFALL_STORAGE_STATE }}
+  run: |
+    mkdir -p .auth
+    printf '%s' "$FROSTFALL_STATE" > .auth/state.json
+    chmod 600 .auth/state.json
+- uses: aquia-inc/frostfall@v1
+```
+
+If the secret holds the file base64-encoded, use `printf '%s' "$FROSTFALL_STATE" | base64 -d > .auth/state.json`.
+For the Docker image, put the file under the directory you mount at `/work`;
+the path in the config resolves against the config file as usual.
+
 `--discover` crawls with the same session, so it sees the app and not the
-login page. If the root page itself redirects to the login page, the crawl
-fails the same way a test does.
+login page, and it never follows what would end that session: with auth on it
+skips paths that look like a logout (`/logout`, `/sign-out`, `/log_off`,
+`/signoff`, matched case-insensitively) and the login page itself, on top of
+your `discover.exclude`. A page that turns out to be the login page when the
+crawl loads it is dropped rather than recorded as a page. If the root page
+itself redirects to the login page, the crawl fails the same way a test does.
 
 ## Discovery: scan pages you didn't list
 
@@ -575,6 +679,9 @@ It understands real SPAs:
 - **Numeric route parameters** are deduplicated by shape: a data table linking
   to `/items/1` through `/items/1000` gets one representative scan, not a
   thousand.
+
+With `auth` configured the crawl is signed in and skips logout-like paths and
+the login page (see Auth above).
 
 Discovered pages get generated test ids (`discovered:/#/users`) and use your
 defaults. Two caveats: a crawler cannot reach the states behind clicks, so keep
