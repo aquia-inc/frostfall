@@ -246,6 +246,9 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 		// suspects failed the fast comparison; confirm re-checks them.
 		suspects   = map[int]stop{}
 		last       stop
+		firstStop  stop
+		lastID     int // previous in-page stop, in scope or not
+		leftPage   bool
 		outs       int
 		cycleEnded bool
 		trapped    bool
@@ -307,7 +310,7 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 				cycleEnded = true
 				break
 			}
-			prev = nil
+			prev, lastID, leftPage = nil, 0, true
 			continue
 		}
 		outs = 0
@@ -319,9 +322,9 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 			continue
 		}
 		last = cur
-		if prev != nil && cur.ID == prev.ID {
+		if cur.ID == lastID {
 			// A modal with a single tab stop legitimately keeps it.
-			if init.Modal != nil && modalStops <= 1 {
+			if init.Modal != nil && cur.InModal && modalStops <= 1 {
 				cycleEnded = true
 				break
 			}
@@ -331,8 +334,9 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 			}
 			break
 		}
+		lastID = cur.ID
 		if first == 0 {
-			first = cur.ID
+			first, firstStop = cur.ID, cur
 		} else if cur.ID == first {
 			cycleEnded = true
 			break
@@ -383,6 +387,16 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 		if err := a.call("unreached", &missed, ids); err != nil {
 			return nil, err
 		}
+		// Focus came back to the first stop without ever leaving the page:
+		// script is wrapping it. Harmless while it reaches everything; with
+		// controls left out it is a trap, and they are its consequence.
+		if init.Modal == nil && !leftPage && first != 0 && len(missed) > 0 {
+			if firstStop.InScope {
+				a.report(RuleTrap, firstStop.Sel, firstStop.HTML,
+					"Focus cycles through a subset of the page and never returns to where Tab navigation began")
+			}
+			missed = nil
+		}
 		for _, m := range missed {
 			a.report(RuleUnreachable, m.Sel, m.HTML, "")
 		}
@@ -390,7 +404,7 @@ func Audit(ctx context.Context, page Page, opts Options) ([]engine.Violation, er
 	// Last: the confirming lap can re-render what it scrolls past (a
 	// virtualized grid's rows), which would make reached elements look new.
 	if cycleEnded && len(suspects) > 0 {
-		if err := a.confirm(last, suspects); err != nil {
+		if err := a.confirm(ctx, last, suspects); err != nil {
 			return nil, err
 		}
 	}
@@ -407,7 +421,7 @@ const confirmDelay = 400
 // suspect with confirmDelay on both sides, reporting only those that still
 // look unchanged. A suspect the lap cannot find again (a virtualized row
 // re-rendered) is dropped: a gate must not fail on a guess.
-func (a *audit) confirm(cur stop, suspects map[int]stop) error {
+func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) error {
 	first := cur.ID
 	// next presses Tab, waiting confirmDelay first only when slow: getting
 	// from one suspect to the next needs no settling at all.
@@ -424,6 +438,9 @@ func (a *audit) confirm(cur stop, suspects map[int]stop) error {
 		return st, a.call("state", &st)
 	}
 	for range a.opts.MaxTabs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s, ok := suspects[cur.ID]
 		if !ok || cur.Out {
 			var err error
@@ -442,17 +459,28 @@ func (a *audit) confirm(cur stop, suspects map[int]stop) error {
 		if err := a.call("state", &cur); err != nil {
 			return err
 		}
+		// Focus may have moved on by itself during the wait (a grid moving
+		// it into a row): then this capture is not the suspect's to judge.
+		if cur.Out || cur.ID != s.ID {
+			continue
+		}
 		before := region(cur.Box, cur.View)
 		focused, err := newFrame(a.page, cur.View, before).pixels(before)
 		if err != nil {
 			return err
 		}
 		// Off the page and back if the suspect was the last stop: see the
-		// fast pass on why a page without focus cannot be compared.
-		for cur, err = next(true); err == nil && cur.Out; cur, err = next(true) {
+		// fast pass on why a page without focus cannot be compared. Twice
+		// out in a row means focus is not coming back; stop the lap.
+		cur, err = next(true)
+		if err == nil && cur.Out {
+			cur, err = next(true)
 		}
 		if err != nil {
 			return err
+		}
+		if cur.Out {
+			return nil
 		}
 		if cur.ID != s.ID && before.In(viewport(cur.View)) {
 			after := region(cur.Box, cur.View)

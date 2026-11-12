@@ -101,11 +101,17 @@ func states(n *proto.AccessibilityAXNode) []string {
 	return out
 }
 
-func str(v *proto.AccessibilityAXValue) string {
+// norm is a value whitespace-collapsed, as a screen reader reads it.
+func norm(v *proto.AccessibilityAXValue) string {
 	if v == nil {
 		return ""
 	}
-	s := strings.Join(strings.Fields(v.Value.Str()), " ")
+	return strings.Join(strings.Fields(v.Value.Str()), " ")
+}
+
+// str is norm shortened for display.
+func str(v *proto.AccessibilityAXValue) string {
+	s := norm(v)
 	if r := []rune(s); len(r) > 120 {
 		s = string(r[:119]) + "…"
 	}
@@ -237,7 +243,7 @@ func CheckFocus(p Page, e Expectation) (ok bool, actual string, err error) {
 	if e.Role != "" && str(focused.Role) != e.Role {
 		return false, actual, nil
 	}
-	if e.Name != "" && str(focused.Name) != strings.Join(strings.Fields(e.Name), " ") {
+	if e.Name != "" && norm(focused.Name) != strings.Join(strings.Fields(e.Name), " ") {
 		return false, actual, nil
 	}
 	if e.Within != "" {

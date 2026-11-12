@@ -115,10 +115,11 @@ func (a Action) String() string {
 }
 
 // Plan reconciles desired groups against existing frostfall issues.
-// testsRun scopes closing: an issue is closed as fixed only when its page was
-// actually scanned this run — a filtered run (--id) must not close issues for
-// pages it never looked at.
-func Plan(groups []Group, existing []Issue, testsRun map[string]bool) []Action {
+// covered scopes closing: an issue is closed as fixed only when this run
+// actually looked for its rule on its page — a filtered run (--id) must not
+// close issues for pages it never looked at, nor a keyboard-only test close
+// axe issues.
+func Plan(groups []Group, existing []Issue, covered func(page, rule string) bool) []Action {
 	desired := map[string]Group{}
 	for _, g := range groups {
 		desired[g.Marker()] = g
@@ -139,7 +140,7 @@ func Plan(groups []Group, existing []Issue, testsRun map[string]bool) []Action {
 			}
 			continue
 		}
-		if issue.State == "open" && testsRun[page] {
+		if issue.State == "open" && covered(page, rule) {
 			actions = append(actions, Action{Kind: "close", Title: issue.Title, Number: issue.Number})
 		}
 	}
@@ -154,12 +155,12 @@ func Plan(groups []Group, existing []Issue, testsRun map[string]bool) []Action {
 // Sync executes a plan. runContext is a one-line provenance note added to
 // bodies and comments (e.g. a link to the CI run). Failures are collected,
 // not fatal: filing issues must never break the scan itself.
-func Sync(c *Client, groups []Group, existing []Issue, testsRun map[string]bool, runContext string) ([]Action, error) {
+func Sync(c *Client, groups []Group, existing []Issue, covered func(page, rule string) bool, runContext string) ([]Action, error) {
 	byMarker := map[string]Group{}
 	for _, g := range groups {
 		byMarker[g.Marker()] = g
 	}
-	actions := Plan(groups, existing, testsRun)
+	actions := Plan(groups, existing, covered)
 	var errs []string
 	for _, a := range actions {
 		var err error

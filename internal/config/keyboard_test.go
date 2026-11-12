@@ -18,6 +18,7 @@ tests:
   - id: off
     path: /
     keyboard: false
+    transcript:
   - id: full
     path: /
     keyboard: { maxTabs: 50, scope: main }
@@ -42,6 +43,10 @@ func TestKeyboardForms(t *testing.T) {
 	}
 	if off.Keyboard == nil || !off.Keyboard.Off {
 		t.Errorf("keyboard: false decoded as %+v", off.Keyboard)
+	}
+	// A bare key on a test means on, as it does on a step.
+	if off.Transcript == nil || off.Transcript.Off {
+		t.Errorf("bare transcript: on a test decoded as %+v", off.Transcript)
 	}
 	if full.Keyboard.MaxTabs != 50 || full.Keyboard.Scope != "main" {
 		t.Errorf("full form decoded as %+v", full.Keyboard)
@@ -105,6 +110,18 @@ tests:
   - id: a
     path: /
     steps: [{transcript: false}]`, "only meaningful on a test"},
+		"frostfall rule in a scan step": {`
+tests:
+  - id: a
+    path: /
+    steps:
+      - scan: { rules: { frostfall/focus-not-visible: off } }`, "is a frostfall/ rule"},
+		"axe rule in a keyboard step": {`
+tests:
+  - id: a
+    path: /
+    steps:
+      - keyboard: { rules: { color-contrast: off } }`, "is an axe rule"},
 		"negative maxTabs": {`
 tests: [{id: a, path: /, keyboard: {maxTabs: -1}}]`, "must not be negative"},
 	}

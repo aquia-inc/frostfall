@@ -109,6 +109,22 @@ func TestKeyboardAudit(t *testing.T) {
 			want: map[string][]string{keyboard.RuleTrap: {"#b"}},
 		},
 		{
+			// A cookie banner first in the DOM that wraps Tab between its own
+			// buttons: one trap, not a list of everything it shuts out.
+			name: "trap includes the first stop",
+			body: `<div id="banner"><button id="a">a</button><button id="b">b</button></div>
+				<button id="c">c</button><button id="d">d</button>
+				<script>b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })</script>`,
+			want: map[string][]string{keyboard.RuleTrap: {"#a"}},
+		},
+		{
+			// Script wrapping focus is harmless while it reaches everything.
+			name: "script wraps focus over every control",
+			body: `<button id="a">a</button><button id="b">b</button>
+				<script>b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })</script>`,
+			want: map[string][]string{},
+		},
+		{
 			name: "control skipped",
 			body: `<button id="a">a</button><button id="b">b</button><button id="c">c</button>
 				<script>a.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); c.focus() } })</script>`,

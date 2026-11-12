@@ -327,7 +327,7 @@ How the checks decide:
 
 An audit presses Tab once per stop, at roughly 150ms each, inside the test's
 `timeout`: a page with 150 tab stops needs about 25 seconds, so raise
-`timeout` on keyboard tests for large pages. It leaves focus and scroll where
+`defaults.timeout` (or a profile's) when auditing large pages. It leaves focus and scroll where
 it found them, so steps after a `keyboard` step run against the state the
 config reached. Returning focus to a dialog's trigger when it closes is
 checked with [`expectFocus`](#screen-reader-transcripts-and-focus-assertions).

@@ -312,6 +312,28 @@ func (s *ScanStep) UnmarshalYAML(node *yaml.Node) error {
 	return decodeStrict(node, (*plain)(s))
 }
 
+// UnmarshalYAML gives a bare `keyboard:` or `transcript:` on a test the
+// meaning the same key has on a step - on. yaml.v3 would leave the pointer
+// nil, silently skipping the check the config asked for.
+func (t *Test) UnmarshalYAML(node *yaml.Node) error {
+	type plain Test
+	if err := decodeStrict(node, (*plain)(t)); err != nil {
+		return err
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i+1].Tag != "!!null" {
+			continue
+		}
+		switch node.Content[i].Value {
+		case "keyboard":
+			t.Keyboard = &KeyboardStep{}
+		case "transcript":
+			t.Transcript = &TranscriptStep{}
+		}
+	}
+	return nil
+}
+
 // KeyboardStep configures a keyboard traversal audit. As a test field it
 // accepts true/false or the full form (without label: it is the initial
 // state); as a step, bare `- keyboard:` or the full form.
@@ -326,8 +348,6 @@ type KeyboardStep struct {
 
 func (k *KeyboardStep) UnmarshalYAML(node *yaml.Node) error {
 	switch node.Tag {
-	case "!!null":
-		return nil
 	case "!!bool":
 		var on bool
 		if err := node.Decode(&on); err != nil {
@@ -344,7 +364,26 @@ func (k *KeyboardStep) validate() error {
 	if k.MaxTabs < 0 {
 		return fmt.Errorf("keyboard.maxTabs: must not be negative")
 	}
-	return validateRules("keyboard.rules", k.Rules)
+	if err := validateRules("keyboard.rules", k.Rules); err != nil {
+		return err
+	}
+	return onlyRules("keyboard.rules", k.Rules, true)
+}
+
+// onlyRules rejects ids the block's check never reads: a keyboard step's
+// rules only reach the keyboard audit, a scan step's only axe, so a toggle
+// for the other would validate and silently do nothing. Defaults and test
+// rules feed both, so they take either.
+func onlyRules(where string, rules map[string]bool, kb bool) error {
+	for id := range rules {
+		if keyboard.IsRule(id) != kb {
+			if kb {
+				return fmt.Errorf("%s: %q is an axe rule; set it in a scan step or the test's rules", where, id)
+			}
+			return fmt.Errorf("%s: %q is a frostfall/ rule; set it in a keyboard step or the test's rules", where, id)
+		}
+	}
+	return nil
 }
 
 // validateRules rejects frostfall/ rule ids this binary does not implement:
@@ -678,6 +717,9 @@ func (s *Step) validate() error {
 	}
 	if s.Scan != nil {
 		if err := validateRules("scan.rules", s.Scan.Rules); err != nil {
+			return err
+		}
+		if err := onlyRules("scan.rules", s.Scan.Rules, false); err != nil {
 			return err
 		}
 	}

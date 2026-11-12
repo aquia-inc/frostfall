@@ -52,10 +52,35 @@ type Run struct {
 	Transcripts []Transcript
 	Stale       []baseline.Violation // baselined entries that no longer occur
 	TestsRun    int
-	// Scanned records test ids that actually executed at least one scan —
-	// distinct from configured tests: issue lifecycle must only treat a page
-	// as "looked at" when a scan genuinely ran there.
-	Scanned map[string]bool
+	// ran records, per test id, which checks actually executed - distinct
+	// from configured tests and from each other: a violation may only be
+	// treated as fixed (a stale baseline entry, a closed issue) where the
+	// check that produces its rule genuinely ran.
+	ran map[string]map[string]bool
+}
+
+// The checks that produce findings. axe owns every rule id outside the
+// frostfall/ namespace.
+const (
+	checkAxe         = "axe"
+	checkKeyboard    = "keyboard"
+	checkExpectFocus = "expectFocus"
+)
+
+func checkFor(ruleID string) string {
+	switch {
+	case ruleID == keyboard.RuleFocusExpectation:
+		return checkExpectFocus
+	case keyboard.IsRule(ruleID):
+		return checkKeyboard
+	}
+	return checkAxe
+}
+
+// Covered reports whether this run looked for ruleID on test's page, so its
+// absence means fixed rather than unchecked.
+func (r *Run) Covered(testID, ruleID string) bool {
+	return r.ran[testID][checkFor(ruleID)]
 }
 
 // Failing reports whether a single result breaks the expect contract, judged
@@ -122,16 +147,14 @@ func (r *Runner) Execute(ctx context.Context, tests []config.Test) (*Run, error)
 			return nil, fmt.Errorf("creating screenshot dir: %w", err)
 		}
 	}
-	run := &Run{Scanned: map[string]bool{}}
+	run := &Run{ran: map[string]map[string]bool{}}
 	for _, t := range tests {
-		results, transcripts, scanned, err := r.runTest(ctx, t)
+		results, transcripts, ran, err := r.runTest(ctx, t)
 		if err != nil {
 			return nil, fmt.Errorf("test %q: %w", t.ID, err)
 		}
 		run.Transcripts = append(run.Transcripts, transcripts...)
-		if scanned {
-			run.Scanned[t.ID] = true
-		}
+		run.ran[t.ID] = ran
 		run.Results = append(run.Results, results...)
 		run.TestsRun++
 	}
@@ -139,7 +162,7 @@ func (r *Runner) Execute(ctx context.Context, tests []config.Test) (*Run, error)
 	return run, nil
 }
 
-func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, transcripts []Transcript, scanned bool, err error) {
+func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, transcripts []Transcript, ran map[string]bool, err error) {
 	d := r.Config.Defaults
 	url := t.URL
 	if url == "" {
@@ -153,35 +176,37 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	r.logf("test %s: loading %s", t.ID, url)
 	session, err := r.Browser.NewSession(url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, err
 	}
 	defer session.Close()
+	ran = map[string]bool{}
 
 	scanInitial := t.Scan == nil || *t.Scan
 	if scanInitial {
 		res, err := r.scan(ctx, session, t, url, "initial", config.ScanStep{})
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, nil, err
 		}
-		scanned = true
-		results = append(results, res...)
-	}
-	// After the initial scan: the audit leaves focus where it found it, but
-	// the Tab presses can still fire focus handlers that change the DOM.
-	if k := t.Keyboard; k != nil && !k.Off {
-		res, err := r.keyboard(ctx, session, t, url, "initial", *k)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		scanned = true
+		ran[checkAxe] = true
 		results = append(results, res...)
 	}
 	if tr := t.Transcript; tr != nil && !tr.Off {
 		lines, err := screenreader.Transcript(session, tr.Scope)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, nil, err
 		}
 		transcripts = append(transcripts, Transcript{TestID: t.ID, Label: "initial", PageURL: url, Lines: lines})
+	}
+	// Last of the initial-state checks: the audit leaves focus where it
+	// found it, but its Tab presses can fire focus handlers that change the
+	// DOM, which the scan and transcript above must not see.
+	if k := t.Keyboard; k != nil && !k.Off {
+		res, err := r.keyboard(ctx, session, t, url, "initial", *k)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		ran[checkKeyboard] = true
+		results = append(results, res...)
 	}
 
 	for i, step := range t.Steps {
@@ -193,7 +218,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			r.logf("test %s: transcript (%s)", t.ID, label)
 			lines, err := screenreader.Transcript(session, tr.Scope)
 			if err != nil {
-				return nil, nil, false, fmt.Errorf("steps[%d]: %w", i, err)
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 			}
 			transcripts = append(transcripts, Transcript{TestID: t.ID, Label: label, PageURL: url, Lines: lines})
 			continue
@@ -202,11 +227,11 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			if e.Label != "" {
 				label = e.Label
 			}
-			res, err := r.expectFocus(session, t, url, label, *e)
+			res, checked, err := r.expectFocus(session, t, url, label, *e)
 			if err != nil {
-				return nil, nil, false, fmt.Errorf("steps[%d]: %w", i, err)
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 			}
-			scanned = true
+			ran[checkExpectFocus] = ran[checkExpectFocus] || checked
 			results = append(results, res...)
 			continue
 		}
@@ -216,9 +241,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			}
 			res, err := r.keyboard(ctx, session, t, url, label, *k)
 			if err != nil {
-				return nil, nil, false, err
+				return nil, nil, nil, err
 			}
-			scanned = true
+			ran[checkKeyboard] = true
 			results = append(results, res...)
 			continue
 		}
@@ -228,18 +253,18 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			}
 			res, err := r.scan(ctx, session, t, url, label, *step.Scan)
 			if err != nil {
-				return nil, nil, false, err
+				return nil, nil, nil, err
 			}
-			scanned = true
+			ran[checkAxe] = true
 			results = append(results, res...)
 			continue
 		}
 		r.logf("test %s: step %d", t.ID, i)
 		if err := session.Step(step, r.BaseURL, d.WaitFor, d.SettleTime.Std()); err != nil {
-			return nil, nil, false, fmt.Errorf("steps[%d]: %w", i, err)
+			return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 		}
 	}
-	return results, transcripts, scanned, nil
+	return results, transcripts, ran, nil
 }
 
 // mergeRules layers rule toggles (defaults, then test, then step) and keeps
@@ -262,7 +287,7 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 		Rules:   mergeRules(true, r.Config.Defaults.Rules, t.Rules, k.Rules),
 	})
 	if errors.Is(err, context.DeadlineExceeded) {
-		return nil, fmt.Errorf("keyboard audit %q: %w (an audit presses Tab through every stop on the page, ~150ms each; raise the timeout for this test)", label, err)
+		return nil, fmt.Errorf("keyboard audit %q: %w (an audit presses Tab through every stop on the page, ~150ms each; raise defaults.timeout, or set it in a profile to raise it for CI alone)", label, err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("keyboard audit %q: %w", label, err)
@@ -274,14 +299,15 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 // baselines like any violation. Its target is the assertion, not the element
 // that wrongly has focus: that element varies with the bug, and the finding's
 // identity must not.
-func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label string, e config.ExpectFocus) ([]Result, error) {
+// checked is false when the rule is toggled off and nothing was evaluated.
+func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label string, e config.ExpectFocus) (res []Result, checked bool, err error) {
 	if on, set := mergeRules(true, r.Config.Defaults.Rules, t.Rules)[keyboard.RuleFocusExpectation]; set && !on {
-		return nil, nil
+		return nil, false, nil
 	}
 	r.logf("test %s: expectFocus (%s)", t.ID, label)
 	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name})
 	if err != nil || ok {
-		return nil, err
+		return nil, err == nil, err
 	}
 	var want []string
 	if e.Role != "" {
@@ -299,7 +325,7 @@ func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label
 	}
 	v := keyboard.NewViolation(keyboard.RuleFocusExpectation, target, "",
 		"Expected focus "+strings.Join(want, ", ")+"; "+actual)
-	return r.results(session, t, url, label, []engine.Violation{v}), nil
+	return r.results(session, t, url, label, []engine.Violation{v}), true, nil
 }
 
 func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Test, url, label string, s config.ScanStep) ([]Result, error) {
@@ -373,7 +399,7 @@ func (r *Runner) classify(run *Run) {
 	for _, entry := range r.Baseline.Violations {
 		// Stale means "scanned its page and the violation is gone" — an entry
 		// whose test didn't run this time (filtered run) is unknown, not stale.
-		if !seen[entry.Fingerprint] && run.Scanned[entry.TestID] {
+		if !seen[entry.Fingerprint] && run.Covered(entry.TestID, entry.RuleID) {
 			run.Stale = append(run.Stale, entry)
 		}
 	}
