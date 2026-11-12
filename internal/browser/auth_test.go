@@ -78,7 +78,7 @@ func newAuthApp(t *testing.T) *authApp {
 	// without any HTTP redirect.
 	mux.HandleFunc("/spa", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>spa</title></head><body>
-			<i id="in"></i><script>if (!localStorage.getItem('token')) location.hash = location.search.includes('withquery') ? '#/login?redirect=/x' : '#/login'</script></body></html>`)
+			<script>if (localStorage.getItem('token')) document.body.insertAdjacentHTML('beforeend', '<i id="in"></i>'); else location.hash = location.search.includes('withquery') ? '#/login?redirect=/x' : '#/login'</script></body></html>`)
 	})
 	// The app side of an SSO round trip: /sso-start sends the browser to the
 	// identity provider, which stores something of its own and comes back to
@@ -97,11 +97,18 @@ func newAuthApp(t *testing.T) *authApp {
 			localStorage.setItem('idp', 'idp-tok'); location.href = new URLSearchParams(location.search).get('cb')</script></body></html>`)
 	})
 	mux.HandleFunc("/idp-end", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>idp</title></head><body><main id="idp-end">idp</main></body></html>`)
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>idp</title></head><body><i id="in"></i><main id="idp-end">idp</main></body></html>`)
 	})
 	mux.HandleFunc("/idp-probe", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>p</title></head><body>
 			<pre id="t"></pre><script>t.textContent = 'idp=' + localStorage.getItem('idp')</script></body></html>`)
+	})
+	// /drop closes the connection without a response: a navigation that fails.
+	mux.HandleFunc("/drop", func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
 	})
 	mux.HandleFunc("/bounce", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, app.bounceTo+"/probe", http.StatusFound)
@@ -311,19 +318,24 @@ func TestLoginRedirectGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("a test that targets the login page is allowed to be there", func(t *testing.T) {
+	t.Run("the login page itself needs auth: false", func(t *testing.T) {
 		cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /login\n")
 		a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, err := openAuthed(t, b, a, cfg, app.URL, "/login")
+		// No exemption for a test whose own path is the login route: it is
+		// guarded like any other, or it could pass an in-place login form.
+		if _, err := openAuthed(t, b, a, cfg, app.URL, "/login"); !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "auth: false") {
+			t.Errorf("err = %v, want the login page refused with a hint to use auth: false", err)
+		}
+		// A test that opts out is a fresh signed-out context with no guard.
+		s, err := openAuthed(t, b, a.Anonymous(), cfg, app.URL, "/login")
 		if err != nil {
-			t.Fatalf("login page test failed the guard: %v", err)
+			t.Fatalf("auth: false login page test failed: %v", err)
 		}
 		s.Close()
 	})
-
 	t.Run("hash route", func(t *testing.T) {
 		cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /spa#/login\n")
 		a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
@@ -342,7 +354,7 @@ func TestLoginRedirectGuard(t *testing.T) {
 		// The same document is fine when the hash route it lands on is not
 		// the login route: /spa itself without a token only ever reaches
 		// #/login, so point the guard elsewhere.
-		cfg = loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /spa#/signin\n")
+		cfg = loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "1", true)+"\n  loginPath: /spa#/signin\n")
 		a, err = NewAuth(b, cfg, app.URL, AuthOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -365,11 +377,9 @@ func TestStorageNotInjectedOnOtherOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	probe := func(base string) string {
-		s, err := openAuthed(t, b, a, cfg, base, "/probe")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer s.Close()
+		// Unguarded: the guard refuses another origin, and what is being
+		// observed is what the seed did there.
+		s := openUnguarded(t, b, a, base+"/probe")
 		raw, err := s.Eval(`() => document.getElementById('t').textContent`)
 		if err != nil {
 			t.Fatal(err)

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -193,16 +194,6 @@ func TestTestAuthIsAStrictBool(t *testing.T) {
 	}
 }
 
-func TestEmptyLoginPathMeansNoLoginRoute(t *testing.T) {
-	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed+"  loginPath: \"\"\n"), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Auth.LoginRoute(); got != "" {
-		t.Errorf("login route = %q, want none: an explicit empty loginPath overrides the setup path", got)
-	}
-}
-
 func TestAuthDefaults(t *testing.T) {
 	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed), "")
 	if err != nil {
@@ -212,8 +203,10 @@ func TestAuthDefaults(t *testing.T) {
 	if !a.ReuseSetup() {
 		t.Error("reuse should default to true")
 	}
-	if a.LoginRoute() != "/login" {
-		t.Errorf("login route = %q, want setup.path", a.LoginRoute())
+	// setup.path is no default login route: it is often a protected page
+	// that bounces through SSO and back.
+	if a.LoginRoute() != "" {
+		t.Errorf("login route = %q, want none unless loginPath is set", a.LoginRoute())
 	}
 	cfg, err = Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed+"  reuse: false\n  loginPath: /signin\n"), "")
 	if err != nil {
@@ -259,5 +252,56 @@ func TestSecretLint(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAuthTrueNeedsAnAuthBlock(t *testing.T) {
+	noAuth := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n    auth: %s\n"
+	if _, err := Load(writeConfigIn(t, t.TempDir(), fmt.Sprintf(noAuth, "true")), ""); err == nil || !strings.Contains(err.Error(), "auth: true needs an auth block") {
+		t.Errorf("auth: true without a block: err = %v, want a config error", err)
+	}
+	// auth: false with nothing to opt out of is a harmless no-op.
+	if _, err := Load(writeConfigIn(t, t.TempDir(), fmt.Sprintf(noAuth, "false")), ""); err != nil {
+		t.Errorf("auth: false without a block: %v", err)
+	}
+}
+
+func TestCheckTestOrigins(t *testing.T) {
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := false
+	cases := []struct {
+		name  string
+		tests []Test
+		want  string
+	}{
+		{"path tests", []Test{{ID: "a", Path: "/x"}}, ""},
+		{"same origin url", []Test{{ID: "a", URL: "http://127.0.0.1:8080/x"}}, ""},
+		{"same origin, default port and case", []Test{{ID: "a", URL: "HTTP://127.0.0.1:8080"}}, ""},
+		{"localhost is not 127.0.0.1", []Test{{ID: "loc", URL: "http://localhost:8080/x"}}, "auth: false"},
+		{"another host", []Test{{ID: "ext", URL: "https://example.com/"}}, "auth: false"},
+		{"another port", []Test{{ID: "p", URL: "http://127.0.0.1:9/"}}, "auth: false"},
+		{"opted out", []Test{{ID: "pub", URL: "https://example.com/", Auth: &f}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cfg.CheckTestOrigins("http://127.0.0.1:8080", tc.tests)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), tc.tests[0].ID)):
+				t.Errorf("err = %v, want a config error naming the test and %q", err, tc.want)
+			}
+		})
+	}
+	// Without auth nothing is checked.
+	plain, err := Load(writeConfigIn(t, t.TempDir(), "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.CheckTestOrigins("http://127.0.0.1:8080", []Test{{ID: "x", URL: "https://example.com/"}}); err != nil {
+		t.Errorf("a config without auth was checked: %v", err)
 	}
 }

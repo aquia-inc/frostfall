@@ -33,6 +33,9 @@ type runOpts struct {
 	tests       string
 	log         func(string, ...any)
 	engine      engine.Engine
+	// after runs when a check that reports on the page has just finished,
+	// before its landing re-check (see Runner.afterOp).
+	after func(s *browser.Session, op, base string)
 }
 
 func runTests(t *testing.T, withSession bool, testsYAML string, log func(string, ...any)) error {
@@ -56,8 +59,8 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 			}
 		}
 		marker := `<i id="in"></i>`
-		if r.URL.Path == "/login" {
-			marker = ""
+		if r.URL.Path == "/login" || r.URL.Path == "/" {
+			marker = "" // signed out, the root and the login page have no marker
 		}
 		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>%spage</main></body></html>`, marker)
 	}))
@@ -94,6 +97,9 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 		eng = o.engine
 	}
 	r := &Runner{Browser: b, Engine: eng, Config: cfg, BaseURL: srv.URL, Auth: a, Verbose: o.log != nil, Log: o.log}
+	if o.after != nil {
+		r.afterOp = func(s *browser.Session, op string) { o.after(s, op, srv.URL) }
+	}
 	return r.Execute(context.Background(), cfg.Tests)
 }
 
@@ -111,8 +117,8 @@ func TestRunFailsWhenTestLandsOnLoginPage(t *testing.T) {
 		t.Fatalf("err = %v, want the login redirect error", err)
 	}
 	want := `test "dashboard": landed on the login page /login: the auth session was not applied or has expired`
-	if err.Error() != want {
-		t.Errorf("err = %q, want %q", err, want)
+	if !strings.HasPrefix(err.Error(), want) || !strings.Contains(err.Error(), "auth: false") {
+		t.Errorf("err = %q, want it to start %q and point at auth: false", err, want)
 	}
 }
 
@@ -220,5 +226,45 @@ func TestVerboseLogIsUnredactedWithoutAuth(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(lines, "\n"), "/plain?keep=1") {
 		t.Errorf("log = %q, want the URL as printed before auth existed", lines)
+	}
+}
+
+// toLogin moves the session's page to /login when op starts with prefix, the
+// way a handler fired by the check itself might.
+func toLogin(prefix string) func(*browser.Session, string, string) {
+	return func(s *browser.Session, op, base string) {
+		if strings.HasPrefix(op, prefix) {
+			s.Step(config.Step{Goto: "/login"}, base, "load", 0)
+		}
+	}
+}
+
+// Each check that reports on the page is followed by a landing re-check: if
+// the page ended up on the login page while it ran, the redirect is reported
+// and none of its results are. The page is moved at exactly that point.
+// (The re-checks before the initial transcript and keyboard audit run
+// immediately after the check that follows navigation, so nothing can
+// change the page between the two, and they have no test of their own.)
+func TestEveryCheckIsFollowedByALandingRecheck(t *testing.T) {
+	cases := []struct {
+		name, tests, op string
+	}{
+		{"initial transcript", "  - id: t\n    path: /app\n    scan: false\n    transcript: true\n", "the initial transcript"},
+		{"initial keyboard audit", "  - id: t\n    path: /app\n    scan: false\n    keyboard: true\n", "keyboard audit"},
+		{"step transcript", "  - id: t\n    path: /app\n    scan: false\n    steps:\n      - transcript:\n", "the transcript"},
+		{"step keyboard audit", "  - id: t\n    path: /app\n    scan: false\n    steps:\n      - keyboard:\n", "keyboard audit"},
+		{"step expectFocus", "  - id: t\n    path: /app\n    scan: false\n    steps:\n      - expectFocus: { role: button }\n", "expectFocus"},
+		{"initial scan", "  - id: t\n    path: /app\n", "scan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run, err := runSite(t, runOpts{withSession: true, tests: tc.tests, after: toLogin(tc.op)})
+			if !errors.Is(err, browser.ErrLoginRedirect) || !strings.Contains(err.Error(), "after "+tc.op) {
+				t.Fatalf("err = %v, want the redirect reported after %q", err, tc.op)
+			}
+			if run != nil {
+				t.Errorf("results were returned from the login page: %+v", run.Results)
+			}
+		})
 	}
 }

@@ -95,6 +95,14 @@ func TestRedactURL(t *testing.T) {
 		"/a;x=1/b;y=2?z":                         "/a/b",
 		"http://h/login;jsessionid=ABC?x#/r?t=1": "http://h/login#/r",
 		"":                                       "",
+		// OAuth implicit flows put the token after the route, in these places.
+		"http://h/a#/home#access_token=X":             "http://h/a#/home",
+		"http://h/#/access_token=X&token_type=bearer": "http://h/#/access_token",
+		"http://h/#/cb&access_token=X":                "http://h/#/cb",
+		"http://h/#/route=1":                          "http://h/#/route",
+		"/login%3Ftoken=X":                            "/login",
+		"/x%23frag":                                   "/x",
+		"/login%3Ftoken=X;jsessionid=Y%23z":           "/login",
 	} {
 		if got := RedactURL(in); got != want {
 			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)

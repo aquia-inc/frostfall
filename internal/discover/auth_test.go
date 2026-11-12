@@ -101,9 +101,15 @@ func TestCrawlUsesAuthenticatedState(t *testing.T) {
 	}
 	t.Cleanup(b.Close)
 
-	got, err := crawler(b, authFor(t, b, srv.URL, true), srv.URL).Run()
+	c := crawler(b, authFor(t, b, srv.URL, true), srv.URL)
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	got, err := c.Run()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Contains(logs, "discover: dropped 0 of 3 pages (not signed in)") {
+		t.Errorf("the summary is always printed, zero included: %q", logs)
 	}
 	for _, want := range []string{"/", "/reports", "/settings"} {
 		if !slices.Contains(got, want) {
@@ -150,7 +156,7 @@ func richSite(t *testing.T) *httptest.Server {
 		}
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
 		if r.URL.Path == "/" {
-			for _, l := range []string{"/about", "/reports", "/logout", "/sign-out", "/Log_Off", "/signoff", "/login", "/secret"} {
+			for _, l := range []string{"/about", "/reports", "/logout", "/sign-out", "/Log_Off", "/signoff", "/login", "/secret;jsessionid=SECRETSESS"} {
 				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
 			}
 		}
@@ -183,8 +189,17 @@ func TestCrawlWhenSignedInSkipsLogoutLoginAndRedirectedPages(t *testing.T) {
 		t.Errorf("found = %v, want %v (no logout links, no login page, no page that redirected to it)", got, want)
 	}
 	joined := strings.Join(logs, "\n")
-	if !strings.Contains(joined, "dropping /secret") || !strings.Contains(joined, "explicit test with auth: false") {
-		t.Errorf("the dropped page was not logged with what to do about it: %q", logs)
+	if !strings.Contains(joined, "dropping /secret:") ||
+		!strings.Contains(joined, "explicit test with auth: false") || !strings.Contains(joined, "does not render the signedIn marker") {
+		t.Errorf("the dropped page was not logged with both things to do about it: %q", logs)
+	}
+	// The link carried a session id in a path parameter. It must reach neither
+	// the log nor the page's identity.
+	if strings.Contains(joined, "SECRETSESS") {
+		t.Errorf("a path parameter reached the log: %q", logs)
+	}
+	if !strings.Contains(joined, "discover: dropped 1 of 4 pages (not signed in)") {
+		t.Errorf("no drop summary: %q", logs)
 	}
 }
 
@@ -244,38 +259,6 @@ func TestCrawlOffOriginLandings(t *testing.T) {
 	}
 }
 
-// loginSite has a real login (POST sets the cookie) and counts how many times
-// it ran, so a crawl that logs in once per page shows.
-func loginSite(t *testing.T, logins *int, mu *sync.Mutex) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/login" {
-			if r.Method == http.MethodPost {
-				mu.Lock()
-				*logins++
-				mu.Unlock()
-				http.SetCookie(w, &http.Cookie{Name: "sid", Value: "valid", Path: "/", HttpOnly: true})
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>
-				<button id="go" onclick="fetch('/login', {method: 'POST'}).then(() => location.href = '/')">go</button></body></html>`)
-			return
-		}
-		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
-		if r.URL.Path == "/" {
-			fmt.Fprint(w, `<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>`)
-		}
-		fmt.Fprint(w, `</body></html>`)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
 func setupAuth(t *testing.T, b *browser.Browser, base string, reuse bool) *browser.Auth {
 	t.Helper()
 	dir := t.TempDir()
@@ -295,15 +278,57 @@ func setupAuth(t *testing.T, b *browser.Browser, base string, reuse bool) *brows
 	return a
 }
 
-// With reuse: false a crawl would log in once per page it loads. It logs in
-// once and crawls with that session.
-func TestCrawlLogsInOnceWithoutReuse(t *testing.T) {
+// rotatingSite is an app whose session rotates: every authenticated response
+// issues a new cookie and retires the old one, so a session can be used by one
+// context at a time and cannot be captured once and shared.
+func rotatingSite(t *testing.T, logins *int, mu *sync.Mutex) *httptest.Server {
+	t.Helper()
+	current := ""
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		issue := func() {
+			n++
+			current = fmt.Sprintf("s%d", n)
+			http.SetCookie(w, &http.Cookie{Name: "sid", Value: current, Path: "/"})
+		}
+		if r.URL.Path == "/login" {
+			if r.Method == http.MethodPost {
+				*logins++
+				issue()
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>
+				<button id="go" onclick="fetch('/login', {method: 'POST'}).then(() => location.href = '/')">go</button></body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != current {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		issue() // rotate
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>`)
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// With reuse: false every page loaded logs in for itself, which is what an app
+// with single-use or rotating sessions needs: a session captured once would be
+// dead after the first page, and every page after the root would be dropped.
+func TestCrawlWithoutReuseLogsInPerPage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}
 	var logins int
 	var mu sync.Mutex
-	srv := loginSite(t, &logins, &mu)
+	srv := rotatingSite(t, &logins, &mu)
 	b, err := browser.Launch("")
 	if err != nil {
 		t.Fatal(err)
@@ -311,21 +336,20 @@ func TestCrawlLogsInOnceWithoutReuse(t *testing.T) {
 	t.Cleanup(b.Close)
 
 	a := setupAuth(t, b, srv.URL, false)
-	crawlAuth, err := a.ForCrawl(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := crawler(b, crawlAuth, srv.URL).Run()
+	c := crawler(b, a, srv.URL)
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	got, err := c.Run()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"/", "/a", "/b", "/c"}; !slices.Equal(got, want) {
-		t.Errorf("found = %v, want %v", got, want)
+		t.Errorf("found = %v, want %v (logs: %q)", got, want, logs)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if logins != 1 {
-		t.Errorf("logins = %d, want 1 for the whole crawl", logins)
+	if logins < len(got) {
+		t.Errorf("logins = %d for %d pages, want a login per page loaded", logins, len(got))
 	}
 }
 
@@ -363,5 +387,97 @@ func TestUnauthenticatedCrawlDoesNotLoadDepthLimitPages(t *testing.T) {
 	defer mu.Unlock()
 	if hits["/"] == 0 || hits["/a"] != 0 {
 		t.Errorf("hits = %v, want / loaded and the depth-limit page /a left alone", hits)
+	}
+}
+
+// Without auth discovery logs exactly what it always did: a path is not redacted.
+func TestUnauthenticatedCrawlLogsAreUnredacted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><a href="/fail;sess=1">x</a></body></html>`)
+		default:
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	c := crawler(b, nil, srv.URL)
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	got, err := c.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(got, "/fail;sess=1") {
+		t.Errorf("found = %v: an unauthenticated crawl must keep the path as it always did", got)
+	}
+	// The line itself, not the error text after it (which carries the URL too).
+	if !slices.ContainsFunc(logs, func(l string) bool { return strings.HasPrefix(l, "discover: not following links of /fail;sess=1: ") }) {
+		t.Errorf("logs = %q, want the path unredacted", logs)
+	}
+	for _, l := range logs {
+		if strings.Contains(l, "dropped") {
+			t.Errorf("a signed-out crawl printed a drop summary: %q", l)
+		}
+	}
+}
+
+// Discovered paths become test ids in reports, baselines and issues: signed
+// in, a token in a link must not reach them. Signed out they stay as they were.
+func TestSignedInCrawlCleansDiscoveredPaths(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>login</body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
+		if r.URL.Path == "/" {
+			for _, l := range []string{"/a;jsessionid=Q", "/b#/home#access_token=X", "/c#/x?y=1&z=2", "/d#/cb&access_token=X",
+				"/cb/token=abc", "/e#/access_token=X&token_type=bearer", "/sig=1f/f", "/ok"} {
+				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+			}
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	got, err := crawler(b, authFor(t, b, srv.URL, true), srv.URL).Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/", "/a", "/b#/home", "/c#/x", "/d#/cb", "/ok"}
+	if !slices.Equal(got, want) {
+		t.Errorf("found = %v, want %v", got, want)
+	}
+	for _, p := range got {
+		for _, secret := range []string{"jsessionid", "access_token", "token=", "y=1", "sig="} {
+			if strings.Contains(p, secret) {
+				t.Errorf("%q carries %q into a test id", p, secret)
+			}
+		}
 	}
 }

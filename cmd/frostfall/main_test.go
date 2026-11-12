@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/aquia-inc/frostfall/internal/config"
 )
 
 // runCaptured runs the CLI and returns its exit code and what it wrote to
@@ -97,5 +99,72 @@ func TestBaseURLTrailingSlashIsTrimmed(t *testing.T) {
 	}
 	if len(paths) == 0 || !strings.Contains(strings.Join(paths, " "), "/p") {
 		t.Errorf("paths = %v, want /p requested", paths)
+	}
+}
+
+// With auth, a test whose url: is on another origin would be sent the
+// session's cookies and escape the guard: a config error (exit 2) before a
+// browser starts, unless it opts out with auth: false.
+func TestCrossOriginURLTestWithAuthIsAConfigError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	_, port, _ := strings.Cut(strings.TrimPrefix(srv.URL, "http://"), ":")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"cookies":[],"origins":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgYAML := func(testAuth string) string {
+		return "version: 1\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n  - id: local\n    url: http://localhost:" + port + "/\n" + testAuth
+	}
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(cfgYAML("")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 127.0.0.1 and localhost are different origins, and different cookie hosts.
+	code, stderr := runCaptured(t, "--config", cfg, "--base-url", srv.URL, "--no-screenshots", "--baseline", "none")
+	if code != exitBadConfig {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitBadConfig, stderr)
+	}
+	if !strings.Contains(stderr, `test "local"`) || !strings.Contains(stderr, "auth: false") {
+		t.Errorf("stderr = %q, want the test named and auth: false suggested", stderr)
+	}
+	if err := os.WriteFile(cfg, []byte(cfgYAML("    auth: false\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if testing.Short() {
+		return
+	}
+	if code, stderr := runCaptured(t, "--config", cfg, "--base-url", srv.URL, "--no-screenshots", "--baseline", "none"); code == exitBadConfig {
+		t.Errorf("auth: false did not opt the test out: %s", stderr)
+	}
+}
+
+func TestDiscoverAuthWarning(t *testing.T) {
+	load := func(auth, discover string) *config.Config {
+		cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+		body := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n" + auth + discover
+		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := config.Load(cfg, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	setup := "auth:\n  signedIn: \"#in\"\n  setup:\n    path: /login\n    steps:\n      - click: a\n"
+	if w := discoverAuthWarning(load(setup+"  reuse: false\n", "discover:\n  maxPages: 7\n")); !strings.Contains(w, "once per crawled page") || !strings.Contains(w, "(7)") {
+		t.Errorf("reuse false: warning = %q", w)
+	}
+	if w := discoverAuthWarning(load(setup+"  reuse: false\n", "")); !strings.Contains(w, "(100)") {
+		t.Errorf("default maxPages: warning = %q", w)
+	}
+	if w := discoverAuthWarning(load(setup, "")); w != "" {
+		t.Errorf("reuse true warned: %q", w)
+	}
+	if w := discoverAuthWarning(load("", "")); w != "" {
+		t.Errorf("no auth warned: %q", w)
 	}
 }

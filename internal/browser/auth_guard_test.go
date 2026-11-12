@@ -25,6 +25,21 @@ func allowing(origins ...string) string {
 	return "  allowedOrigins: [" + strings.Join(q, ", ") + "]\n"
 }
 
+// openUnguarded opens url with a's state seeded and no landing check, to
+// observe what the seed does on an origin the guard would refuse.
+func openUnguarded(t *testing.T, b *Browser, a *Auth, url string) *Session {
+	t.Helper()
+	s, err := b.open(a.defaults.Viewport, 8*time.Second, a.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	if err := s.navigate(url, "load", 0); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func authWith(t *testing.T, b *Browser, app *authApp, authYAML string) (*Auth, error) {
 	t.Helper()
 	cfg := loadAuthConfig(t, app.URL, authYAML)
@@ -80,9 +95,12 @@ func TestSetupMustEndBackOnTheApp(t *testing.T) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
 	}
-	// Naming the provider lets the flow pass through it, not end on it.
-	if _, err := authWith(t, b, app, flow+allowing(idp.URL)); !errors.Is(err, ErrLoginRedirect) {
-		t.Errorf("a flow ending on an allowed origin passed: err = %v", err)
+	// Naming the provider lets the flow pass through it, not end on it. The
+	// provider's page carries the marker, so only the origin check can refuse
+	// it, and the message must say that is what did.
+	_, err = authWith(t, b, app, flow+allowing(idp.URL))
+	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "ended on "+idp.URL) {
+		t.Errorf("a flow ending on an allowed origin was not refused for its origin: err = %v", err)
 	}
 }
 
@@ -114,12 +132,7 @@ func TestStorageCapturedForAllowedOriginsVisited(t *testing.T) {
       - waitFor: "[data-testid=app-shell]"
 `
 	idpValue := func(a *Auth) string {
-		cfg := loadAuthConfig(t, app.URL, flow)
-		s, err := b.NewAuthSession(a, idp.URL+"/idp-probe", cfg.Defaults.Viewport, "load", 0, 8*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer s.Close()
+		s := openUnguarded(t, b, a, idp.URL+"/idp-probe")
 		raw, err := s.Eval(`() => document.getElementById('t').textContent`)
 		if err != nil {
 			t.Fatal(err)
@@ -245,7 +258,7 @@ func TestSetupSuccessIsChecked(t *testing.T) {
 	b := launch(t)
 
 	t.Run("ends on the login page", func(t *testing.T) {
-		_, err := authWith(t, b, app, "  setup:\n    path: /login\n    steps:\n      - waitFor: \"#email\"\n")
+		_, err := authWith(t, b, app, "  setup:\n    path: /login\n    steps:\n      - waitFor: \"#email\"\n  loginPath: /login\n")
 		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "still on the login page /login") {
 			t.Errorf("err = %v, want a setup that never logged in to fail", err)
 		}
@@ -263,7 +276,7 @@ func TestSetupSuccessIsChecked(t *testing.T) {
 	})
 	t.Run("a flow that leaves nothing behind warns even when not verbose", func(t *testing.T) {
 		var warns []string
-		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /probe\n    steps:\n      - waitFor: \"#t\"\n  loginPath: /login\n")
+		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /login\n    steps:\n      - goto: /probe\n      - waitFor: \"#t\"\n  loginPath: /login\n")
 		_, err := NewAuth(b, cfg, app.URL, AuthOptions{Warn: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }})
 		if err != nil {
 			t.Fatal(err)
@@ -339,10 +352,10 @@ func TestNoQueryTokensInMessagesOrLogs(t *testing.T) {
 	})
 	t.Run("navigation failure", func(t *testing.T) {
 		lines = nil
-		dead := newAuthApp(t)
-		cfg := loadAuthConfig(t, dead.URL, tokenPath)
-		dead.Close()
-		_, err := NewAuth(b, cfg, dead.URL, AuthOptions{Log: record})
+		// /drop answers the signed-out probe's / normally but hangs up on the
+		// setup page, so it is setup's own navigation that fails.
+		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /drop?token="+tok+"&x=1\n    steps:\n      - click: \"#go\"\n")
+		_, err := NewAuth(b, cfg, app.URL, AuthOptions{Log: record})
 		if err == nil {
 			t.Fatal("want a navigation failure")
 		}
@@ -407,7 +420,7 @@ func TestCloseDisposesTheContext(t *testing.T) {
 // The login route is a path on the app's origin. The same path on another
 // origin is not it, and a test that asks for that other page is not asking
 // for the app's login page.
-func TestLoginRouteIsScopedToTheAppOrigin(t *testing.T) {
+func TestRedirectIntoTheAppLoginPageFromAnotherOriginFails(t *testing.T) {
 	app, other := newAuthApp(t), newAuthApp(t)
 	other.loginTo = app.URL // other.URL/login sends the browser to the app's login page
 	b := launch(t)
@@ -432,8 +445,8 @@ func TestSignedInMarkerIsRequiredOnEveryLanding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// /idp-end is neither the login route (none is named) nor marked.
-	_, err = openAuthed(t, b, a, cfg, app.URL, "/idp-end")
+	// /idp-probe is neither the login route (none is named) nor marked.
+	_, err = openAuthed(t, b, a, cfg, app.URL, "/idp-probe")
 	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), `signedIn selector "#in"`) {
 		t.Errorf("err = %v, want the missing marker reported", err)
 	}
@@ -444,44 +457,34 @@ func TestSignedInMarkerIsRequiredOnEveryLanding(t *testing.T) {
 	s.Close()
 }
 
-// A page on the login route that carries the marker is a configuration
-// error to be loud about, not a pass.
-func TestLoginRouteStillFailsWhenMarked(t *testing.T) {
+// A marker that is also on the login path cannot tell signed in from signed
+// out: the signed-out probe refuses the config before any test runs.
+func TestMarkedLoginPathIsRefusedByTheProbe(t *testing.T) {
 	app := newAuthApp(t)
 	b := launch(t)
-	// /probe is marked; naming it the login route makes landing there a failure
-	// for any test that did not ask for it, marker or not.
+	// /probe carries the marker.
 	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n  loginPath: /probe\n")
-	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := openAuthed(t, b, a, cfg, app.URL, "/probe"); err != nil {
-		t.Fatalf("a test about the login route itself must be allowed there: %v", err)
-	}
-	// A sibling that lands there by redirect is not allowed.
-	app.bounceTo = "" // /bounce redirects to bounceTo+"/probe"; empty bounceTo is the app's own /probe
-	if _, err := openAuthed(t, b, a, cfg, app.URL, "/bounce"); !errors.Is(err, ErrLoginRedirect) {
-		t.Errorf("err = %v, want the redirect onto the login route caught", err)
+	_, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "login path") {
+		t.Fatalf("err = %v, want the login path probe to refuse the marker", err)
 	}
 }
 
-// An explicit empty loginPath says there is no login URL: nothing is the login
-// route, and a test at the setup path is not exempt from the marker.
-func TestEmptyLoginPathMeansNoLoginRoute(t *testing.T) {
+// With no loginPath there is no login route: nothing is ever "on" it, and the
+// marker alone catches the unmarked login page.
+func TestNoLoginPathMeansNoLoginRoute(t *testing.T) {
 	app := newAuthApp(t)
 	b := launch(t)
-	cfg := loadAuthConfig(t, app.URL, setupYAML+"  loginPath: \"\"\n")
+	cfg := loadAuthConfig(t, app.URL, setupYAML) // the setup path is not a login path
 	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
 	if err != nil {
 		t.Fatalf("a setup ending signed in failed: %v", err)
 	}
 	if a.loginKey != "" {
-		t.Errorf("login key = %q, want none", a.loginKey)
+		t.Errorf("login key = %q, want none: setup.path is not a default login path", a.loginKey)
 	}
-	// The login page is unmarked, so with no login route it is caught by the
-	// marker alone.
-	if _, err := openAuthed(t, b, a, cfg, app.URL, "/login"); !errors.Is(err, ErrLoginRedirect) {
+	_, err = openAuthed(t, b, a, cfg, app.URL, "/login")
+	if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "signedIn selector") {
 		t.Errorf("err = %v, want the unmarked login page caught by the marker", err)
 	}
 }
@@ -530,5 +533,63 @@ func TestNavigationErrorsAreUnredactedWithoutAuth(t *testing.T) {
 	_, err := b.NewSession(dead.URL+"/x?keep=1", config.Viewport{Width: 800, Height: 600}, "load", 0, 5*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "/x?keep=1") {
 		t.Errorf("err = %v, want the URL printed as it always was", err)
+	}
+}
+
+// The marker must not match a page with no session: loading the app with
+// none, the run learns that before it scans anything.
+func TestSignedOutProbeRefusesAMarkerThatMatchesWithoutASession(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	state := "  storageState: " + stateFile(t, app, "-1", true) + "\n"
+
+	t.Run("the base URL", func(t *testing.T) {
+		// The root renders a <main> signed in or out: the in-place login case.
+		cfg := loadAuthConfig(t, app.URL, state+"  signedIn: main\n")
+		_, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "also matches the base URL") {
+			t.Errorf("err = %v, want the marker refused for matching with no session", err)
+		}
+	})
+	t.Run("the login path", func(t *testing.T) {
+		cfg := loadAuthConfig(t, app.URL, state+"  loginPath: /login\n  signedIn: \"#email\"\n") // only the login form has it
+		_, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "login path") {
+			t.Errorf("err = %v, want the login path probe to refuse the marker", err)
+		}
+	})
+	t.Run("the setup page before the steps", func(t *testing.T) {
+		// /probe is public and marked, so the end-of-setup check alone would pass
+		// a login that never happened.
+		cfg := loadAuthConfig(t, app.URL, "  setup:\n    path: /probe\n    steps:\n      - waitFor: \"#t\"\n")
+		_, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "already matches the setup page") {
+			t.Errorf("err = %v, want the marker refused on the setup page", err)
+		}
+	})
+	t.Run("a good marker passes", func(t *testing.T) {
+		cfg := loadAuthConfig(t, app.URL, state+"  loginPath: /login\n")
+		if _, err := NewAuth(b, cfg, app.URL, AuthOptions{}); err != nil {
+			t.Errorf("a marker only signed-in pages render was refused: %v", err)
+		}
+	})
+}
+
+// An auth: false test belongs to a run with auth: its URLs are still printed
+// without their secrets, though it gets no session and no guard.
+func TestAnonymousSessionKeepsTheRunsRedaction(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n")
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.NewAuthSession(a.Anonymous(), app.URL+"/drop?token=SECRETTOK123", cfg.Defaults.Viewport, "load", 0, 5*time.Second)
+	if err == nil {
+		t.Fatal("want a navigation failure")
+	}
+	if strings.Contains(err.Error(), "SECRETTOK123") {
+		t.Errorf("an auth: false test printed a secret: %v", err)
 	}
 }
