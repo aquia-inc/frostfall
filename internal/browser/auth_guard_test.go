@@ -693,10 +693,94 @@ func TestProbeCoverageAndWarnings(t *testing.T) {
 			t.Errorf("the probe printed a secret: %v", err)
 		}
 	})
+	t.Run("a late marker is waited for on every page, not only the root", func(t *testing.T) {
+		_, err := probeWarnings(t, b, app, state, "/late")
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "the first test that uses auth") {
+			t.Errorf("err = %v, want the late marker caught on the first test's page", err)
+		}
+	})
+	t.Run("the first test as an absolute url", func(t *testing.T) {
+		_, err := probeWarnings(t, b, app, state, app.URL+"/probe")
+		if !errors.Is(err, ErrLoginRedirect) || !strings.Contains(err.Error(), "the first test that uses auth") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("a non-root page that bounces warns for that page", func(t *testing.T) {
+		bouncing := newAuthApp(t)
+		bouncing.bounceTo = idp.URL
+		warns, err := probeWarnings(t, b, bouncing, "  storageState: "+stateFile(t, bouncing, "-1", true)+"\n", "/bounce")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(warns) != 1 || !strings.Contains(warns[0], "the first test that uses auth") || !strings.Contains(warns[0], idp.URL) {
+			t.Errorf("warnings = %q, want one naming the bounced first test and where it went", warns)
+		}
+	})
+	t.Run("several pages that bounce are one warning", func(t *testing.T) {
+		gated := newAuthApp(t)
+		gated.rootTo, gated.bounceTo = idp.URL, idp.URL
+		warns, err := probeWarnings(t, b, gated, "  storageState: "+stateFile(t, gated, "-1", true)+"\n  loginPath: /bounce\n", "/bounce?x=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(warns) != 2 || !strings.Contains(warns[0], "3 probed pages") || !strings.Contains(warns[1], "no page loaded signed out") {
+			t.Errorf("warnings = %q, want one folded line and the unverified-marker line", warns)
+		}
+	})
+	t.Run("warnings already collected survive a later error", func(t *testing.T) {
+		gated := newAuthApp(t)
+		gated.rootTo = idp.URL
+		warns, err := probeWarnings(t, b, gated, "  storageState: "+stateFile(t, gated, "-1", true)+"\n  loginPath: /drop\n", "")
+		if err == nil {
+			t.Fatal("want the failing login path to stop the probe")
+		}
+		if len(warns) == 0 || !strings.Contains(warns[0], "not the app's origin") {
+			t.Errorf("warnings = %q, want the bounced root said before the error", warns)
+		}
+	})
 	t.Run("a good marker raises no warnings", func(t *testing.T) {
 		warns, err := probeWarnings(t, b, app, state+"  loginPath: /login\n", "/app")
 		if err != nil || len(warns) != 0 {
 			t.Errorf("err = %v, warnings = %q", err, warns)
 		}
 	})
+}
+
+// An identity provider's page that keeps a request open must not run the probe
+// out its timeout: the probe loads with load, whatever readiness is configured.
+func TestProbeDoesNotWaitForAnIdpToGoIdle(t *testing.T) {
+	app, idp := newAuthApp(t), newAuthApp(t)
+	app.rootTo, app.rootPath = idp.URL, "/keepalive"
+	b := launch(t)
+	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n")
+	cfg.Defaults.Timeout = config.Duration(8 * time.Second)
+	cfg.Defaults.WaitFor = "networkIdle"
+	var warns []string
+	start := time.Now()
+	if _, err := NewAuth(b, cfg, app.URL, AuthOptions{Warn: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }}); err != nil {
+		t.Fatalf("an idle-less identity provider failed the probe: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("the probe took %s: it waited for the provider's page to go idle", d)
+	}
+	if len(warns) == 0 || !strings.Contains(strings.Join(warns, "\n"), "not the app's origin") {
+		t.Errorf("warnings = %q", warns)
+	}
+}
+
+// A provider page that never finishes loading is still just a page the marker
+// could not be checked on: the error after landing off-origin is a warning.
+func TestProbeTurnsAnOffOriginTimeoutIntoAWarning(t *testing.T) {
+	app, idp := newAuthApp(t), newAuthApp(t)
+	app.rootTo, app.rootPath = idp.URL, "/stall"
+	b := launch(t)
+	cfg := loadAuthConfig(t, app.URL, "  storageState: "+stateFile(t, app, "-1", true)+"\n")
+	cfg.Defaults.Timeout = config.Duration(3 * time.Second)
+	var warns []string
+	if _, err := NewAuth(b, cfg, app.URL, AuthOptions{Warn: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }}); err != nil {
+		t.Fatalf("a provider page that never loaded failed the run: %v", err)
+	}
+	if !strings.Contains(strings.Join(warns, "\n"), "not the app's origin") {
+		t.Errorf("warnings = %q, want the bounce said", warns)
+	}
 }

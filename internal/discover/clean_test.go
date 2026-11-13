@@ -46,6 +46,12 @@ func TestCleanAuthPath(t *testing.T) {
 		{"/s/dGhpc0lzQVNlY3JldFRva2VuMTIzNDU2", "", false},
 		{"/s/Zm9vYmFyQmF6UXV4MTIzNDU2Nzg5", "", false},
 		{"/#/cb/dGhpc0lzQVNlY3JldFRva2VuMTIzNDU2", "", false},
+		// A JWT whose parts use - and _, and a token right after a # that is not a route.
+		{"/cb/eyJhbGci-OiJIUzI1_NiJ9.eyJzdWIi-OiIxMjM0.SflKxwRJSM_eKKF2QT4", "", false},
+		{"/a#dGhpc0lzQVNlY3JldFRva2VuMTIzNDU2", "", false},
+		// 32 hex characters is a secret, 31 letters-only is a name.
+		{"/h/abcdefabcdefabcdefabcdefabcdefab", "", false},
+		{"/h/abcdefabcdefabcdefabcdefabcdefa", "/h/abcdefabcdefabcdefabcdefabcdefa", true},
 		// Names and slugs are kept.
 		{"/docs/release-notes-2024-01-15-summary", "/docs/release-notes-2024-01-15-summary", true},
 		{"/docs/internationalization-guidelines", "/docs/internationalization-guidelines", true},

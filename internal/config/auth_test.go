@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -328,15 +329,39 @@ func TestCheckTestOriginsDefaultPorts(t *testing.T) {
 	}
 }
 
-func TestTestPathMustStartWithASlash(t *testing.T) {
-	for path, ok := range map[string]bool{"/": true, "/a/b": true, "/#/route": true, "dashboard": false, "./a": false, "?q=1": false} {
+// Every form of path that worked before still loads: a path is joined to the
+// base URL, not required to look a certain way.
+func TestOddTestPathsStillLoad(t *testing.T) {
+	for _, path := range []string{"/", "/a/b", "/#/route", "index.html", "?a=1", "#/route", "@evil.example/"} {
 		yml := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: \"" + path + "\"\n"
-		_, err := Load(writeConfigIn(t, t.TempDir(), yml), "")
-		if (err == nil) != ok {
-			t.Errorf("path %q: err = %v, want ok=%v", path, err, ok)
+		if _, err := Load(writeConfigIn(t, t.TempDir(), yml), ""); err != nil {
+			t.Errorf("path %q: %v", path, err)
 		}
-		if err != nil && !strings.Contains(err.Error(), "path must start with /") {
-			t.Errorf("path %q: err = %v", path, err)
+	}
+}
+
+func TestJoinURL(t *testing.T) {
+	cases := []struct{ base, path, want string }{
+		{"http://app", "/x", "http://app/x"},
+		{"http://app/", "/x", "http://app/x"},
+		{"http://app/base", "/x", "http://app/base/x"},
+		{"http://app/", "index.html", "http://app/index.html"},
+		{"http://app", "index.html", "http://app/index.html"},
+		{"http://app", "?a=1", "http://app?a=1"},
+		{"http://app/", "?a=1", "http://app?a=1"},
+		{"http://app", "#/route", "http://app#/route"},
+		{"http://app", "/#/route", "http://app/#/route"},
+		{"http://app", "@evil.example/", "http://app/@evil.example/"},
+		{"http://app:8080/", "", "http://app:8080"},
+	}
+	for _, tc := range cases {
+		if got := JoinURL(tc.base, tc.path); got != tc.want {
+			t.Errorf("JoinURL(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
 		}
+	}
+	// A path that looks like userinfo stays a path on the same host.
+	u, err := url.Parse(JoinURL("http://app", "@evil.example/"))
+	if err != nil || u.Host != "app" || u.User != nil {
+		t.Errorf("host = %q, user = %v, err = %v: the path was read as userinfo", u.Host, u.User, err)
 	}
 }

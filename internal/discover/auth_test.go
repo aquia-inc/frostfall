@@ -465,9 +465,17 @@ func TestSignedInCrawlCleansDiscoveredPaths(t *testing.T) {
 	}
 	t.Cleanup(b.Close)
 
-	got, err := crawler(b, authFor(t, b, srv.URL, true), srv.URL).Run()
+	c := crawler(b, authFor(t, b, srv.URL, true), srv.URL)
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	got, err := c.Run()
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Three links look like they carry a credential. Saying so makes a missing
+	// UUID subtree explainable.
+	if !slices.Contains(logs, "discover: skipped 3 links that looked like they carry credentials") {
+		t.Errorf("logs = %q, want the skipped count", logs)
 	}
 	want := []string{"/", "/a", "/b#/home", "/c#/x", "/d#/cb", "/ok"}
 	if !slices.Equal(got, want) {

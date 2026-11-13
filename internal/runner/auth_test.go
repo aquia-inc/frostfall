@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/config"
 	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/engine/axe"
+	"github.com/aquia-inc/frostfall/internal/fingerprint"
 )
 
 // runWithAuth executes one test against a site whose /app needs a session
@@ -36,6 +39,11 @@ type runOpts struct {
 	// after runs when a check that reports on the page has just finished,
 	// before its landing re-check (see Runner.afterOp).
 	after func(s *browser.Session, op, base string)
+	// seen collects each request's URI; baseSuffix is appended to the base URL
+	// the runner gets; shots turns screenshots on.
+	seen       *[]string
+	baseSuffix string
+	shots      string
 }
 
 func runTests(t *testing.T, withSession bool, testsYAML string, log func(string, ...any)) error {
@@ -51,7 +59,17 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}
+	var seenMu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if o.seen != nil {
+			seenMu.Lock()
+			*o.seen = append(*o.seen, r.URL.RequestURI())
+			seenMu.Unlock()
+		}
+		if r.URL.Path == "/linkpage" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i><a href="/dl?token=Q7xK2pLm9Zw">download</a></main></body></html>`)
+			return
+		}
 		if r.URL.Path == "/app" {
 			if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" {
 				http.Redirect(w, r, "/login", http.StatusFound)
@@ -96,7 +114,7 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 	if o.engine != nil {
 		eng = o.engine
 	}
-	r := &Runner{Browser: b, Engine: eng, Config: cfg, BaseURL: srv.URL, Auth: a, Verbose: o.log != nil, Log: o.log}
+	r := &Runner{Browser: b, Engine: eng, Config: cfg, BaseURL: srv.URL + o.baseSuffix, Auth: a, ScreenshotDir: o.shots, Verbose: o.log != nil, Log: o.log}
 	if o.after != nil {
 		r.afterOp = func(s *browser.Session, op string) { o.after(s, op, srv.URL) }
 	}
@@ -305,5 +323,76 @@ func TestReportedPageURLsFollowTheAuthConfig(t *testing.T) {
 	}
 	if !strings.HasSuffix(plain.Results[0].PageURL, "/plain?keep=1") {
 		t.Errorf("without auth PageURL = %q, want it unchanged", plain.Results[0].PageURL)
+	}
+}
+
+// targetEngine reports one violation with a fixed selector.
+type targetEngine struct{ target string }
+
+func (targetEngine) Name() string    { return "target" }
+func (targetEngine) Version() string { return "0" }
+func (e targetEngine) Audit(context.Context, engine.Page, engine.ScanOptions) ([]engine.Violation, error) {
+	return []engine.Violation{{RuleID: "image-alt", Impact: engine.Critical, Target: e.target}}, nil
+}
+
+// axe anchors on a short href, so a download link's token lands in the selector
+// and from there in the fingerprint, the baseline and every report. With auth
+// the selector is scrubbed first; without it nothing changes, fingerprint
+// included.
+func TestSelectorTokensAreScrubbedWithAuthOnly(t *testing.T) {
+	const raw = `main > a[href="/dl?token=Q7xK2pLm9Zw"]`
+	tests := "  - id: dl\n    path: /linkpage\n"
+
+	run, err := runSite(t, runOpts{withSession: true, tests: tests, engine: targetEngine{raw}, shots: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := run.Results[0]
+	for _, field := range []string{res.Target, res.StableTarget} {
+		if strings.Contains(field, "Q7xK2pLm9Zw") || strings.Contains(field, "token") {
+			t.Errorf("a token reached %q", field)
+		}
+	}
+	const scrubbed = `main > a[href="/dl"]`
+	if want := fingerprint.Fingerprint("dl", "initial", "image-alt", scrubbed); res.Fingerprint != want {
+		t.Errorf("fingerprint = %s, want the scrubbed selector's %s", res.Fingerprint, want)
+	}
+	// The element is still found by its real selector for the screenshot.
+	if res.ScreenshotPath == "" {
+		t.Error("no screenshot: the scrubbed selector was used to find the element")
+	}
+
+	plain, err := runSite(t, runOpts{noAuth: true, tests: tests, engine: targetEngine{raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := plain.Results[0]
+	if p.Target != raw {
+		t.Errorf("without auth the target = %q, want it untouched", p.Target)
+	}
+	if want := fingerprint.Fingerprint("dl", "initial", "image-alt", raw); p.Fingerprint != want {
+		t.Errorf("without auth the fingerprint = %s, want the unchanged scheme's %s", p.Fingerprint, want)
+	}
+}
+
+// A path is joined to the base URL, not required to start with a slash: the
+// forms that worked before still reach the same URLs, and a base's trailing
+// slash does not double up.
+func TestTestPathsAreJoinedToTheBase(t *testing.T) {
+	var seen []string
+	tests := "  - id: a\n    path: index.html\n  - id: b\n    path: \"?a=1\"\n  - id: c\n    path: \"#/route\"\n" +
+		"  - id: d\n    path: \"@evil.example/\"\n  - id: e\n    path: /plain\n"
+	if _, err := runSite(t, runOpts{noAuth: true, tests: tests, seen: &seen, baseSuffix: "/"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/index.html", "/?a=1", "/@evil.example/", "/plain"} {
+		if !slices.Contains(seen, want) {
+			t.Errorf("requests = %q, want %q among them", seen, want)
+		}
+	}
+	for _, got := range seen {
+		if strings.HasPrefix(got, "//") {
+			t.Errorf("request %q: a slash was doubled", got)
+		}
 	}
 }

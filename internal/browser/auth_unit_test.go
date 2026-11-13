@@ -103,6 +103,12 @@ func TestRedactURL(t *testing.T) {
 		"/login%3Ftoken=X":                            "/login",
 		"/x%23frag":                                   "/x",
 		"/login%3Ftoken=X;jsessionid=Y%23z":           "/login",
+		// A path segment that looks like a secret is masked; names are kept.
+		"http://h/dl/dGhpc0lzQVNlY3JldFRva2VuMTIzNDU2/x":     "http://h/dl/[redacted]/x",
+		"/o/0123456789abcdef0123456789abcdef":                "/o/[redacted]",
+		"/cb/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0.SflKxwRJ": "/cb/[redacted]",
+		"/#/cb/dGhpc0lzQVNlY3JldFRva2VuMTIzNDU2":             "/#/cb/[redacted]",
+		"/docs/release-notes-2024-01-15-summary":             "/docs/release-notes-2024-01-15-summary",
 	} {
 		if got := RedactURL(in); got != want {
 			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)

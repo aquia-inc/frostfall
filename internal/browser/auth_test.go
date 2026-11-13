@@ -33,7 +33,7 @@ type authApp struct {
 	rootCookie             string
 	// rootTo redirects /, rootDrop hangs up on it, rootLate draws #late on it
 	// a second after load, signed in or not.
-	rootTo             string
+	rootTo, rootPath   string // rootPath is where on rootTo, "/idp-probe" by default
 	rootDrop, rootLate bool
 }
 
@@ -114,6 +114,22 @@ func newAuthApp(t *testing.T) *authApp {
 			conn.Close()
 		}
 	})
+	// /late draws the marker a second after load, signed in or not.
+	mux.HandleFunc("/late", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>late</title></head><body><script>
+			setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<i id="in"></i>'), 1000)</script></body></html>`)
+	})
+	// /keepalive is a page that keeps a request open for good (an identity
+	// provider's long poll); /stall never finishes loading at all.
+	mux.HandleFunc("/keepalive", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>idp</title></head><body><script>fetch('/never')</script></body></html>`)
+	})
+	mux.HandleFunc("/never", func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	mux.HandleFunc("/stall", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>idp</title></head><body>partial`)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
 	mux.HandleFunc("/bounce", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, app.bounceTo+"/probe", http.StatusFound)
 	})
@@ -129,7 +145,11 @@ func newAuthApp(t *testing.T) *authApp {
 			return
 		}
 		if app.rootTo != "" {
-			http.Redirect(w, r, app.rootTo+"/idp-probe", http.StatusFound)
+			path := app.rootPath
+			if path == "" {
+				path = "/idp-probe"
+			}
+			http.Redirect(w, r, app.rootTo+path, http.StatusFound)
 			return
 		}
 		late := ""

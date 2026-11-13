@@ -35,6 +35,23 @@ func runCaptured(t *testing.T, args ...string) (int, string) {
 	return code, <-done
 }
 
+// runBoth is runCaptured that also returns stdout.
+func runBoth(t *testing.T, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	origOut, origErr := os.Stdout, os.Stderr
+	ro, wo, _ := os.Pipe()
+	re, we, _ := os.Pipe()
+	os.Stdout, os.Stderr = wo, we
+	outC, errC := make(chan string), make(chan string)
+	go func() { b, _ := io.ReadAll(ro); outC <- string(b) }()
+	go func() { b, _ := io.ReadAll(re); errC <- string(b) }()
+	code = run(args)
+	os.Stdout, os.Stderr = origOut, origErr
+	wo.Close()
+	we.Close()
+	return code, <-outC, <-errC
+}
+
 // The auth fixtures through the real entry point: a valid storage state
 // reaches the protected page and finds its planted violation (exit 1), and an
 // empty one is sent to the login page and must stop with exit 3 and say so,
@@ -174,7 +191,7 @@ func TestDiscoverAuthWarning(t *testing.T) {
 func authSite(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i>page</main></body></html>`)
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i>page<img src="x.png"></main></body></html>`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -240,5 +257,139 @@ func TestScanChecksOnlySelectedTestsForOrigins(t *testing.T) {
 	}
 	if code, stderr := runCaptured(t, "--config", cfg, "--id", "^ok$", "--no-screenshots", "--baseline", "none"); code != exitOK {
 		t.Errorf("filtered to the test that is fine: exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+}
+
+// Every output of a run whose config has auth, even one where nothing signs in,
+// is free of what the paths and the base URL carry: stdout, stderr (verbose),
+// the SARIF file and the HTML report.
+func TestSkippedAuthStillRedactsEveryOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	t.Chdir(t.TempDir())
+	cfg := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /p?token=SECRETTOK123\n    auth: false\n")
+	base := strings.Replace(srv.URL, "http://", "http://ciuser:S3cretBasicPW@", 1)
+	secrets := []string{"SECRETTOK123", "S3cretBasicPW"}
+	for _, format := range []string{"sarif", "html"} {
+		out := filepath.Join(t.TempDir(), "report."+format)
+		code, stdout, stderr := runBoth(t, "--config", cfg, "--base-url", base, "--verbose", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitOK {
+			t.Fatalf("%s: exit code = %d (stderr: %s)", format, code, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, text := range map[string]string{"stdout": stdout, "stderr": stderr, format + " report": string(report)} {
+			for _, secret := range secrets {
+				if strings.Contains(text, secret) {
+					t.Errorf("%s: %q reached the %s", format, secret, name)
+				}
+			}
+		}
+		if len(report) == 0 || !strings.Contains(string(report), "/p") {
+			t.Errorf("%s report is empty or lost the page", format)
+		}
+	}
+}
+
+// Without auth the base URL in the report is what it always was.
+func TestBaseURLInTheReportIsUnchangedWithoutAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte("version: 1\ndefaults:\n  waitFor: load\ntests:\n  - id: p\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	base := strings.Replace(srv.URL, "http://", "http://ciuser:S3cretBasicPW@", 1)
+	out := filepath.Join(dir, "r.html")
+	if code, _, stderr := runBoth(t, "--config", cfg, "--base-url", base, "--format", "html", "--output", out, "--no-screenshots", "--baseline", "none"); code != exitOK {
+		t.Fatalf("exit code = %d (stderr: %s)", code, stderr)
+	}
+	report, _ := os.ReadFile(out)
+	if !strings.Contains(string(report), "S3cretBasicPW") {
+		t.Error("without auth the report's Target changed: it must be byte-identical to before")
+	}
+}
+
+// The "cannot reach" line names the base URL; with auth it must not carry the
+// userinfo in it, and without auth it is as it always was.
+func TestCannotReachMessageRedactsOnlyWithAuth(t *testing.T) {
+	dir := t.TempDir()
+	withAuth := writeAuthConfig(t, "http://127.0.0.1:1", "  - id: a\n    path: /\n")
+	plain := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(plain, []byte("version: 1\ntests:\n  - id: a\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := "http://ciuser:S3cretBasicPW@127.0.0.1:1"
+	_, stderr := runCaptured(t, "--config", withAuth, "--base-url", base, "--no-screenshots")
+	if !strings.Contains(stderr, "cannot reach") || strings.Contains(stderr, "S3cretBasicPW") {
+		t.Errorf("with auth: stderr = %q", stderr)
+	}
+	_, stderr = runCaptured(t, "--config", plain, "--base-url", base, "--no-screenshots")
+	if !strings.Contains(stderr, "cannot reach "+base) {
+		t.Errorf("without auth: stderr = %q, want the line unchanged", stderr)
+	}
+}
+
+// --discover needs the session even when every explicit test says auth: false:
+// the crawl itself is signed in. The marker is on every page here, so the probe
+// that discovery brings back refuses it.
+func TestDiscoverSetsUpAuthEvenWhenNoExplicitTestUsesIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	t.Chdir(t.TempDir())
+	cfg := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /\n    auth: false\n")
+	if code, stderr := runCaptured(t, "--config", cfg, "--discover", "--no-screenshots", "--baseline", "none"); code != exitEnvironment {
+		t.Errorf("exit code = %d, want %d (stderr: %s)", code, exitEnvironment, stderr)
+	}
+}
+
+// The first test that uses auth is probed, whether it is written with a path or
+// a url:. Here the root has no marker and the test's page does.
+func TestFirstTestWithAURLIsProbed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marker := ""
+		if r.URL.Path == "/p" {
+			marker = `<i id="in"></i>`
+		}
+		fmt.Fprintf(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>%spage</main></body></html>`, marker)
+	}))
+	t.Cleanup(srv.Close)
+	t.Chdir(t.TempDir())
+	cfg := writeAuthConfig(t, srv.URL, "  - id: a\n    url: "+srv.URL+"/p\n")
+	code, stderr := runCaptured(t, "--config", cfg, "--no-screenshots", "--baseline", "none")
+	if code != exitEnvironment || !strings.Contains(stderr, "the first test that uses auth") {
+		t.Errorf("exit code = %d, stderr = %q, want the probe to refuse the marker on the test's page", code, stderr)
+	}
+}
+
+func TestValidateAppliesFiltersLikeARealRun(t *testing.T) {
+	cfg := writeAuthConfig(t, "http://127.0.0.1:9", "  - id: ok\n    path: /\n  - id: other\n    url: http://localhost:9/x\n")
+	// --path selects by path: the url: test has none, so it is not checked.
+	if code, stderr := runCaptured(t, "--config", cfg, "--validate", "--path", "^/$"); code != exitOK {
+		t.Errorf("--validate --path: exit code = %d, stderr = %q", code, stderr)
+	}
+	// A bad filter regex fails --validate the way it fails a run, with or without auth.
+	plain := filepath.Join(t.TempDir(), "frostfall.yml")
+	if err := os.WriteFile(plain, []byte("version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"--id", "--path"} {
+		code, stderr := runCaptured(t, "--config", plain, "--validate", flag, "(")
+		if code != exitBadConfig || !strings.Contains(stderr, flag+":") {
+			t.Errorf("%s ( : exit code = %d, stderr = %q, want the same error a run gives", flag, code, stderr)
+		}
 	}
 }
