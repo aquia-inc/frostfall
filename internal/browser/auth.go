@@ -40,53 +40,9 @@ const signedInWaitMax = 5 * time.Second
 // page.
 var logoutRe = regexp.MustCompile(`(?i)/(log|sign)[-_]?(out|off)\b`)
 
-var pathParamRe = regexp.MustCompile(`;[^/]*`)
-
-// maskSegments replaces each path segment that looks like a secret (a JWT, a
-// long hex string, a long opaque token: secrets.TokenLike) with [redacted].
-// Explicit paths are otherwise printed as written; a token in the path itself,
-// as opposed to its query, is what this catches.
-func maskSegments(p string) string {
-	segs := strings.Split(p, "/")
-	for i, seg := range segs {
-		if secrets.TokenLike(seg) {
-			segs[i] = "[redacted]"
-		}
-	}
-	return strings.Join(segs, "/")
-}
-
-// RedactURL reduces a URL to where it points, safe to print: userinfo, the
-// query, ;params on path segments (/login;jsessionid=...) and the fragment
-// are dropped. A hash route (#/users) is the page's identity in a hash-routed
-// app and is kept, but only up to the first '#', '?', '&' or '=' after it:
-// OAuth implicit flows put the token in exactly those places
-// (#/home#access_token=..., #/cb&access_token=...). A percent-encoded '?' or
-// '#' in the path is decoded by the parse, so it is cut the same way and
-// cannot smuggle a query past it. Setup paths and navigation targets are
-// printed in errors and logs, and any of those parts can carry a token or
-// credential. A URL that does not parse prints as a placeholder.
-func RedactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<unparsable url>"
-	}
-	path := u.Path
-	if i := strings.IndexAny(path, "?#"); i >= 0 {
-		path = path[:i]
-	}
-	out := maskSegments(pathParamRe.ReplaceAllString(path, ""))
-	if u.Host != "" {
-		out = u.Scheme + "://" + u.Host + out
-	}
-	if frag := u.Fragment; strings.HasPrefix(frag, "/") {
-		if i := strings.IndexAny(frag, "#?&="); i >= 0 {
-			frag = frag[:i]
-		}
-		out += "#" + maskSegments(pathParamRe.ReplaceAllString(frag, ""))
-	}
-	return out
-}
+// RedactURL reduces a URL to where it points, safe to print; see
+// secrets.RedactURL.
+func RedactURL(raw string) string { return secrets.RedactURL(raw) }
 
 // State is the session a test's context starts with: cookies, plus the
 // local and session storage of the origins that have any. It exists only in
@@ -160,7 +116,7 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 	}
 	bu, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("auth: base url: %w", err)
+		return nil, fmt.Errorf("auth: base url %s is not a valid URL", RedactURL(baseURL))
 	}
 	origin, err := originOf(baseURL)
 	if err != nil {
@@ -185,7 +141,7 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 		a.loginPath = route
 		lu, err := url.Parse(route)
 		if err != nil {
-			return nil, fmt.Errorf("auth: login path: %w", err)
+			return nil, fmt.Errorf("auth: login path %s is not a valid URL path", RedactURL(route))
 		}
 		a.loginDisplay = RedactURL(route)
 		// The login path is relative to the base URL, so an app served under a
@@ -377,6 +333,11 @@ func (a *Auth) probeOne(b *Browser, url string) probeResult {
 	// Where the page ended is read before anything else can go wrong, and a
 	// page that is off the app's origin is a warning whatever the error was.
 	landed, lerr := s.landedLoosely()
+	if lerr != nil && navErr == nil {
+		// The page loaded, but its main thread is busy: the quick read gave up,
+		// and the page is a valid one of the app's. Read again with the full budget.
+		landed, lerr = s.landedAt()
+	}
 	if lerr == nil && (landed.Scheme == "http" || landed.Scheme == "https") {
 		// Only a real page counts: a failed navigation leaves chrome-error://
 		// behind, and that is the failure, not a bounce.
@@ -396,12 +357,15 @@ func (a *Auth) probeOne(b *Browser, url string) probeResult {
 // landedLoosely is landedAt that still works after the page's own time budget
 // ran out, which is when the answer matters most.
 func (s *Session) landedLoosely() (*url.URL, error) {
-	res, err := s.raw.Timeout(3 * time.Second).Eval(`() => location.href`)
+	p := s.raw.Timeout(3 * time.Second)
+	defer p.CancelTimeout()
+	res, err := p.Eval(`() => location.href`)
 	if err != nil {
-		return nil, fmt.Errorf("reading landing url: %w", err)
+		return nil, errors.New("could not read the landing URL")
 	}
-	return url.Parse(res.Value.Str())
+	return parseLanding(res.Value.Str())
 }
+
 func (a *Auth) logf(format string, args ...any) {
 	if a.opts.Log != nil {
 		a.opts.Log(format, args...)
@@ -600,7 +564,17 @@ func (s *Session) landedAt() (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading landing url: %w", err)
 	}
-	return url.Parse(res.Value.Str())
+	return parseLanding(res.Value.Str())
+}
+
+// parseLanding parses a page's location. A url.Error would carry the whole URL
+// into the message, token and all, so the error says nothing about it.
+func parseLanding(href string) (*url.URL, error) {
+	u, err := url.Parse(href)
+	if err != nil {
+		return nil, errors.New("could not parse the landing URL")
+	}
+	return u, nil
 }
 
 func (s *Session) signedInWait() time.Duration { return min(signedInWaitMax, s.timeout/4) }
@@ -650,7 +624,8 @@ func RouteKey(u *url.URL) string { return config.RouteKey(u) }
 func originOf(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		// A url.Error carries the whole URL, query and userinfo included.
+		return "", fmt.Errorf("%s is not a valid URL", RedactURL(raw))
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", fmt.Errorf("%q is not an http(s) URL", RedactURL(raw))

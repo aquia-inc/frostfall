@@ -39,7 +39,7 @@ type Crawler struct {
 func (c *Crawler) Run() ([]string, error) {
 	base, err := url.Parse(c.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parsing base url: %w", err)
+		return nil, fmt.Errorf("base url %s is not a valid URL", browser.RedactURL(c.BaseURL))
 	}
 	excludes := make([]*regexp.Regexp, 0, len(c.Options.Exclude))
 	for _, pat := range c.Options.Exclude {
@@ -62,13 +62,7 @@ func (c *Crawler) Run() ([]string, error) {
 	var clean func(string) (string, bool)
 	credentialLooking := map[string]bool{}
 	if c.Auth != nil {
-		clean = func(p string) (string, bool) {
-			cp, ok := cleanAuthPath(p)
-			if !ok {
-				credentialLooking[p] = true
-			}
-			return cp, ok
-		}
+		clean = cleanAuthPath
 	}
 
 	type node struct {
@@ -128,7 +122,7 @@ func (c *Crawler) Run() ([]string, error) {
 			}
 			continue
 		}
-		for _, p := range filterLinks(base, links, excludes, clean) {
+		for _, p := range filterLinks(base, links, excludes, clean, func(p string) { credentialLooking[p] = true }) {
 			shape := ShapeKey(p)
 			if !seen[p] && !seenShape[shape] {
 				seen[p] = true
@@ -226,14 +220,14 @@ func (c *Crawler) collectLinks(path string) ([]string, error) {
 // app into "/". Plain fragments and queries are dropped, trailing slashes
 // trimmed (except root). Sorted for deterministic queueing.
 func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []string {
-	return filterLinks(base, hrefs, excludes, nil)
+	return filterLinks(base, hrefs, excludes, nil, nil)
 }
 
 // filterLinks is FilterLinks with an optional clean step, run on each path
 // before the excludes and the dedupe see it, so that a ;param or a token
 // cannot slip a login page or a user's exclude past its regex, and two links
 // that differ only in a secret are one page. Nil leaves every path as it was.
-func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean func(string) (string, bool)) []string {
+func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean func(string) (string, bool), onSkip func(string)) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, href := range hrefs {
@@ -249,8 +243,14 @@ func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean
 		}
 		p := browser.RouteKey(u)
 		if clean != nil {
+			raw := p
 			var ok bool
 			if p, ok = clean(p); !ok {
+				// A link the user's own excludes would have removed anyway is not
+				// news about credentials.
+				if onSkip != nil && !excluded(raw, excludes) {
+					onSkip(raw)
+				}
 				continue
 			}
 		}

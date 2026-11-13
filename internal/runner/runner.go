@@ -344,6 +344,11 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	return results, transcripts, cov, nil
 }
 
+// signedIn reports whether t runs with the config's auth: there is an auth
+// block and the test has not opted out. Such a test sees account data, which
+// is what the scrubbing and masking of what it reports is for.
+func (r *Runner) signedIn(t config.Test) bool { return r.Auth != nil && t.UsesAuth() }
+
 // reports is whether a step produces findings or evidence from the page, as
 // opposed to driving it.
 func reports(st config.Step) bool {
@@ -409,7 +414,7 @@ func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label
 		return nil, nil
 	}
 	r.logf("test %s: expectFocus (%s)", t.ID, label)
-	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name})
+	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name, OmitValue: r.signedIn(t)})
 	if err != nil {
 		return nil, err
 	}
@@ -467,13 +472,16 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 	results := make([]Result, 0, len(violations))
 	for _, v := range violations {
 		// The raw selector finds the element for its screenshot; everything
-		// that is fingerprinted, stored or printed gets the scrubbed one. axe
-		// anchors on a whole href when it is short, so a download link's token
-		// ([href="/dl?token=..."]) would otherwise reach the baseline, SARIF and
-		// the reports. Without auth nothing is touched, and fingerprints are
-		// exactly what they always were.
+		// that is fingerprinted, stored or printed gets the scrubbed one: axe
+		// puts attribute values in selectors (a link's href, a field's value, a
+		// data-* token), and every one of them is dropped. This is for tests that
+		// use auth, which see account data. A test with auth: false, or a config
+		// without auth, is untouched and its fingerprints are exactly what they
+		// always were. For a signed-in test, elements that differ only in an
+		// attribute value now share a fingerprint, and the fingerprints differ
+		// from those of an unauthenticated run of the same page.
 		raw := v.Target
-		if r.Auth != nil {
+		if r.signedIn(t) {
 			v.Target = secrets.ScrubSelector(raw)
 		}
 		res := Result{

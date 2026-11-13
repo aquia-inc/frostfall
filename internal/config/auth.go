@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // Auth is the optional login block (DESIGN.md §7.5). Exactly one of Setup
@@ -209,15 +211,17 @@ func (c *Config) validateAuth() error {
 // (a path, query, credentials) is an error, since an origin that silently
 // dropped it would mean something other than what was written.
 func NormalizeOrigin(raw string) (string, error) {
+	// Errors print the value redacted: it can be a base URL with userinfo, and a
+	// url.Error would carry all of it.
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%q is not a valid URL", secrets.RedactURL(raw))
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", fmt.Errorf("%q is not an absolute http(s) origin", raw)
+		return "", fmt.Errorf("%q is not an absolute http(s) origin", secrets.RedactURL(raw))
 	}
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("%q has more than an origin: drop the path, query and credentials", raw)
+		return "", fmt.Errorf("%q has more than an origin (what follows the origin is not shown here): drop the path, query and credentials", secrets.RedactURL(raw))
 	}
 	return originOfURL(u), nil
 }
@@ -338,7 +342,7 @@ func (c *Config) CheckTestOrigins(baseURL string, tests []Test) error {
 	}
 	bu, err := url.Parse(baseURL)
 	if err != nil {
-		return fmt.Errorf("base url: %w", err)
+		return fmt.Errorf("base url %s is not a valid URL", secrets.RedactURL(baseURL))
 	}
 	base := originOfURL(bu)
 	for _, t := range tests {
