@@ -15,6 +15,7 @@ import (
 
 	"github.com/aquia-inc/frostfall/internal/browser"
 	"github.com/aquia-inc/frostfall/internal/config"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 type Crawler struct {
@@ -59,8 +60,15 @@ func (c *Crawler) Run() ([]string, error) {
 	// signed-in crawl cleans them before anything else looks at them. Signed
 	// out nothing is touched: the output stays as it always was.
 	var clean func(string) (string, bool)
+	credentialLooking := map[string]bool{}
 	if c.Auth != nil {
-		clean = cleanAuthPath
+		clean = func(p string) (string, bool) {
+			cp, ok := cleanAuthPath(p)
+			if !ok {
+				credentialLooking[p] = true
+			}
+			return cp, ok
+		}
 	}
 
 	type node struct {
@@ -129,6 +137,11 @@ func (c *Crawler) Run() ([]string, error) {
 			}
 		}
 	}
+	if c.Auth != nil && c.Log != nil && len(credentialLooking) > 0 {
+		// Whole subtrees of opaque ids (UUIDs, ObjectIds) look like tokens too, so
+		// say how many links were left out and why.
+		c.Log("discover: skipped %d links that looked like they carry credentials", len(credentialLooking))
+	}
 	if c.Auth != nil && c.Log != nil {
 		// Always said, zero included: a crawl that dropped nothing and one
 		// that was not told are different things to a reader.
@@ -138,59 +151,6 @@ func (c *Crawler) Run() ([]string, error) {
 }
 
 var pathParams = regexp.MustCompile(`;[^/]*`)
-
-// credentialMarks in a path say the link carries a secret in the path itself.
-// Matched case-insensitively as substrings, so they are blunt on purpose: a
-// page named /signature-pad is skipped too, and is added as an explicit test.
-var credentialMarks = []string{
-	"token=", "access_token", "sig=", "code=",
-	"password=", "passwd=", "key=", "api_key", "apikey", "session=", "sessionid",
-	"ticket=", "signature", "x-amz-", "auth=", "otp=",
-}
-
-var (
-	jwtSegment = regexp.MustCompile(`^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$`)
-	hexSegment = regexp.MustCompile(`^[0-9a-fA-F]{32,}$`)
-	b64Segment = regexp.MustCompile(`^[A-Za-z0-9_-]{24,}$`)
-	wordChunk  = regexp.MustCompile(`^[a-z]{4,}$`)
-)
-
-// tokenLike reports whether a single path segment looks like a secret rather
-// than a name: a JWT (three base64url parts joined by dots), 32 or more hex
-// characters, or 24 or more base64url characters that carry a digit or mixed
-// case and no recognizable word. A slug like release-notes-2024-summary has
-// words between its hyphens and is kept; a random string has none. The
-// heuristic is deliberately simple: it will miss a short or all-lowercase
-// token, and skip a long opaque id that is not one, which is the safer error
-// for something that becomes a test id.
-func tokenLike(seg string) bool {
-	if jwtSegment.MatchString(seg) || hexSegment.MatchString(seg) {
-		return true
-	}
-	if !b64Segment.MatchString(seg) {
-		return false
-	}
-	hasDigit, hasUpper, hasLower := false, false, false
-	for _, r := range seg {
-		switch {
-		case r >= '0' && r <= '9':
-			hasDigit = true
-		case r >= 'A' && r <= 'Z':
-			hasUpper = true
-		case r >= 'a' && r <= 'z':
-			hasLower = true
-		}
-	}
-	if !hasDigit && !(hasUpper && hasLower) {
-		return false
-	}
-	for _, chunk := range strings.FieldsFunc(seg, func(r rune) bool { return r == '-' || r == '_' }) {
-		if wordChunk.MatchString(chunk) && strings.ContainsAny(chunk, "aeiou") {
-			return false // a word between separators: a slug, not a secret
-		}
-	}
-	return true
-}
 
 // cleanAuthPath makes a discovered path safe to use as a test id when signed
 // in: a percent-decoded '?' in the path is cut like a real query, ;params are
@@ -217,13 +177,13 @@ func cleanAuthPath(p string) (string, bool) {
 		}
 	}
 	lower := strings.ToLower(route)
-	for _, mark := range credentialMarks {
+	for _, mark := range secrets.CredentialNames {
 		if strings.Contains(lower, mark) {
 			return "", false
 		}
 	}
 	for _, seg := range strings.FieldsFunc(route, func(r rune) bool { return r == '/' || r == '#' }) {
-		if tokenLike(seg) {
+		if secrets.TokenLike(seg) {
 			return "", false
 		}
 	}
@@ -242,7 +202,7 @@ func (c *Crawler) shown(path string) string {
 func (c *Crawler) collectLinks(path string) ([]string, error) {
 	// The 15s is the crawl's per-page budget; a login flow (reuse: false)
 	// runs under its own, not inside it.
-	session, err := c.Browser.NewAuthSession(c.Auth, c.BaseURL+path, c.Defaults.Viewport,
+	session, err := c.Browser.NewAuthSession(c.Auth, config.JoinURL(c.BaseURL, path), c.Defaults.Viewport,
 		c.Defaults.WaitFor, c.Defaults.SettleTime.Std(), 15*time.Second)
 	if err != nil {
 		return nil, err

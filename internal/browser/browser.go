@@ -292,7 +292,7 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		time.Sleep(st.Wait.Std())
 		return nil
 	case st.Goto != "":
-		return s.navigate(baseURL+st.Goto, defaultWait, settle)
+		return s.navigate(config.JoinURL(baseURL, st.Goto), defaultWait, settle)
 	}
 	return fmt.Errorf("unhandled step")
 }

@@ -114,17 +114,21 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	if *validateOnly {
+		// The filters are compiled and applied the way a real run would, so a bad
+		// --id or --path regex fails here too, with the same error, whatever the
+		// config has in it.
+		selected, ferr := filterTests(cfg.Tests, *idFilter, *pathFilter)
+		if ferr != nil {
+			fmt.Fprintln(os.Stderr, "config error:", ferr)
+			return exitBadConfig
+		}
 		// With auth, a test on another origin is a config error. Where the base
 		// URL is known without starting anything (baseUrl or --base-url) that is
 		// checked here; with serve: the origin is an ephemeral port, so it is
 		// checked at scan time.
 		if base := knownBaseURL(cfg, *baseURL, *serveDir); cfg.Auth != nil && base != "" {
-			selected, ferr := filterTests(cfg.Tests, *idFilter, *pathFilter)
-			if ferr == nil {
-				ferr = cfg.CheckTestOrigins(strings.TrimRight(base, "/"), selected)
-			}
-			if ferr != nil {
-				fmt.Fprintln(os.Stderr, "config error:", ferr)
+			if cerr := cfg.CheckTestOrigins(strings.TrimRight(base, "/"), selected); cerr != nil {
+				fmt.Fprintln(os.Stderr, "config error:", cerr)
 				return exitBadConfig
 			}
 		}
@@ -348,7 +352,7 @@ func run(args []string) int {
 			ferr = format.HTML(f, res, format.RunMeta{
 				Date:        time.Now(),
 				App:         appname.Detect(".", cfg.Name),
-				BaseURL:     base,
+				BaseURL:     reportedBase(base, cfg),
 				Standard:    cfg.Defaults.Standard,
 				Profile:     activeProfileName(profileReq, cfg),
 				ToolVersion: version,
@@ -502,6 +506,17 @@ func activeProfileName(req string, cfg *config.Config) string {
 	}
 }
 
+// reportedBase is the base URL as a report may show it. With auth configured it
+// is redacted (userinfo, query, params, fragment): the report header would
+// otherwise print ciuser:password@host straight into a file that gets
+// uploaded. Without auth it is unchanged.
+func reportedBase(base string, cfg *config.Config) string {
+	if cfg.Auth != nil {
+		return browser.RedactURL(base)
+	}
+	return base
+}
+
 // knownBaseURL is the base URL a run would use when it can be known without
 // starting a server: --base-url, else the config's baseUrl. "" for serve mode,
 // whose origin is an ephemeral port.
@@ -590,14 +605,14 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	noop := func() {}
 	switch {
 	case baseURLFlag != "":
-		return probeAttach(baseURLFlag, noop)
+		return probeAttach(baseURLFlag, noop, cfg.Auth != nil)
 	case serveFlag != "":
 		return startStatic(serveFlag, true)
 	case cfg.Server == nil:
 		fmt.Fprintln(os.Stderr, "no server configured: set server: in config or pass --base-url / --serve")
 		return "", noop, exitBadConfig
 	case cfg.Server.BaseURL != "":
-		return probeAttach(cfg.Server.BaseURL, noop)
+		return probeAttach(cfg.Server.BaseURL, noop, cfg.Auth != nil)
 	case cfg.Server.Serve != "":
 		spa := cfg.Server.SPAFallback == nil || *cfg.Server.SPAFallback
 		return startStatic(cfg.Server.Serve, spa)
@@ -607,15 +622,19 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	}
 }
 
-func probeAttach(url string, cleanup func()) (string, func(), int) {
+func probeAttach(url string, cleanup func(), redact bool) (string, func(), int) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
 	if err != nil || resp.StatusCode >= 500 {
+		shown := url
+		if redact {
+			shown = browser.RedactURL(url) // userinfo in the base URL is a credential
+		}
 		fmt.Fprintf(os.Stderr,
-			"cannot reach %s — is the server running? (or use --serve for a static build)\n", url)
+			"cannot reach %s — is the server running? (or use --serve for a static build)\n", shown)
 		return "", cleanup, exitEnvironment
 	}
 	return url, cleanup, exitOK

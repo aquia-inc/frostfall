@@ -356,3 +356,20 @@ func (c *Config) CheckTestOrigins(baseURL string, tests []Test) error {
 	}
 	return nil
 }
+
+// JoinURL appends a test's path to the base URL. The base's trailing slash is
+// dropped, and a "/" is put between them unless the path starts with one, or
+// with "?" or "#" (a query or hash route on the base itself). So "index.html"
+// under "http://app/" is http://app/index.html, "?a=1" and "#/route" attach to
+// the base, and a path such as "@evil.example/" stays a path on the same host
+// (http://app/@evil.example/) instead of becoming userinfo.
+func JoinURL(base, path string) string {
+	base = strings.TrimRight(base, "/")
+	if path == "" {
+		return base
+	}
+	if path[0] != '/' && path[0] != '?' && path[0] != '#' {
+		return base + "/" + path
+	}
+	return base + path
+}

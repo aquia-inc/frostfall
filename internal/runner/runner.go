@@ -20,6 +20,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/fingerprint"
 	"github.com/aquia-inc/frostfall/internal/keyboard"
 	"github.com/aquia-inc/frostfall/internal/screenreader"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // Result is one classified violation.
@@ -210,7 +211,7 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	d := r.Config.Defaults
 	url := t.URL
 	if url == "" {
-		url = r.BaseURL + t.Path
+		url = config.JoinURL(r.BaseURL, t.Path)
 	}
 	waitFor := t.WaitFor
 	if waitFor == "" {
@@ -235,8 +236,10 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	defer session.Close()
 	// From here url is only ever reported, as the PageURL of results and
 	// transcripts (SARIF locations, the HTML report). With auth configured it
-	// goes out redacted, like every other printed URL: a token interpolated
-	// into a test path or userinfo in the base URL must not reach a report.
+	// goes out redacted, like every other printed URL: userinfo, the query,
+	// ;params and the fragment are dropped, and a path segment that looks like a
+	// secret is masked. A path of your own is otherwise printed as written, so
+	// keep credentials out of it.
 	url = shown
 	cov = newCoverage()
 
@@ -463,6 +466,16 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 func (r *Runner) results(session *browser.Session, t config.Test, url, label string, violations []engine.Violation) []Result {
 	results := make([]Result, 0, len(violations))
 	for _, v := range violations {
+		// The raw selector finds the element for its screenshot; everything
+		// that is fingerprinted, stored or printed gets the scrubbed one. axe
+		// anchors on a whole href when it is short, so a download link's token
+		// ([href="/dl?token=..."]) would otherwise reach the baseline, SARIF and
+		// the reports. Without auth nothing is touched, and fingerprints are
+		// exactly what they always were.
+		raw := v.Target
+		if r.Auth != nil {
+			v.Target = secrets.ScrubSelector(raw)
+		}
 		res := Result{
 			Violation:    v,
 			TestID:       t.ID,
@@ -477,7 +490,7 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 		// assertion), so there is nothing to photograph.
 		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation {
 			if _, known := r.baselineIdx[res.Fingerprint]; !known {
-				res.ScreenshotPath = r.captureScreenshot(session, res)
+				res.ScreenshotPath = r.captureScreenshot(session, res, raw)
 			}
 		}
 		results = append(results, res)
@@ -487,8 +500,8 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 
 // captureScreenshot best-effort shoots the violating element. Failure is
 // logged, never fatal: a violation without a picture still counts.
-func (r *Runner) captureScreenshot(session *browser.Session, res Result) string {
-	png, err := session.CaptureElement(res.Target)
+func (r *Runner) captureScreenshot(session *browser.Session, res Result, target string) string {
+	png, err := session.CaptureElement(target)
 	if err != nil {
 		r.logf("screenshot %s: %v", res.Fingerprint, err)
 		return ""

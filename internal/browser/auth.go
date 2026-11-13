@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 
 	"github.com/aquia-inc/frostfall/internal/config"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // ErrLoginRedirect marks a test or a setup that ended somewhere other than
@@ -40,6 +42,20 @@ var logoutRe = regexp.MustCompile(`(?i)/(log|sign)[-_]?(out|off)\b`)
 
 var pathParamRe = regexp.MustCompile(`;[^/]*`)
 
+// maskSegments replaces each path segment that looks like a secret (a JWT, a
+// long hex string, a long opaque token: secrets.TokenLike) with [redacted].
+// Explicit paths are otherwise printed as written; a token in the path itself,
+// as opposed to its query, is what this catches.
+func maskSegments(p string) string {
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		if secrets.TokenLike(seg) {
+			segs[i] = "[redacted]"
+		}
+	}
+	return strings.Join(segs, "/")
+}
+
 // RedactURL reduces a URL to where it points, safe to print: userinfo, the
 // query, ;params on path segments (/login;jsessionid=...) and the fragment
 // are dropped. A hash route (#/users) is the page's identity in a hash-routed
@@ -59,7 +75,7 @@ func RedactURL(raw string) string {
 	if i := strings.IndexAny(path, "?#"); i >= 0 {
 		path = path[:i]
 	}
-	out := pathParamRe.ReplaceAllString(path, "")
+	out := maskSegments(pathParamRe.ReplaceAllString(path, ""))
 	if u.Host != "" {
 		out = u.Scheme + "://" + u.Host + out
 	}
@@ -67,7 +83,7 @@ func RedactURL(raw string) string {
 		if i := strings.IndexAny(frag, "#?&="); i >= 0 {
 			frag = frag[:i]
 		}
-		out += "#" + pathParamRe.ReplaceAllString(frag, "")
+		out += "#" + maskSegments(pathParamRe.ReplaceAllString(frag, ""))
 	}
 	return out
 }
@@ -263,15 +279,15 @@ func (a *Auth) probeSignedOut(b *Browser) error {
 		pages = append(pages, page{what: what, url: u})
 	}
 	if a.loginPath != "" {
-		add("the login path "+a.loginDisplay, a.baseURL+a.loginPath)
+		add("the login path "+a.loginDisplay, config.JoinURL(a.baseURL, a.loginPath))
 	}
 	if a.setupPath != "" {
-		add("the setup page "+RedactURL(a.setupPath), a.baseURL+a.setupPath)
+		add("the setup page "+RedactURL(a.setupPath), config.JoinURL(a.baseURL, a.setupPath))
 	}
 	if t := a.opts.FirstTest; t != "" {
 		u := t
 		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
-			u = a.baseURL + t
+			u = config.JoinURL(a.baseURL, t)
 		}
 		add("the first test that uses auth ("+RedactURL(t)+")", u)
 	}
@@ -287,34 +303,62 @@ func (a *Auth) probeSignedOut(b *Browser) error {
 	}
 	wg.Wait()
 
+	// Warnings already collected are always said, even when a later page ends
+	// the probe with an error.
 	var warns []string
+	defer func() {
+		for _, w := range warns {
+			a.warnf("%s", w)
+		}
+	}()
 	checked := 0
+	var probeErr error
+	var bounced []string // pages that ended off the app's origin
+	var bouncedTo []string
+scan:
 	for i, r := range results {
 		p := pages[i]
 		switch {
+		case r.landed != "":
+			// Off the app's origin, whatever happened after: the marker cannot be
+			// checked there, and an identity provider's page that never settles
+			// is not a failure of the app.
+			bounced = append(bounced, p.what)
+			if !slices.Contains(bouncedTo, r.landed) {
+				bouncedTo = append(bouncedTo, r.landed)
+			}
 		case r.err != nil && p.root:
 			// An unreachable root alone is not fatal: a run that never loads it
 			// does not need it, and one that does fails on its own.
 			warns = append(warns, fmt.Sprintf("auth: could not load %s signed out (%v): the signedIn marker was not checked there", p.what, r.err))
 		case r.err != nil:
-			return fmt.Errorf("auth: probing %s signed out: %w", p.what, r.err)
-		case r.landed != "":
-			warns = append(warns, fmt.Sprintf("auth: probing %s signed out landed on %s, not the app's origin %s: the signedIn marker was not checked on that page",
-				p.what, r.landed, a.origin))
+			probeErr = fmt.Errorf("auth: probing %s signed out: %w", p.what, r.err)
+			break scan
 		case r.checked && r.present:
-			return &redirectError{fmt.Sprintf("auth: the signedIn selector %q also matches %s with no session: pick a marker that only signed-in pages "+
+			probeErr = &redirectError{fmt.Sprintf("auth: the signedIn selector %q also matches %s with no session: pick a marker that only signed-in pages "+
 				"render, such as a test id on content that needs the user (not main, nav, header or a layout shell, which render before auth resolves)",
 				a.signedIn, p.what)}
+			break scan
 		}
 		if r.checked {
 			checked++
 		}
 	}
+	switch len(bounced) {
+	case 0:
+	case 1:
+		warns = append(warns, fmt.Sprintf("auth: probing %s signed out landed on %s, not the app's origin %s: the signedIn marker was not checked on that page",
+			bounced[0], strings.Join(bouncedTo, ", "), a.origin))
+	default:
+		// A fully SSO-gated app bounces every page: one line, not one per page.
+		warns = append(warns, fmt.Sprintf("auth: %d probed pages (%s) landed on %s, not the app's origin %s: the signedIn marker was not checked on them",
+			len(bounced), strings.Join(bounced, "; "), strings.Join(bouncedTo, ", "), a.origin))
+	}
+	if probeErr != nil {
+		return probeErr
+	}
 	if checked == 0 {
 		warns = append(warns, "auth: no page loaded signed out on the app's origin, so the signedIn marker could not be verified as absent without a session")
-	}
-	for _, w := range warns {
-		a.warnf("%s", w)
 	}
 	return nil
 }
@@ -326,17 +370,37 @@ func (a *Auth) probeOne(b *Browser, url string) probeResult {
 	}
 	defer s.Close()
 	s.redact = true
-	if err := s.navigate(url, readiness(a.defaults.WaitFor), a.defaults.SettleTime.Std()); err != nil {
-		return probeResult{err: err}
+	// load, whatever the configured readiness: networkIdle waits out every open
+	// request, and an identity provider's page that keeps one open would run the
+	// page's whole timeout for nothing the probe needs.
+	navErr := s.navigate(url, "load", a.defaults.SettleTime.Std())
+	// Where the page ended is read before anything else can go wrong, and a
+	// page that is off the app's origin is a warning whatever the error was.
+	landed, lerr := s.landedLoosely()
+	if lerr == nil && (landed.Scheme == "http" || landed.Scheme == "https") {
+		// Only a real page counts: a failed navigation leaves chrome-error://
+		// behind, and that is the failure, not a bounce.
+		if o := originOf2(landed); o != a.origin {
+			return probeResult{landed: o}
+		}
 	}
-	landed, err := s.landedAt()
-	if err != nil {
-		return probeResult{err: err}
+	if navErr != nil {
+		return probeResult{err: navErr}
 	}
-	if o := originOf2(landed); o != a.origin {
-		return probeResult{landed: o}
+	if lerr != nil {
+		return probeResult{err: lerr}
 	}
 	return probeResult{checked: true, present: s.has(a.signedIn)}
+}
+
+// landedLoosely is landedAt that still works after the page's own time budget
+// ran out, which is when the answer matters most.
+func (s *Session) landedLoosely() (*url.URL, error) {
+	res, err := s.raw.Timeout(3 * time.Second).Eval(`() => location.href`)
+	if err != nil {
+		return nil, fmt.Errorf("reading landing url: %w", err)
+	}
+	return url.Parse(res.Value.Str())
 }
 func (a *Auth) logf(format string, args ...any) {
 	if a.opts.Log != nil {
@@ -384,7 +448,7 @@ func (a *Auth) captureOnce(b *Browser, setup *config.AuthSetup) (*State, error) 
 func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
 	settle := a.defaults.SettleTime.Std()
 	a.logf("auth setup: loading %s", RedactURL(setup.Path))
-	if err := s.navigate(a.baseURL+setup.Path, readiness(a.defaults.WaitFor), settle); err != nil {
+	if err := s.navigate(config.JoinURL(a.baseURL, setup.Path), readiness(a.defaults.WaitFor), settle); err != nil {
 		return fmt.Errorf("auth setup: %w", err)
 	}
 	for i, st := range setup.Steps {
