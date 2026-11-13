@@ -249,7 +249,8 @@ profiles:                        # named overlays for environment differences
 
 discover:                        # tuning for --discover (see Discovery below)
   maxDepth: 3                    # crawl depth from /
-  maxPages: 100                  # hard cap on pages visited
+  maxPages: 100                  # caps pages scanned; signed in, it caps page
+                                 # loads (dropped pages included)
   exclude: ["^/logout"]          # Go regexes matched against paths
 
 tests:
@@ -488,6 +489,9 @@ Most real apps put their interesting pages behind a login. Frostfall signs in
 once and starts every test with that session. The smallest config that works:
 
 ```yaml
+version: 1
+server:
+  baseUrl: http://localhost:3000
 auth:
   setup:
     path: /login
@@ -497,6 +501,9 @@ auth:
       - click: "button[type=submit]"
       - waitFor: "[data-testid=account-menu]"
   signedIn: "[data-testid=account-menu]"   # on every signed-in page, on no login page
+tests:
+  - id: dashboard
+    path: /dashboard
 ```
 
 Run it with `A11Y_USER` and `A11Y_PASS` in the environment (an unset `${VAR}` fails
@@ -530,18 +537,7 @@ captures what the login left behind: every cookie of the browser context
 `sessionStorage`. Each test's fresh context gets that state before its first
 navigation, so the page sees a signed-in session from its first request.
 
-```yaml
-auth:
-  setup:
-    path: /login
-    steps:
-      - fill: { "#email": "${A11Y_USER}" }
-      - fill: { "#password": "${A11Y_PASS}" }
-      - click: "button[type=submit]"
-      - waitFor: "[data-testid=account-menu]"
-  signedIn: "[data-testid=account-menu]"
-  reuse: true      # default
-```
+That is the example above; `reuse` (default `true`) is covered below.
 
 A selector `defaults.waitFor` is ignored throughout setup (the first load and
 every `goto` step use `load` instead), since it is usually something only
@@ -576,6 +572,10 @@ config loads, so a missing or malformed one is a config error, and
 `frostfall --validate` needs it to exist: write it first (see below). Cookies in
 the file that have already expired are not sent; the browser would drop them
 anyway, and the expired session then shows up as the guard below.
+
+`loginPath` is the one optional key here: the URL a signed-out visitor lands on,
+used for a clearer message when a test lands there and so that discovery skips
+it (it is explained under the guard below).
 
 ```yaml
 auth:
@@ -693,10 +693,22 @@ reports (the report's Target line, and each result's page URL) are printed witho
 userinfo, query string, `;params` or fragment (a `#/hash-route` is kept), and a
 path segment that looks like a secret is shown as `[redacted]`, so
 `--base-url http://user:pw@host` and `setup.path: /login?token=...` cannot leak.
-A path of your own is otherwise printed as written. The attribute values in axe's
-selectors are scrubbed the same way before they are fingerprinted or reported: a
-`a[href="/dl?token=..."]` becomes `a[href="/dl"]`. Without auth none of this
-changes. The captured cookies and storage live only in memory for the run: they
+A path of your own is otherwise printed as written. The masking
+also catches UUIDs and MongoDB ObjectIds, which look like tokens: they appear as
+`[redacted]` in report URLs, and discovery skips links that contain them (it logs
+how many).
+
+For tests that use auth, axe's selectors are scrubbed before they are
+fingerprinted or reported: every attribute value is dropped, whatever the
+attribute, so `a[href="/dl?token=..."]` becomes `a[href]` and
+`input[value="..."]` becomes `input[value]`. The selector is parsed, so quoted
+values containing `]` or escaped quotes and escaped names (`button[\@click=...]`)
+are handled, and nothing outside attribute brackets changes. The cost is that
+elements which differ only in an attribute value share a fingerprint, and that a
+signed-in test's fingerprints differ from an unauthenticated run of the same page
+(so baseline entries made without auth do not carry over to it). A test with
+`auth: false` is untouched, and so is a config without auth. A failing
+`expectFocus` summary for such a test omits the focused field's value. The captured cookies and storage live only in memory for the run: they
 are never written to disk, reports or logs. A `storageState` file is a
 credential in itself; keep it out of version control (for example `.auth/` in
 `.gitignore`).
@@ -871,6 +883,11 @@ these are normalized away:
 - generated element ids and React `useId` attribute values
 - sibling reordering (`:nth-child` is dropped when anything better identifies
   the element)
+
+With auth, a test that uses it fingerprints a selector with its attribute values
+dropped (see Auth), so elements that differ only in an attribute value are one
+violation there, and its fingerprints differ from an unauthenticated run's.
+Tests with `auth: false` keep their exact fingerprints.
 
 The baseline records the axe-core version it was created with. When the binary
 embeds a different axe version, Frostfall warns instead of reporting phantom

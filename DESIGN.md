@@ -254,6 +254,12 @@ A violation's fingerprint is `sha256` (hex, first 16 bytes) of the following fie
   Tailwind arbitrary-value brackets excluded — plain utility classes are kept).
 - Drop `:nth-child(n)` qualifiers when the element has any other distinguishing feature
   (id, surviving class, attribute); keep them only as a last resort.
+- For a test that uses `auth:` (and only such a test), every attribute value in the selector is
+  dropped before the steps above (`[href="/dl?token=x"]` becomes `[href]`; see §7.5). Elements that
+  differ only in an attribute value then share a fingerprint, the same kind of collapsing as the
+  generated-id and `:nth-child` rules, and a signed-in test's fingerprints differ from an
+  unauthenticated run of the same page. A test with `auth: false`, and any config without `auth`,
+  is unaffected, so the v1 scheme is unchanged for them.
 - (v2 candidate, NOT in the v1 scheme: preferring `data-testid`, then `role` + accessible name,
   over positional selectors. Changing this invalidates baselines, so it requires a fingerprint
   version bump with a migration path — not a silent amendment.)
@@ -459,10 +465,15 @@ a percent-encoded `?` or `#` in the path is cut like a real one, and a hash rout
 the first `#`, `?`, `&` or `=` (OAuth implicit flows put the token there), so a token in
 `setup.path` cannot leak; without auth the output is unchanged. With auth configured, `PageURL` in results and transcripts (SARIF locations, the HTML report) is
 redacted the same way, as is the report header's base URL and the "cannot reach" message; a path
-segment that looks like a secret (`secrets.TokenLike`) is masked as `[redacted]`. axe selectors are
-scrubbed before they are fingerprinted or reported (`secrets.ScrubSelector`: a `[href="/dl?token=x"]`
-becomes `[href="/dl"]`, and a value that still names a credential becomes `[href]`), with auth only,
-so the fingerprint scheme is unchanged for everyone else. `Violation.HTML` is never rendered or
+segment that looks like a secret (`secrets.TokenLike`) is masked as `[redacted]`. axe selectors of a test that uses auth are
+scrubbed before they are fingerprinted or reported (`secrets.ScrubSelector`, a small parser, not a
+pattern: every attribute value is dropped, `[href="/dl?token=x"]` becomes `[href]`, whatever the
+attribute name, escaping or operator, and text outside attribute brackets is untouched); a test with
+`auth: false`, and any config without auth, keeps its exact targets, so the fingerprint scheme is
+unchanged for them. For a signed-in test, elements that differ only in an attribute value share a
+fingerprint, as the existing collapsing of generated ids and `:nth-child` already merges
+near-identical elements, and the fingerprints differ from an unauthenticated run of the same page.
+`Violation.HTML` is never rendered or
 stored by any formatter, the baseline or the issue code, so it is not scrubbed. The captured cookies and storage exist only in memory: never written to disk,
 reports or logs, and the state type redacts itself under `%v`. That is about the session itself:
 element screenshots, the HTML report and transcripts of signed-in pages can contain account data,
