@@ -28,21 +28,28 @@ permissions:
 jobs:
   enhance-notes:
     name: Enhance Release Notes
+    # Manual runs are limited to main so a branch's copy of this file cannot
+    # be dispatched against the repo secrets. Called runs always pass.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-notes-${{ inputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate tag and release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURR_TAG: ${{ inputs.tag }}
         run: |
-          if ! printf '%s\n' "$CURR_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag input '$CURR_TAG' must look like v1.2.3 (^v[0-9]+\.[0-9]+\.[0-9]+$)."
+          if ! [[ "$CURR_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag input is not vX.Y.Z."
             exit 1
           fi
           if ! git rev-parse -q --verify "refs/tags/$CURR_TAG^{commit}" > /dev/null; then
@@ -58,8 +65,13 @@ jobs:
         id: key
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ] || [ "$ANTHROPIC_API_KEY" = "REPLACE_ME" ]; then
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::error::ANTHROPIC_API_KEY is not populated; cannot regenerate notes."
+              exit 1
+            fi
             echo "::notice::ANTHROPIC_API_KEY not populated; keeping semantic-release notes."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
@@ -104,6 +116,7 @@ jobs:
           ORIGINAL_NOTES: ${{ steps.context.outputs.notes }}
           COMMIT_MESSAGES: ${{ steps.context.outputs.commits }}
           DIFF_CONTENT: ${{ steps.context.outputs.diff }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           PROMPT="Enhance these semantic-release notes with better context.
 
@@ -145,16 +158,28 @@ jobs:
           REQUEST_BODY=$(jq -n --arg model "$RELEASE_NOTES_MODEL" --arg prompt "$PROMPT" \
             '{model: $model, max_tokens: 16000, messages: [{role: "user", content: $prompt}]}')
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          RESPONSE=$(curl -s --max-time 300 --retry 2 --retry-delay 5 \
+            https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$REQUEST_BODY")
+            -d "$REQUEST_BODY" || true)
 
-          NOTES=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")')
+          # A non-JSON body (an HTML 502, say) must reach the no-notes path
+          # below instead of aborting the step under bash -e.
+          NOTES=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")' 2>/dev/null || true)
+          STOP_REASON=$(echo "$RESPONSE" | jq -r '.stop_reason // empty' 2>/dev/null || true)
+          if [ "$STOP_REASON" = "max_tokens" ]; then
+            echo "Response hit max_tokens; the notes are truncated, so they are discarded."
+            NOTES=""
+          fi
           if [ -z "$NOTES" ]; then
-            echo "::warning::No text returned; release keeps the semantic-release notes."
             echo "Full API response (first 500): ${RESPONSE:0:500}"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::error::No usable notes returned; the release notes were not changed."
+              exit 1
+            fi
+            echo "::warning::No usable notes returned; release keeps the semantic-release notes."
             exit 0
           fi
           DELIM="ff_$(openssl rand -hex 16)"
@@ -166,4 +191,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
-        run: gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES"
+        run: |
+          # Keep the notes being replaced so they can be restored by hand.
+          {
+            echo "## Previous notes"
+            echo
+            echo '~~~~~~~~markdown'
+            gh release view "$RELEASE_TAG" --json body --jq .body
+            echo '~~~~~~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES"
