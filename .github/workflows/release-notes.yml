@@ -1,0 +1,203 @@
+name: Release Notes
+
+# Rewrites the notes of an existing GitHub release with the Anthropic API.
+# Called from release.yml after a release is published, and runnable by hand
+# to regenerate the notes for a tag that already exists:
+#   gh workflow run release-notes.yml -f tag=v1.5.0
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to enhance (vX.Y.Z)
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to enhance (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  enhance-notes:
+    name: Enhance Release Notes
+    # Manual runs are limited to main so a branch's copy of this file cannot
+    # be dispatched against the repo secrets. Called runs always pass.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-notes-${{ inputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURR_TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$CURR_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag input is not vX.Y.Z."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$CURR_TAG^{commit}" > /dev/null; then
+            echo "::error::git tag '$CURR_TAG' does not exist in this repository."
+            exit 1
+          fi
+          if ! gh release view "$CURR_TAG" --json tagName --jq .tagName > /dev/null; then
+            echo "::error::GitHub release '$CURR_TAG' does not exist."
+            exit 1
+          fi
+
+      - name: Check for API key
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ "$ANTHROPIC_API_KEY" = "REPLACE_ME" ]; then
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::error::ANTHROPIC_API_KEY is not populated; cannot regenerate notes."
+              exit 1
+            fi
+            echo "::notice::ANTHROPIC_API_KEY not populated; keeping semantic-release notes."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release context
+        if: steps.key.outputs.present == 'true'
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURR_TAG: ${{ inputs.tag }}
+        run: |
+          # The semver tag immediately before CURR_TAG, so re-running an older
+          # release diffs against its true predecessor. First release falls
+          # back to the root commit.
+          PREV_TAG=$(git tag --sort=v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | awk -v cur="$CURR_TAG" '$0 == cur { print prev; exit } { prev = $0 }')
+          [ -z "$PREV_TAG" ] && PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+
+          NOTES=$(gh release view "$CURR_TAG" --json body --jq .body)
+          COMMITS=$(git log "$PREV_TAG..$CURR_TAG" --format="### %s%n%b%n---" | head -c 10000)
+          DIFF=$(git diff "$PREV_TAG..$CURR_TAG" -- '*.go' '*.md' '*.yml' '*.yaml' '*.json' ':!*.min.js' | head -c 40000)
+
+          # Random per-run delimiter, and the value always ends in a newline
+          # before the closing delimiter. head -c cuts mid-line, and a fixed
+          # EOF can also appear inside a diff or notes body; either one makes
+          # GitHub reject the file with "Matching delimiter not found".
+          DELIM="ff_$(openssl rand -hex 16)"
+          {
+            printf 'notes<<%s\n%s\n%s\n' "$DELIM" "$NOTES" "$DELIM"
+            printf 'commits<<%s\n%s\n%s\n' "$DELIM" "$COMMITS" "$DELIM"
+            printf 'diff<<%s\n%s\n%s\n' "$DELIM" "$DIFF" "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate enhanced release notes
+        if: steps.key.outputs.present == 'true'
+        id: notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL || 'claude-opus-5' }}
+          ORIGINAL_NOTES: ${{ steps.context.outputs.notes }}
+          COMMIT_MESSAGES: ${{ steps.context.outputs.commits }}
+          DIFF_CONTENT: ${{ steps.context.outputs.diff }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PROMPT="Enhance these semantic-release notes with better context.
+
+          ORIGINAL NOTES (preserve ALL links):
+          ${ORIGINAL_NOTES}
+
+          FULL COMMIT MESSAGES (with bodies for context):
+          ${COMMIT_MESSAGES}
+
+          GIT DIFF (for technical details):
+          ${DIFF_CONTENT:0:20000}
+
+          TASK: Rewrite these notes for TWO audiences in one document. Start with a short, plain-language summary for non-technical readers, then full technical detail for engineers.
+
+          REQUIREMENTS:
+          1. PRESERVE ALL LINKS in the detailed sections: PR numbers, commit hashes, issue refs
+          2. Pull context from commit message bodies, not just subject lines
+          3. Group related changes by user-facing capability, not one bullet per PR
+          4. Explain WHY each change matters, in terms the reader cares about
+
+          FORMAT (these sections, in this order):
+
+          ## What's new
+          - Plain-language highlights for a non-technical teammate. 3 to 5 short bullets.
+          - Say what a person can now do and why it helps. No function names, flags, file paths, or PR numbers here.
+          - One tasteful emoji per bullet is allowed here. Nowhere else.
+
+          ## Added / ## Fixed / ## Changed
+          - Each change with links, user impact, and root cause or migration notes where relevant.
+
+          ## Technical Notes
+          - Dependencies, contract changes (exit codes, fingerprint scheme, config schema), safe-to-adopt reasoning.
+
+          RULES:
+          - Never use an em dash.
+          - Plain human prose. No marketing language, no AI-tell filler (delve, seamless, robust, leverage, unlock, empower, streamline).
+          - Detailed sections read like a senior engineer documenting changes: WHY, not just WHAT."
+
+          REQUEST_BODY=$(jq -n --arg model "$RELEASE_NOTES_MODEL" --arg prompt "$PROMPT" \
+            '{model: $model, max_tokens: 16000, messages: [{role: "user", content: $prompt}]}')
+
+          RESPONSE=$(curl -s --max-time 300 --retry 2 --retry-delay 5 \
+            https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$REQUEST_BODY" || true)
+
+          # A non-JSON body (an HTML 502, say) must reach the no-notes path
+          # below instead of aborting the step under bash -e.
+          NOTES=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")' 2>/dev/null || true)
+          STOP_REASON=$(echo "$RESPONSE" | jq -r '.stop_reason // empty' 2>/dev/null || true)
+          if [ "$STOP_REASON" = "max_tokens" ]; then
+            echo "Response hit max_tokens; the notes are truncated, so they are discarded."
+            NOTES=""
+          fi
+          if [ -z "$NOTES" ]; then
+            echo "Full API response (first 500): ${RESPONSE:0:500}"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::error::No usable notes returned; the release notes were not changed."
+              exit 1
+            fi
+            echo "::warning::No usable notes returned; release keeps the semantic-release notes."
+            exit 0
+          fi
+          DELIM="ff_$(openssl rand -hex 16)"
+          printf 'notes<<%s\n%s\n%s\n' "$DELIM" "$NOTES" "$DELIM" >> "$GITHUB_OUTPUT"
+
+      - name: Update release with enhanced notes
+        if: steps.key.outputs.present == 'true' && steps.notes.outputs.notes != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
+        run: |
+          # Keep the notes being replaced so they can be restored by hand.
+          {
+            echo "## Previous notes"
+            echo
+            echo '~~~~~~~~markdown'
+            gh release view "$RELEASE_TAG" --json body --jq .body
+            echo '~~~~~~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$RELEASE_TAG" --notes "$RELEASE_NOTES"
