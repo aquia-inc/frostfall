@@ -114,8 +114,8 @@ func TestRedactURL(t *testing.T) {
 			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if got := RedactURL("http://[bad"); strings.Contains(got, "bad") {
-		t.Errorf("an unparsable URL was echoed: %q", got)
+	if got := RedactURL("http://u:pw@[bad?token=X"); strings.Contains(got, "pw") || strings.Contains(got, "token") {
+		t.Errorf("an unparsable URL was echoed with its credentials: %q", got)
 	}
 	if got := describeStep(config.Step{Goto: "/next?token=abc;k=v"}); strings.Contains(got, "abc") || strings.Contains(got, "k=v") {
 		t.Errorf("describeStep leaks a query: %q", got)

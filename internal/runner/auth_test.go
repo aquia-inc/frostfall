@@ -66,6 +66,10 @@ func runSite(t *testing.T, o runOpts) (*Run, error) {
 			*o.seen = append(*o.seen, r.URL.RequestURI())
 			seenMu.Unlock()
 		}
+		if r.URL.Path == "/field" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i><input id="f" aria-label="SMTP password" value="Hunter2-Smtp-Pass!"></main></body></html>`)
+			return
+		}
 		if r.URL.Path == "/linkpage" {
 			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><i id="in"></i><a href="/dl?token=Q7xK2pLm9Zw">download</a></main></body></html>`)
 			return
@@ -335,34 +339,45 @@ func (e targetEngine) Audit(context.Context, engine.Page, engine.ScanOptions) ([
 	return []engine.Violation{{RuleID: "image-alt", Impact: engine.Critical, Target: e.target}}, nil
 }
 
-// axe anchors on a short href, so a download link's token lands in the selector
-// and from there in the fingerprint, the baseline and every report. With auth
-// the selector is scrubbed first; without it nothing changes, fingerprint
-// included.
-func TestSelectorTokensAreScrubbedWithAuthOnly(t *testing.T) {
+// axe puts attribute values in its selectors, and a value can be a token, a
+// prefilled password, a CSRF string. For a test that uses auth every value is
+// dropped before the selector is fingerprinted or reported. A test with
+// auth: false, or a config without auth, keeps its exact target and fingerprint,
+// so adding an auth block does not re-key the baseline of the public pages.
+func TestSelectorValuesAreScrubbedOnlyForTestsThatUseAuth(t *testing.T) {
 	const raw = `main > a[href="/dl?token=Q7xK2pLm9Zw"]`
-	tests := "  - id: dl\n    path: /linkpage\n"
+	tests := "  - id: dl\n    path: /linkpage\n  - id: pub\n    path: /linkpage\n    auth: false\n"
 
 	run, err := runSite(t, runOpts{withSession: true, tests: tests, engine: targetEngine{raw}, shots: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := run.Results[0]
-	for _, field := range []string{res.Target, res.StableTarget} {
-		if strings.Contains(field, "Q7xK2pLm9Zw") || strings.Contains(field, "token") {
-			t.Errorf("a token reached %q", field)
+	byTest := map[string]Result{}
+	for _, r := range run.Results {
+		byTest[r.TestID] = r
+	}
+	signed, public := byTest["dl"], byTest["pub"]
+	for _, field := range []string{signed.Target, signed.StableTarget} {
+		if strings.Contains(field, "Q7xK2pLm9Zw") || strings.Contains(field, "token") || strings.Contains(field, "=") {
+			t.Errorf("a value reached %q", field)
 		}
 	}
-	const scrubbed = `main > a[href="/dl"]`
-	if want := fingerprint.Fingerprint("dl", "initial", "image-alt", scrubbed); res.Fingerprint != want {
-		t.Errorf("fingerprint = %s, want the scrubbed selector's %s", res.Fingerprint, want)
+	const scrubbed = `main > a[href]`
+	if want := fingerprint.Fingerprint("dl", "initial", "image-alt", scrubbed); signed.Fingerprint != want {
+		t.Errorf("fingerprint = %s, want the scrubbed selector's %s", signed.Fingerprint, want)
 	}
 	// The element is still found by its real selector for the screenshot.
-	if res.ScreenshotPath == "" {
+	if signed.ScreenshotPath == "" {
 		t.Error("no screenshot: the scrubbed selector was used to find the element")
 	}
+	if public.Target != raw {
+		t.Errorf("the auth: false test's target = %q, want it untouched", public.Target)
+	}
+	if want := fingerprint.Fingerprint("pub", "initial", "image-alt", raw); public.Fingerprint != want {
+		t.Errorf("the auth: false test's fingerprint = %s, want the unchanged scheme's %s", public.Fingerprint, want)
+	}
 
-	plain, err := runSite(t, runOpts{noAuth: true, tests: tests, engine: targetEngine{raw}})
+	plain, err := runSite(t, runOpts{noAuth: true, tests: "  - id: dl\n    path: /linkpage\n", engine: targetEngine{raw}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,6 +387,26 @@ func TestSelectorTokensAreScrubbedWithAuthOnly(t *testing.T) {
 	}
 	if want := fingerprint.Fingerprint("dl", "initial", "image-alt", raw); p.Fingerprint != want {
 		t.Errorf("without auth the fingerprint = %s, want the unchanged scheme's %s", p.Fingerprint, want)
+	}
+}
+
+// A failing focus assertion is a finding and gets reported. For a test that
+// uses auth the sentence does not carry the focused field's value.
+func TestExpectFocusSummaryOmitsFieldValuesForSignedInTests(t *testing.T) {
+	steps := "    scan: false\n    steps:\n      - click: \"#f\"\n      - expectFocus: { role: button }\n"
+	run, err := runSite(t, runOpts{withSession: true, tests: "  - id: field\n    path: /field\n" + steps + "  - id: pubfield\n    path: /field\n    auth: false\n" + steps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := map[string]string{}
+	for _, r := range run.Results {
+		summaries[r.TestID] = r.Summary
+	}
+	if s := summaries["field"]; s == "" || strings.Contains(s, "Hunter2-Smtp-Pass") {
+		t.Errorf("signed-in summary = %q, want a finding without the field's value", s)
+	}
+	if s := summaries["pubfield"]; !strings.Contains(s, "Hunter2-Smtp-Pass") {
+		t.Errorf("auth: false summary = %q, want it unchanged", s)
 	}
 }
 

@@ -114,6 +114,17 @@ func newAuthApp(t *testing.T) *authApp {
 			conn.Close()
 		}
 	})
+	// /badesc lands on a URL that Go's url.Parse refuses, with a token in it.
+	mux.HandleFunc("/badesc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/home%zz?token=SECRETTOK123")
+		w.WriteHeader(http.StatusFound)
+	})
+	// /busy loads, then blocks the page's main thread for longer than the
+	// probe's quick landing read waits.
+	mux.HandleFunc("/busy", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>busy</title></head><body><script>
+			addEventListener('load', () => setTimeout(() => { const end = Date.now() + 4500; while (Date.now() < end) {} }, 50))</script></body></html>`)
+	})
 	// /late draws the marker a second after load, signed in or not.
 	mux.HandleFunc("/late", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>late</title></head><body><script>

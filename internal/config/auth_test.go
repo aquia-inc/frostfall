@@ -365,3 +365,58 @@ func TestJoinURL(t *testing.T) {
 		t.Errorf("host = %q, user = %v, err = %v: the path was read as userinfo", u.Host, u.User, err)
 	}
 }
+
+func TestOriginErrorsDoNotCarryCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"http://ciuser:S3cretBasicPW@host:8080/path?token=SECRETTOK123",
+		"http://ciuser:S3cretBasicPW@host/%zz?token=SECRETTOK123",
+		"ciuser:S3cretBasicPW@host?token=SECRETTOK123",
+	} {
+		_, err := NormalizeOrigin(raw)
+		if err == nil {
+			t.Fatalf("%q: want an error", raw)
+		}
+		for _, secret := range []string{"S3cretBasicPW", "SECRETTOK123", "ciuser"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%q: %q reached %q", raw, secret, err)
+			}
+		}
+	}
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), authPrefix+validSetup+signed), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.CheckTestOrigins("http://ciuser:S3cretBasicPW@h/%zz?token=SECRETTOK123", []Test{{ID: "a", URL: "http://h/"}})
+	if err == nil || strings.Contains(err.Error(), "S3cretBasicPW") || strings.Contains(err.Error(), "SECRETTOK123") {
+		t.Errorf("CheckTestOrigins: err = %v", err)
+	}
+}
+
+// The minimal example at the top of the README's Auth section must be a whole
+// config that loads, or the first thing a reader copies fails.
+func TestReadmeMinimalAuthExampleLoads(t *testing.T) {
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	i := strings.Index(text, "## Auth: scan pages behind a login")
+	if i < 0 {
+		t.Fatal("README has no Auth section")
+	}
+	start := strings.Index(text[i:], "```yaml\n")
+	end := strings.Index(text[i+start+8:], "```")
+	if start < 0 || end < 0 {
+		t.Fatal("the Auth section has no yaml example")
+	}
+	example := text[i+start+8 : i+start+8+end]
+	t.Setenv("A11Y_USER", "u")
+	t.Setenv("A11Y_PASS", "p")
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), example), "")
+	if err != nil {
+		t.Fatalf("the README's minimal example does not load: %v\n%s", err, example)
+	}
+	if cfg.Auth == nil || cfg.Auth.SignedIn == "" || len(cfg.Tests) != 1 {
+		t.Errorf("example loaded without auth, signedIn or its test: %+v", cfg)
+	}
+}

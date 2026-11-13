@@ -738,6 +738,26 @@ func TestProbeCoverageAndWarnings(t *testing.T) {
 			t.Errorf("warnings = %q, want the bounced root said before the error", warns)
 		}
 	})
+	t.Run("exactly two pages that bounce are folded too", func(t *testing.T) {
+		gated := newAuthApp(t)
+		gated.rootTo, gated.bounceTo = idp.URL, idp.URL
+		warns, err := probeWarnings(t, b, gated, "  storageState: "+stateFile(t, gated, "-1", true)+"\n  loginPath: /bounce\n", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(warns) != 2 || !strings.Contains(warns[0], "2 probed pages") {
+			t.Errorf("warnings = %q, want one folded line for the two pages", warns)
+		}
+	})
+	t.Run("a same-origin page with a busy main thread still passes", func(t *testing.T) {
+		warns, err := probeWarnings(t, b, app, state, "/busy")
+		if err != nil {
+			t.Fatalf("a valid page that blocked its thread for a few seconds failed the run: %v", err)
+		}
+		if len(warns) != 0 {
+			t.Errorf("warnings = %q", warns)
+		}
+	})
 	t.Run("a good marker raises no warnings", func(t *testing.T) {
 		warns, err := probeWarnings(t, b, app, state+"  loginPath: /login\n", "/app")
 		if err != nil || len(warns) != 0 {
@@ -782,5 +802,46 @@ func TestProbeTurnsAnOffOriginTimeoutIntoAWarning(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(warns, "\n"), "not the app's origin") {
 		t.Errorf("warnings = %q, want the bounce said", warns)
+	}
+}
+
+// A url.Error carries the whole URL. A landing the parser refuses must not put
+// its token into a message, whichever code path read it.
+func TestLandingParseErrorsDoNotCarryTheURL(t *testing.T) {
+	app := newAuthApp(t)
+	b := launch(t)
+	state := "  storageState: " + stateFile(t, app, "-1", true) + "\n"
+
+	cfg := loadAuthConfig(t, app.URL, state)
+	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = openAuthed(t, b, a, cfg, app.URL, "/badesc")
+	if err == nil || strings.Contains(err.Error(), "SECRETTOK123") || !strings.Contains(err.Error(), "could not parse the landing URL") {
+		t.Errorf("guard: err = %v, want a generic parse error", err)
+	}
+
+	_, err = probeWarnings(t, b, app, state, "/badesc")
+	if err == nil || strings.Contains(err.Error(), "SECRETTOK123") {
+		t.Errorf("probe: err = %v, want a failure that does not carry the token", err)
+	}
+}
+
+// Config URLs that fail to parse are printed redacted, never as a url.Error.
+func TestBadBaseURLsAreNotPrintedRaw(t *testing.T) {
+	const bad = "http://ciuser:S3cretBasicPW@127.0.0.1:1/%zz?token=SECRETTOK123"
+	cfg := loadAuthConfig(t, "http://127.0.0.1:1", "  storageState: "+stateFile(t, newAuthApp(t), "-1", true)+"\n")
+	_, err := NewAuth(nil, cfg, bad, AuthOptions{})
+	if err == nil {
+		t.Fatal("want an error for an unparsable base URL")
+	}
+	for _, secret := range []string{"S3cretBasicPW", "SECRETTOK123", "ciuser"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("%q reached %q", secret, err)
+		}
+	}
+	if _, err := originOf(bad); err == nil || strings.Contains(err.Error(), "S3cretBasicPW") || strings.Contains(err.Error(), "SECRETTOK123") {
+		t.Errorf("originOf: err = %v", err)
 	}
 }

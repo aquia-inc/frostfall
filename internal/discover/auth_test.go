@@ -617,3 +617,51 @@ func TestMaxPagesCapsLoadsWhenSignedIn(t *testing.T) {
 		t.Errorf("signed-out found = %v, want %v: the unauthenticated loop must not change", plain, want)
 	}
 }
+
+func TestCrawlerBaseURLParseErrorsAreRedacted(t *testing.T) {
+	c := &discover.Crawler{BaseURL: "http://u:S3cretBasicPW@h/%zz?token=SECRETTOK123"}
+	_, err := c.Run()
+	if err == nil || strings.Contains(err.Error(), "S3cretBasicPW") || strings.Contains(err.Error(), "SECRETTOK123") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// The skipped count is about credentials. A link the user's own exclude would
+// remove anyway is not counted.
+func TestSkippedCountLeavesOutLinksTheExcludesRemove(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>l</title></head><body>login</body></html>`)
+			return
+		}
+		if c, err := r.Cookie("sid"); err != nil || c.Value != "valid" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><i id="in"></i>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/admin/token=1">x</a><a href="/cb/token=2">x</a><a href="/ok">x</a>`)
+		}
+		fmt.Fprint(w, `</body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	c := crawler(b, authFor(t, b, srv.URL, true), srv.URL)
+	c.Options.Exclude = []string{`^/admin`}
+	var logs []string
+	c.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	if _, err := c.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(logs, "discover: skipped 1 links that looked like they carry credentials") {
+		t.Errorf("logs = %q, want exactly the one link the excludes did not remove", logs)
+	}
+}

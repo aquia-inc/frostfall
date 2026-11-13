@@ -1,6 +1,9 @@
 package secrets
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestTokenLike(t *testing.T) {
 	cases := map[string]bool{
@@ -46,30 +49,63 @@ func TestHasCredentialName(t *testing.T) {
 
 func TestScrubSelector(t *testing.T) {
 	cases := map[string]string{
-		// The value is cut at the first ?, keeping the path.
-		`a[href="/dl?token=Q7xK2pLm9Zw"] > img`: `a[href="/dl"] > img`,
-		`a[href^="/cb?code=1"]`:                 `a[href^="/cb"]`,
-		`img[src$="/x.png?sig=abc"]`:            `img[src$="/x.png"]`,
-		`a[href*="/dl?x=1"]`:                    `a[href*="/dl"]`,
-		`a[href="/search?q=hello"]`:             `a[href="/search"]`,
-		`a[href='/dl?x=1']`:                     `a[href='/dl']`,
-		// What is left still names a credential or looks like one: the attribute stays, the value goes.
-		`[data-x="token=abc"]`:                          `[data-x]`,
-		`[href="/dl/dGhpc0lzQVNlY3JldFRva2VuMTIz?x=1"]`: `[href]`,
-		`[href="/api_key/x?y=1"]`:                       `[href]`,
-		// Several in one selector, the rest untouched.
-		`main > a[href="/a?token=1"] + a[href="/token=2"] > span.c`: `main > a[href="/a"] + a[href] > span.c`,
-		// No ? and no = : never touched.
-		`a[href="/pricing"]`:            `a[href="/pricing"]`,
-		`#main > button.cta`:            `#main > button.cta`,
-		`[id="main"]`:                   `[id="main"]`,
-		`[class*="release-notes-2024"]`: `[class*="release-notes-2024"]`,
-		// = without ? and no credential name: kept.
-		`[data-x="a=b"]`: `[data-x="a=b"]`,
+		// Every value goes, whatever the attribute or the value looks like.
+		`a[href="/dl?token=Q7xK2pLm9Zw"] > img`:   `a[href] > img`,
+		`input[value="Hunter2-Smtp-Pass!"]`:       `input[value]`,
+		`button[data-csrf="a1b2c3d4e5f6"]`:        `button[data-csrf]`,
+		`span[data-auth-token="abc"]`:             `span[data-auth-token]`,
+		`input[value="sk_live_51Habcdefg"]`:       `input[value]`,
+		`a[href$="Zm9vYmFyQmF6UXV4MTIzNDU2Nzg5"]`: `a[href]`,
+		`a[href="/pricing"]`:                      `a[href]`,
+		`[title="Are you sure?"]`:                 `[title]`,
+		// Every operator, quote style and flag.
+		`[a^="x"] [b$="y"] [c*="z"] [d~="w"] [e|="v"]`: `[a] [b] [c] [d] [e]`,
+		`[a='single']`: `[a]`,
+		`[a=bare]`:     `[a]`,
+		`[a="v" i]`:    `[a]`,
+		`[a = "v"]`:    `[a ]`,
+		// A CSS-escaped attribute name is kept, and its value is not.
+		`button[\@click="dl('/f?token=SECRET')"]`: `button[\@click]`,
+		`div[\:class="x"]`:                        `div[\:class]`,
+		`div[x-on\:click.prevent="go('/a?t=1')"]`: `div[x-on\:click.prevent]`,
+		// Escaped operator and bracket characters in a name.
+		`div[a\=b="v"]`:     `div[a\=b]`,
+		`div[a\]b="v"] > c`: `div[a\]b] > c`,
+		// Quotes and brackets inside a value.
+		`a[href="/x\"]?token=SECRET"]`:   `a[href]`,
+		`a[data-x="]token=SECRET["] > b`: `a[data-x] > b`,
+		`a[data-x='it\'s ]secret'] > b`:  `a[data-x] > b`,
+		// The shadow separator and everything outside brackets is untouched.
+		`#host >>> input[value="secret"] > span.c:nth-child(2)`: `#host >>> input[value] > span.c:nth-child(2)`,
+		`main > a.x#y:not([disabled]) + b`:                      `main > a.x#y:not([disabled]) + b`,
+		`#a\[b\]c > d`:                                          `#a\[b\]c > d`,
+		`.cls\:x[title="t"]`:                                    `.cls\:x[title]`,
+		// Valueless attributes are left alone.
+		`input[disabled]`:           `input[disabled]`,
+		`input[disabled][required]`: `input[disabled][required]`,
+		// Several, mixed.
+		`form > input[name="a"][value="b"] ~ button[type="submit"]`: `form > input[name][value] ~ button[type]`,
+		// Unterminated: nothing after the name survives.
+		`input[value="secret`: `input[value]`,
+		`input[value`:         `input[value]`,
+		// Nothing to scrub.
+		`#main > button.cta`: `#main > button.cta`,
+		``:                   ``,
 	}
 	for in, want := range cases {
 		if got := ScrubSelector(in); got != want {
 			t.Errorf("ScrubSelector(%s) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+func TestRedactURLFallsBackWithoutEchoingUserinfo(t *testing.T) {
+	for _, in := range []string{"http://user:S3cretPW@host/%zz?token=SECRET", "http://user:S3cretPW@host/p%zz", "://bad%zzurl"} {
+		got := RedactURL(in)
+		for _, secret := range []string{"S3cretPW", "SECRET", "user:"} {
+			if strings.Contains(got, secret) {
+				t.Errorf("RedactURL(%q) = %q, still carries %q", in, got, secret)
+			}
 		}
 	}
 }
