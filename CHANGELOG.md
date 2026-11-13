@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.6.0](https://github.com/aquia-inc/frostfall/compare/v1.5.0...v1.6.0) (2026-11-13)
+
+### Features
+
+* **auth:** authenticated scanning with a signed-in guard ([#66](https://github.com/aquia-inc/frostfall/issues/66)) ([2467060](https://github.com/aquia-inc/frostfall/commit/246706020e4ec8c7216fe06150177d1ca2ebe190)), closes [#13](https://github.com/aquia-inc/frostfall/issues/13)
+
 ## [1.5.0](https://github.com/aquia-inc/frostfall/compare/v1.4.2...v1.5.0) (2026-11-12)
 
 ### Features
