@@ -180,7 +180,8 @@ discover:                      # only used with --discover; see §7.6
 
 tests:
   - id: home                   # required, unique; used in filtering, baseline entries, output
-    path: /                    # joined to the base URL (config.JoinURL: a / is added unless the path
+    path: /                    # joined to the base URL (config.JoinURL: the base's trailing slash is dropped for a /path
+                               # and kept for ?query and #hash paths; a / is added unless the path
                                # starts with /, ? or #); absolute url: also accepted for cross-origin
     scan: true                 # scan the initial state after readiness (default true)
 

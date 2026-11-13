@@ -318,6 +318,8 @@ func TestCheckTestOriginsDefaultPorts(t *testing.T) {
 		{"http://127.0.0.1:80", "http://127.0.0.1/x"},
 		{"https://app.example.com", "https://app.example.com:443/x"},
 		{"https://app.example.com:443", "https://APP.example.com/x"},
+		{"http://127.0.0.1:8080/", "http://127.0.0.1:8080/x"},
+		{"http://127.0.0.1:8080/sub/", "http://127.0.0.1:8080/other"},
 	}
 	for _, tc := range cases {
 		if err := cfg.CheckTestOrigins(tc.base, []Test{{ID: "t", URL: tc.url}}); err != nil {
@@ -341,22 +343,30 @@ func TestOddTestPathsStillLoad(t *testing.T) {
 }
 
 func TestJoinURL(t *testing.T) {
-	cases := []struct{ base, path, want string }{
-		{"http://app", "/x", "http://app/x"},
-		{"http://app/", "/x", "http://app/x"},
-		{"http://app/base", "/x", "http://app/base/x"},
-		{"http://app/", "index.html", "http://app/index.html"},
-		{"http://app", "index.html", "http://app/index.html"},
-		{"http://app", "?a=1", "http://app?a=1"},
-		{"http://app/", "?a=1", "http://app?a=1"},
-		{"http://app", "#/route", "http://app#/route"},
-		{"http://app", "/#/route", "http://app/#/route"},
-		{"http://app", "@evil.example/", "http://app/@evil.example/"},
-		{"http://app:8080/", "", "http://app:8080"},
+	// Each base, each path: "/..." paths drop the base's trailing slash, "?" and
+	// "#" attach to the base exactly as plain concatenation did, and anything else
+	// is joined with one "/".
+	bases := []string{"http://h:1", "http://h:1/", "http://h:1/sub", "http://h:1/sub/"}
+	want := map[string][]string{
+		"/x":         {"http://h:1/x", "http://h:1/x", "http://h:1/sub/x", "http://h:1/sub/x"},
+		"index.html": {"http://h:1/index.html", "http://h:1/index.html", "http://h:1/sub/index.html", "http://h:1/sub/index.html"},
+		"?a=1":       {"http://h:1?a=1", "http://h:1/?a=1", "http://h:1/sub?a=1", "http://h:1/sub/?a=1"},
+		"#/route":    {"http://h:1#/route", "http://h:1/#/route", "http://h:1/sub#/route", "http://h:1/sub/#/route"},
+		"/":          {"http://h:1/", "http://h:1/", "http://h:1/sub/", "http://h:1/sub/"},
+		"":           {"http://h:1", "http://h:1/", "http://h:1/sub", "http://h:1/sub/"},
 	}
-	for _, tc := range cases {
-		if got := JoinURL(tc.base, tc.path); got != tc.want {
-			t.Errorf("JoinURL(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
+	for path, wants := range want {
+		for i, base := range bases {
+			got := JoinURL(base, path)
+			if got != wants[i] {
+				t.Errorf("JoinURL(%q, %q) = %q, want %q", base, path, got, wants[i])
+			}
+			if (path[:min(1, len(path))] == "?" || path[:min(1, len(path))] == "#") && got != base+path {
+				t.Errorf("JoinURL(%q, %q) = %q: a ? or # path must be what concatenation gave", base, path, got)
+			}
+			if path[:min(1, len(path))] == "/" && strings.Contains(strings.TrimPrefix(got, "http://"), "//") {
+				t.Errorf("JoinURL(%q, %q) = %q: doubled slash", base, path, got)
+			}
 		}
 	}
 	// A path that looks like userinfo stays a path on the same host.

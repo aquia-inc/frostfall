@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -391,5 +392,37 @@ func TestValidateAppliesFiltersLikeARealRun(t *testing.T) {
 		if code != exitBadConfig || !strings.Contains(stderr, flag+":") {
 			t.Errorf("%s ( : exit code = %d, stderr = %q, want the same error a run gives", flag, code, stderr)
 		}
+	}
+}
+
+// Through the real entry point, a --base-url that ends in a slash keeps it for a
+// ? path (what plain concatenation produced) and never doubles it for a / path.
+func TestTrailingSlashBaseURLEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	var mu sync.Mutex
+	var uris []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		uris = append(uris, r.URL.RequestURI())
+		mu.Unlock()
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>page</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte("version: 1\ndefaults:\n  waitFor: load\ntests:\n  - id: q\n    path: \"?a=1\"\n  - id: x\n    path: /x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if code, _, stderr := runBoth(t, "--config", cfg, "--base-url", srv.URL+"/sub/", "--no-screenshots", "--baseline", "none"); code != exitOK {
+		t.Fatalf("exit code = %d (stderr: %s)", code, stderr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Under a path prefix the slash is visible on the wire: /sub/?a=1 is not /sub?a=1.
+	if !slices.Contains(uris, "/sub/?a=1") || !slices.Contains(uris, "/sub/x") || slices.Contains(uris, "/sub?a=1") {
+		t.Errorf("requests = %q, want /sub/?a=1 and /sub/x", uris)
 	}
 }

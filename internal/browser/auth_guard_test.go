@@ -179,13 +179,31 @@ func TestAppUnderAPathPrefix(t *testing.T) {
 		}
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>h</title></head><body><main id="shell"><i id="in"></i>home</main></body></html>`)
 	})
-	srv := httptest.NewServer(mux)
+	var seenMu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMu.Lock()
+		seen = append(seen, r.URL.RequestURI())
+		seenMu.Unlock()
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(srv.Close)
 	b := launch(t)
 	app := &authApp{Server: srv}
 
 	// loginPath is relative to the base URL: /login under /prefix is
 	// /prefix/login, and a trailing slash on the base changes nothing.
+	t.Cleanup(func() {
+		// A trailing slash on the base must not turn into "//" in any URL the
+		// probe, the setup flow or a test builds.
+		seenMu.Lock()
+		defer seenMu.Unlock()
+		for _, u := range seen {
+			if strings.Contains(u, "//") {
+				t.Errorf("request %q: a slash was doubled", u)
+			}
+		}
+	})
 	for _, base := range []string{srv.URL + "/prefix", srv.URL + "/prefix/"} {
 		t.Run("expired session, base "+base, func(t *testing.T) {
 			cfg := loadAuthConfig(t, base, "  storageState: "+stateFile(t, app, "1", false)+"\n  loginPath: /login\n")

@@ -665,3 +665,27 @@ func TestSkippedCountLeavesOutLinksTheExcludesRemove(t *testing.T) {
 		t.Errorf("logs = %q, want exactly the one link the excludes did not remove", logs)
 	}
 }
+
+// A base URL ending in a slash works for the whole crawl: the probe, the page
+// loads and the origin comparison do not depend on it being trimmed.
+func TestCrawlWithATrailingSlashBase(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := protectedSite(t)
+	b, err := browser.Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+	base := srv.URL + "/"
+	got, err := crawler(b, authFor(t, b, base, true), base).Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/", "/reports", "/settings"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("crawl missed %s: %v", want, got)
+		}
+	}
+}

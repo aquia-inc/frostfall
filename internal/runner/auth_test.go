@@ -431,3 +431,46 @@ func TestTestPathsAreJoinedToTheBase(t *testing.T) {
 		}
 	}
 }
+
+// A base URL that ends in a slash keeps it for a ? or # path, as plain
+// concatenation did: http://h/sub/ and ?a=1 is http://h/sub/?a=1, not
+// http://h/sub?a=1. A / path never doubles it.
+func TestTrailingSlashBaseKeepsItForQueryAndHashPaths(t *testing.T) {
+	var seen []string
+	tests := "  - id: q\n    path: \"?a=1\"\n  - id: x\n    path: /x\n  - id: r\n    path: /\n  - id: i\n    path: index.html\n"
+	if _, err := runSite(t, runOpts{noAuth: true, tests: tests, seen: &seen, baseSuffix: "/sub/"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/sub/?a=1", "/sub/x", "/sub/", "/sub/index.html"} {
+		if !slices.Contains(seen, want) {
+			t.Errorf("requests = %q, want %q among them", seen, want)
+		}
+	}
+	if slices.Contains(seen, "/sub?a=1") {
+		t.Errorf("requests = %q: the base's trailing slash was dropped for a ? path", seen)
+	}
+}
+
+// With no auth the screenshot lookup logs what it always did; for a test that
+// uses auth the log must not carry the raw selector it failed to find.
+func TestScreenshotLookupFailureLogsDoNotLeakSelectors(t *testing.T) {
+	const raw = `main > a[href="/nothing?token=SECRETTOK123"]`
+	run := func(o runOpts) []string {
+		var lines []string
+		o.log = func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }
+		o.engine, o.shots = targetEngine{raw}, t.TempDir()
+		o.tests = "  - id: dl\n    path: /linkpage\n"
+		if _, err := runSite(t, o); err != nil {
+			t.Fatal(err)
+		}
+		return lines
+	}
+	signed := strings.Join(run(runOpts{withSession: true}), "\n")
+	if strings.Contains(signed, "SECRETTOK123") || !strings.Contains(signed, "could not be captured") {
+		t.Errorf("signed-in log leaks or lost the line:\n%s", signed)
+	}
+	plain := strings.Join(run(runOpts{noAuth: true}), "\n")
+	if !strings.Contains(plain, `locating "main > a[href=\"/nothing?token=SECRETTOK123\"]"`) {
+		t.Errorf("without auth the line changed:\n%s", plain)
+	}
+}

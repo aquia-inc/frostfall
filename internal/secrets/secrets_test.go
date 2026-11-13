@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -71,6 +72,9 @@ func TestScrubSelector(t *testing.T) {
 		// Escaped operator and bracket characters in a name.
 		`div[a\=b="v"]`:     `div[a\=b]`,
 		`div[a\]b="v"] > c`: `div[a\]b] > c`,
+		// Any CSS whitespace may precede a value.
+		"a[data-x=\t\"]SECRET\"] > b": `a[data-x] > b`,
+		"a[data-x=\n\f \"]SECRET\"]":  `a[data-x]`,
 		// Quotes and brackets inside a value.
 		`a[href="/x\"]?token=SECRET"]`:   `a[href]`,
 		`a[data-x="]token=SECRET["] > b`: `a[data-x] > b`,
@@ -99,13 +103,37 @@ func TestScrubSelector(t *testing.T) {
 	}
 }
 
-func TestRedactURLFallsBackWithoutEchoingUserinfo(t *testing.T) {
-	for _, in := range []string{"http://user:S3cretPW@host/%zz?token=SECRET", "http://user:S3cretPW@host/p%zz", "://bad%zzurl"} {
+// A URL that does not parse cannot be redacted by cutting: a password may hold
+// the very characters a cut would use. It is replaced outright.
+func TestRedactURLReplacesWhatItCannotParse(t *testing.T) {
+	cases := map[string]string{
+		"http://user:a/b@host%zz":                    "http://<unparsable url>",
+		"http://user:p?ss@host%zz":                   "http://<unparsable url>",
+		"http://user:pa#ss@host%zz":                  "http://<unparsable url>",
+		"http://user:S3cret;part@host/%zz":           "http://<unparsable url>",
+		"http://user:S3cretPW@host/%zz?token=SECRET": "http://<unparsable url>",
+		// The same four without the escape: a password with / ? # ; in it is not a port.
+		"http://user:a/b@host":      "http://<unparsable url>",
+		"http://user:p?ss@host":     "http://<unparsable url>",
+		"http://user:pa#ss@host":    "http://<unparsable url>",
+		"://bad%zzurl":              "<unparsable url>",
+		"no-scheme%zz?token=SECRET": "<unparsable url>",
+	}
+	for in, want := range cases {
 		got := RedactURL(in)
-		for _, secret := range []string{"S3cretPW", "SECRET", "user:"} {
+		if got != want {
+			t.Errorf("RedactURL(%q) = %q, want %q", in, got, want)
+		}
+		for _, secret := range []string{"S3cret", "SECRET", "user", "ss@", "a/b", "part"} {
 			if strings.Contains(got, secret) {
 				t.Errorf("RedactURL(%q) = %q, still carries %q", in, got, secret)
 			}
+		}
+	}
+	// Those inputs really are unparsable, so the cases above exercise the fallback.
+	for in := range cases {
+		if _, err := url.Parse(in); err == nil {
+			t.Errorf("%q parses; the case does not test the fallback", in)
 		}
 	}
 }
