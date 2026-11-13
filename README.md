@@ -255,7 +255,8 @@ discover:                        # tuning for --discover (see Discovery below)
 tests:
   - id: home                     # required, unique; keep it stable - it is part
                                  # of every violation's baseline identity
-    path: /                      # relative to the server's base URL; must start with /
+    path: /                      # joined to the server's base URL (a leading / is
+                                 # added unless the path starts with /, ? or #)
     # url: https://example.com/  # or an absolute URL (exactly one of path/url)
     scan: true                   # scan the initial state after load (default true)
     waitFor: "[data-testid=app]" # per-test readiness override
@@ -441,8 +442,8 @@ PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
 |------|---------|
 | 0 | ran to completion, nothing broke the enforcement contract (report-only mode always exits 0) |
 | 1 | new violations broke the configured `expect` contract |
-| 2 | invalid config |
-| 3 | environment failure (browser, server unreachable, page load, step failure) |
+| 2 | invalid config, including an `auth` block that is wrong (no `signedIn`, both `setup` and `storageState`, a missing or malformed storage-state file, a `url:` test off the app's origin without `auth: false`) and an unset `${VAR}` |
+| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, and a failed login flow |
 
 Distinct codes mean CI can tell "the pages are broken" from "the tool couldn't
 run".
@@ -484,8 +485,24 @@ For values rather than structure, environment interpolation is often enough:
 ## Auth: scan pages behind a login
 
 Most real apps put their interesting pages behind a login. Frostfall signs in
-once and starts every test with that session, in one of two ways. A config
-sets exactly one of them (both or neither is exit 2), and always sets
+once and starts every test with that session. The smallest config that works:
+
+```yaml
+auth:
+  setup:
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER}" }
+      - fill: { "#password": "${A11Y_PASS}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=account-menu]"
+  signedIn: "[data-testid=account-menu]"   # on every signed-in page, on no login page
+```
+
+Run it with `A11Y_USER` and `A11Y_PASS` in the environment (an unset `${VAR}` fails
+the run with exit 2, which matters for pull requests from forks, where secrets are
+not passed). The rest of this section explains each part. A config sets exactly
+one of `setup` and `storageState` (both or neither is exit 2), and always sets
 `signedIn`.
 
 **`signedIn` (required).** A selector for something that exists on every
@@ -496,31 +513,16 @@ required because a URL alone cannot tell a login page from the app: a login can
 be rendered in place at the same URL, an identity provider's page lives on
 another origin, and a route can be renamed. A marker in the page can. It must
 be present on every page your tests load while signed in (use `auth: false` for
-the ones that are public, below). The wait is up to 5 seconds (a quarter of
-`defaults.timeout` if that is smaller), so a missing session costs that long,
-not the whole test timeout.
+the ones that are public, below). The wait is up to 5 seconds, or a quarter of
+`defaults.timeout` when that is under 20 seconds, so a missing session costs that
+long, not the whole test timeout.
 
 *Choosing it.* Pick a test id or element that only the signed-in app renders,
 such as the account menu (`[data-testid=account-menu]`) or a piece of content
 that needs the user. Do not use `main`, `nav`, `header` or a layout shell: those
 render before authentication resolves, on the login page too, and the guard
-would pass a login form.
-
-*The startup probe.* Before anything is scanned, Frostfall loads these pages in
-fresh contexts with no session and no storage: the base URL, `loginPath` (when
-set), the setup page (in setup mode), and the first explicit test that uses
-auth. They load in parallel, under the configured readiness except that a
-selector `waitFor` is replaced by `load` (a selector only signed-in pages render
-would otherwise time out every run), and the marker is waited for the same way
-the guard waits for it. If `signedIn` matches on any of them, the run stops with
-exit 3 and says which page. Two things print a `warning:` instead of failing: a
-probed page that lands off the app's origin (the root bouncing to your identity
-provider, say), where the marker could not be checked; and, if no probed page
-loaded on the app's origin at all, that the marker could not be verified as
-absent when signed out. A base URL that cannot be loaded warns, since a run that
-never loads it does not need it; any other probed page that fails to load stops
-the run. When every selected test says `auth: false` and `--discover` is off,
-there is nothing to sign in for, and the probe and the login flow are skipped.
+would pass a login form. Frostfall checks your choice at startup; see
+[the startup probe](#the-startup-probe).
 
 **A login flow (`setup`).** Frostfall opens `setup.path`, runs the steps, and
 captures what the login left behind: every cookie of the browser context
@@ -540,6 +542,11 @@ auth:
   signedIn: "[data-testid=account-menu]"
   reuse: true      # default
 ```
+
+A selector `defaults.waitFor` is ignored throughout setup (the first load and
+every `goto` step use `load` instead), since it is usually something only
+signed-in pages render. To wait for a page to hydrate, start the steps with an
+explicit `- waitFor: "<selector>"`.
 
 Setup steps are the interaction steps only (`click`, `fill`, `press`, `hover`,
 `select`, `waitFor`, `wait`, `goto`). `scan`, `keyboard`, `transcript` and
@@ -681,10 +688,15 @@ each apart from any login.
 `fill` into a field whose selector contains `password`, `passwd` or
 `type=password` has a literal value in the file. Setup steps are logged under
 `--verbose` as the action and selector only, never the value, and error
-messages never include a filled value. With auth configured, URLs in errors and
-logs are printed without userinfo, query string, `;params` or fragment (a
-`#/hash-route` is kept), so `setup.path: /login?token=...` cannot leak the
-token. The captured cookies and storage live only in memory for the run: they
+messages never include a filled value. With auth configured, URLs in errors, logs and
+reports (the report's Target line, and each result's page URL) are printed without
+userinfo, query string, `;params` or fragment (a `#/hash-route` is kept), and a
+path segment that looks like a secret is shown as `[redacted]`, so
+`--base-url http://user:pw@host` and `setup.path: /login?token=...` cannot leak.
+A path of your own is otherwise printed as written. The attribute values in axe's
+selectors are scrubbed the same way before they are fingerprinted or reported: a
+`a[href="/dl?token=..."]` becomes `a[href="/dl"]`. Without auth none of this
+changes. The captured cookies and storage live only in memory for the run: they
 are never written to disk, reports or logs. A `storageState` file is a
 credential in itself; keep it out of version control (for example `.auth/` in
 `.gitignore`).
@@ -692,7 +704,8 @@ credential in itself; keep it out of version control (for example `.auth/` in
 **Screenshots and reports show signed-in pages.** The cookies and storage are
 never written out, but what the signed-in pages display can be: element
 screenshots of violations, the HTML report, and transcripts may contain account
-data (names, emails, records). Screenshots are on by default under GitHub
+data (names, emails, records), and a transcript records the visible values of
+form fields. Screenshots are on by default under GitHub
 Actions and written to `frostfall-artifacts/`, which you may then upload as a
 build artifact. For a sensitive account, pass `--no-screenshots`, use a test
 account with synthetic data, or do not upload the artifacts.
@@ -764,12 +777,36 @@ too and goes in as an explicit test) or has a segment that looks like a secret: 
 JWT (three base64url parts joined by dots), 32 or more hex characters, or 24 or
 more base64url characters that carry a digit or mixed case and no recognizable
 word (a slug like `release-notes-2024-summary` has words and is kept). The check
-is a heuristic: it can miss a short or all-lowercase token. Without auth
-discovery output is unchanged.
+is a heuristic: it can miss a short or all-lowercase token, and it also skips
+subtrees of opaque ids (UUIDs, ObjectIds), which is why the crawl logs how many
+links it skipped (`discover: skipped N links that looked like they carry
+credentials`). Without auth discovery output is unchanged.
 
 `discover.maxPages` caps the pages scanned. Signed out that is the pages found.
 Signed in it caps page loads, dropped pages included, since each load can cost a
 login and a crawl whose pages keep being dropped must still stop.
+
+### The startup probe
+
+Before anything is scanned, Frostfall loads these pages in fresh contexts with no
+session and no storage: the base URL, `loginPath` (when set), the setup page (in
+setup mode), and the first explicit test that uses auth. They load in parallel
+with `load` readiness whatever `defaults.waitFor` is (waiting for the network to
+go idle would run out the timeout on an identity provider's page that keeps a
+request open), and the marker is waited for the same way the guard waits for it.
+If `signedIn` matches on any of them, the run stops with exit 3 and says which
+page.
+
+Two things print a `warning:` instead of failing: a probed page that lands off
+the app's origin (the root bouncing to your identity provider, say), where the
+marker could not be checked, shown as one line however many pages bounced; and,
+if no probed page loaded on the app's origin at all, that the marker could not be
+verified as absent when signed out. A page that lands off the app's origin and
+then fails to settle is still just that warning. A base URL that cannot be loaded
+warns, since a run that never loads it does not need it; any other probed page on
+the app that fails to load stops the run. When every selected test says
+`auth: false` and `--discover` is off, there is nothing to sign in for, and the
+probe and the login flow are skipped.
 
 ## Discovery: scan pages you didn't list
 
@@ -840,6 +877,9 @@ embeds a different axe version, Frostfall warns instead of reporting phantom
 "new" violations; run `--update-baseline` to realign.
 
 ## GitHub Action
+
+To scan pages behind a login, see [Auth](#auth-scan-pages-behind-a-login) for the
+minimal config and for passing credentials to the action.
 
 ```yaml
 - uses: aquia-inc/frostfall@v1

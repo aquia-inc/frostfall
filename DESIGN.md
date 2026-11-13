@@ -180,7 +180,8 @@ discover:                      # only used with --discover; see §7.6
 
 tests:
   - id: home                   # required, unique; used in filtering, baseline entries, output
-    path: /                    # relative to base URL; absolute url: also accepted for cross-origin
+    path: /                    # joined to the base URL (config.JoinURL: a / is added unless the path
+                               # starts with /, ? or #); absolute url: also accepted for cross-origin
     scan: true                 # scan the initial state after readiness (default true)
 
   - id: dashboard-direct       # fresh load of a deep route
@@ -350,12 +351,15 @@ messages; it is optional and has no default (`setup.path` is often a protected p
 through SSO and back, which is not a login page). The marker is verified before anything is
 scanned (`Auth.probeSignedOut`): the base URL, `loginPath` (when set), the setup page and the first
 explicit test that uses auth are loaded in parallel in fresh contexts with no session and no seed,
-and a marker that matches on any of them fails the run (exit 3). The readiness is the configured one
-except that a selector `waitFor` becomes `load` (the same holds for the setup flow's first load), and
-the marker is waited for with the guard's own wait (`has`, `min(5s, defaults.timeout / 4)`), so a
-marker drawn a moment after load is seen. A page that lands off the app's origin cannot be checked
-and warns; so does a run where no probed page landed on the app's origin, and an unreachable base
-URL (a failure to load any other probed page is fatal). The probe and the login flow are skipped when
+and a marker that matches on any of them fails the run (exit 3). The probe loads with `load` whatever
+`defaults.waitFor` is (networkIdle would wait out an identity provider's open request), the landing
+URL is read before anything can fail, and the marker is waited for with the guard's own wait (`has`,
+`min(5s, defaults.timeout / 4)`), so a marker drawn a moment after load is seen. The setup flow's
+first load and `goto` default also ignore a selector `defaults.waitFor`. A page that lands off the
+app's origin cannot be checked: that is a warning (one line however many pages bounced), also when
+the page then fails to settle; so is a run where no probed page landed on the app's origin, and an
+unreachable base URL (a failure to load any other probed page on the app is fatal). Warnings
+already collected are always printed. The probe and the login flow are skipped when
 every selected test has `auth: false` and discovery is off; the run keeps only the redaction.
 
 **Setup.** `setup.path` and a non-empty list of interaction steps (`scan`, `keyboard`, `transcript`
@@ -412,7 +416,7 @@ auth config (`Auth.Anonymous`). Discovered tests use the configured auth. `auth:
 `url:` is not on the base URL's origin is a config error (exit 2) unless it sets `auth: false`: the
 session's cookies are injected into the whole context, so they would go to a host the guard cannot
 judge (`CheckTestOrigins`, over the tests the run selects with `--id`/`--path`). It runs under
-`--validate` when the base URL is known without starting a server (`server.baseUrl`, `--base-url`),
+`--validate` (which also compiles the `--id`/`--path` filters like a real run) when the base URL is known without starting a server (`server.baseUrl`, `--base-url`),
 and at scan time otherwise (`serve:` binds an ephemeral port).
 
 **Allowed origins.** `allowedOrigins` lists absolute http(s) origins (validated; `NormalizeOrigin`
@@ -441,7 +445,9 @@ names a credential (`credentialMarks`: `token=`, `access_token`, `sig=`, `code=`
 `passwd=`, `key=`, `api_key`, `apikey`, `session=`, `sessionid`, `ticket=`, `signature`, `x-amz-`,
 `auth=`, `otp=`, case-insensitive substrings) or has a segment that looks like a secret
 (`tokenLike`: a JWT, 32+ hex characters, or 24+ base64url characters with a digit or mixed case and
-no word between separators); without auth the output is unchanged.
+no word between separators); a signed-in crawl logs how many links it skipped for that
+(`discover: skipped N links that looked like they carry credentials`); without auth the output is
+unchanged.
 
 **Secrets.** Only through `${ENV}` interpolation. A `fill` into a password-looking selector
 (`password`, `passwd`, `type=password`, case-insensitive) whose raw text has no `${...}` is a
@@ -452,7 +458,12 @@ URLs in errors and logs go through `RedactURL`: userinfo, query, `;params` and f
 a percent-encoded `?` or `#` in the path is cut like a real one, and a hash route is kept only up to
 the first `#`, `?`, `&` or `=` (OAuth implicit flows put the token there), so a token in
 `setup.path` cannot leak; without auth the output is unchanged. With auth configured, `PageURL` in results and transcripts (SARIF locations, the HTML report) is
-redacted the same way. The captured cookies and storage exist only in memory: never written to disk,
+redacted the same way, as is the report header's base URL and the "cannot reach" message; a path
+segment that looks like a secret (`secrets.TokenLike`) is masked as `[redacted]`. axe selectors are
+scrubbed before they are fingerprinted or reported (`secrets.ScrubSelector`: a `[href="/dl?token=x"]`
+becomes `[href="/dl"]`, and a value that still names a credential becomes `[href]`), with auth only,
+so the fingerprint scheme is unchanged for everyone else. `Violation.HTML` is never rendered or
+stored by any formatter, the baseline or the issue code, so it is not scrubbed. The captured cookies and storage exist only in memory: never written to disk,
 reports or logs, and the state type redacts itself under `%v`. That is about the session itself:
 element screenshots, the HTML report and transcripts of signed-in pages can contain account data,
 and screenshots default on under GitHub Actions, so sensitive accounts should run with
