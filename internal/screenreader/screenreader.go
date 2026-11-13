@@ -122,7 +122,10 @@ func str(v *proto.AccessibilityAXValue) string {
 
 // Line renders one node as a screen reader would announce it, e.g.
 // `checkbox "Remember me" (not checked)` or `button (no accessible name)`.
-func Line(n *proto.AccessibilityAXNode) string {
+func Line(n *proto.AccessibilityAXNode) string { return line(n, true) }
+
+// line is Line, optionally without the value of a field.
+func line(n *proto.AccessibilityAXNode, withValue bool) string {
 	role, name := str(n.Role), str(n.Name)
 	if role == "StaticText" {
 		return fmt.Sprintf("text %q", name)
@@ -135,7 +138,7 @@ func Line(n *proto.AccessibilityAXNode) string {
 		b.WriteString(" (no accessible name)")
 	}
 	st := states(n)
-	if v := str(n.Value); v != "" && v != name {
+	if v := str(n.Value); withValue && v != "" && v != name {
 		st = append([]string{fmt.Sprintf("value %q", v)}, st...)
 	}
 	if len(st) > 0 {
@@ -221,6 +224,10 @@ type Expectation struct {
 	Within string
 	Role   string
 	Name   string
+	// OmitValue leaves the focused field's value out of the sentence that says
+	// where focus is: the sentence becomes a finding, and a finding is
+	// reported, so a prefilled password or token field must not be in it.
+	OmitValue bool
 }
 
 // CheckFocus reports whether focus meets e, and when it does not, a sentence
@@ -233,7 +240,7 @@ func CheckFocus(p Page, e Expectation) (ok bool, actual string, err error) {
 	if focused == nil {
 		return false, "focus is not on any element", nil
 	}
-	actual = "focus is on " + Line(focused)
+	actual = "focus is on " + line(focused, !e.OmitValue)
 	if e.Role != "" && str(focused.Role) != e.Role {
 		return false, actual, nil
 	}

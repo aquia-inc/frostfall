@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -38,7 +39,7 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
 type Config struct {
-	Version  int                `yaml:"version"`
+	Version int `yaml:"version"`
 	// Name identifies the app in report headers. Optional: when empty it is
 	// detected from CI env, the git remote, or package.json.
 	Name     string             `yaml:"name"`
@@ -49,6 +50,13 @@ type Config struct {
 	Discover *Discover          `yaml:"discover"`
 	Profiles map[string]Profile `yaml:"profiles"`
 	Tests    []Test             `yaml:"tests"`
+
+	// Warnings are lint findings that do not stop the run; the caller
+	// prints them. Never holds a config value, only where to look.
+	Warnings []string `yaml:"-"`
+	// dir is the config file's directory, which relative paths in the
+	// config (auth.storageState) resolve against.
+	dir string
 }
 
 // Profile is a named overlay for environment differences (local vs CI). It
@@ -166,8 +174,8 @@ func (c *Config) KeyboardFor(t Test) *KeyboardStep {
 // anywhere, Frostfall is report-only: violations are reported but never fail
 // the run. Setting severity (or rules) opts into failing CI.
 type Expect struct {
-	Severity      string   `yaml:"severity"`
-	MaxViolations *int     `yaml:"maxViolations"`
+	Severity      string `yaml:"severity"`
+	MaxViolations *int   `yaml:"maxViolations"`
 	// Rules fails on new violations of these rule ids regardless of impact —
 	// for teams that enforce a curated set before adopting a severity floor.
 	Rules []string `yaml:"rules"`
@@ -192,17 +200,6 @@ func normalizeExpect(e *Expect) {
 	}
 }
 
-type Auth struct {
-	Setup        *AuthSetup `yaml:"setup"`
-	Reuse        *bool      `yaml:"reuse"`
-	StorageState string     `yaml:"storageState"`
-}
-
-type AuthSetup struct {
-	Path  string `yaml:"path"`
-	Steps []Step `yaml:"steps"`
-}
-
 type Discover struct {
 	MaxDepth int      `yaml:"maxDepth"`
 	Exclude  []string `yaml:"exclude"`
@@ -222,7 +219,16 @@ type Test struct {
 	Keyboard *KeyboardStep `yaml:"keyboard"`
 	// Transcript records the initial state's screen reader transcript.
 	Transcript *TranscriptStep `yaml:"transcript"`
+	// Auth: false runs this test in a fresh context with no session and no
+	// login guard, for public pages, signed-out states and the login page
+	// itself. Absent or true means the configured auth applies (true needs
+	// an auth block).
+	Auth *bool `yaml:"auth"`
 }
+
+// UsesAuth reports whether the config's auth block applies to t: always,
+// unless the test says auth: false.
+func (t Test) UsesAuth() bool { return t.Auth == nil || *t.Auth }
 
 // Step is one entry of the step vocabulary (DESIGN.md §4). Exactly one action
 // field is set.
@@ -541,6 +547,10 @@ func Load(path, profile string) (*Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	cfg.dir = filepath.Dir(path)
+	// Lint the raw text: interpolation has already replaced the ${VAR}
+	// references the lint looks for.
+	cfg.Warnings = lintSecrets(string(raw))
 	if err := cfg.applyProfile(profile); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -718,11 +728,10 @@ func (c *Config) validate() error {
 	if (c.Defaults.Viewport.Width == 0) != (c.Defaults.Viewport.Height == 0) {
 		return fmt.Errorf("defaults.viewport: width and height must both be set")
 	}
-	// Silently ignoring an auth block would mean scanning a login redirect
-	// and passing — the worst failure mode for this tool. Refuse until auth
-	// is implemented.
 	if c.Auth != nil {
-		return fmt.Errorf("auth: not implemented yet — remove the auth block (planned; see DESIGN.md)")
+		if err := c.validateAuth(); err != nil {
+			return err
+		}
 	}
 	if c.Discover != nil {
 		for _, pat := range c.Discover.Exclude {
@@ -759,6 +768,9 @@ func (c *Config) validate() error {
 		seen[t.ID] = true
 		if (t.Path == "") == (t.URL == "") {
 			return fmt.Errorf("test %q: exactly one of path, url must be set", t.ID)
+		}
+		if t.Auth != nil && *t.Auth && c.Auth == nil {
+			return fmt.Errorf("test %q: auth: true needs an auth block in the config; remove it, or configure auth", t.ID)
 		}
 		if t.Expect != nil && t.Expect.Severity != "" && !validSeverities[t.Expect.Severity] {
 			return fmt.Errorf("test %q: invalid expect.severity", t.ID)

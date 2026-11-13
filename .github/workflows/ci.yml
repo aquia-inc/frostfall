@@ -26,7 +26,7 @@ jobs:
         run: go vet ./...
 
       - name: Unit tests
-        run: go test ./...
+        run: go test -timeout 15m ./...
 
       - name: Integration test (fixture scan)
         # Runners ship Chrome; the fixture has 6 planted violations, so the
@@ -40,6 +40,43 @@ jobs:
           set -e
           if [ "$code" -ne 1 ]; then
             echo "expected exit 1 (violations found), got $code"
+            exit 1
+          fi
+
+      - name: Integration test (auth fixture, signed in)
+        # The fixture's protected page redirects to login unless the session
+        # cookie from the storage state is present, and carries one planted
+        # violation. Exit 1 therefore proves the session was applied AND the
+        # page was actually reached; a scan of the login page would find
+        # nothing and exit 0.
+        run: |
+          set +e
+          /tmp/frostfall --config testdata/auth/frostfall.yml
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (protected page reached, violation found), got $code"
+            exit 1
+          fi
+
+      - name: Integration test (auth fixture, no session)
+        # Same page with an empty storage state: the page redirects to login,
+        # and the run must stop with exit 3 (login-redirect guard) and say why,
+        # rather than scan the login page and pass. The message check keeps an
+        # unrelated exit 3 (a crashed browser, an unreachable server) from
+        # passing for the guard.
+        run: |
+          set +e
+          /tmp/frostfall --config testdata/auth/frostfall-nosession.yml 2> /tmp/auth-nosession.err
+          code=$?
+          set -e
+          cat /tmp/auth-nosession.err
+          if [ "$code" -ne 3 ]; then
+            echo "expected exit 3 (landed on the login page), got $code"
+            exit 1
+          fi
+          if ! grep -q "landed on the login page" /tmp/auth-nosession.err; then
+            echo "exit 3 came from something other than the login guard"
             exit 1
           fi
 

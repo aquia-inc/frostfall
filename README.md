@@ -220,6 +220,23 @@ defaults:                        # applied to every test unless overridden
     maxViolations: 0             # tolerated count of failing violations (default 0)
     rules: [image-alt]           # also fail on these rule ids at ANY impact
 
+auth:                            # optional: sign in before testing (see Auth below)
+  setup:                         # a login flow, run through the normal steps
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER}" }
+      - fill: { "#password": "${A11Y_PASS}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=account-menu]"
+  signedIn: "[data-testid=account-menu]"   # REQUIRED: a selector present on every
+                                 # signed-in page and on no login page
+  reuse: true                    # log in once, restore into every test (default)
+  # storageState: .auth/state.json   # or: a Playwright storage-state file
+  # loginPath: /login            # optional, no default: the login URL, for clearer
+                               # messages and so discovery skips it
+  # allowedOrigins: ["https://login.example.com"]   # SSO providers a setup flow
+                               # passes through (never excuses a test)
+
 baseline: .frostfall-baseline.json   # known-debt file; see step 6 above
 
 profiles:                        # named overlays for environment differences
@@ -232,13 +249,15 @@ profiles:                        # named overlays for environment differences
 
 discover:                        # tuning for --discover (see Discovery below)
   maxDepth: 3                    # crawl depth from /
-  maxPages: 100                  # hard cap on pages visited
+  maxPages: 100                  # caps pages scanned; signed in, it caps page
+                                 # loads (dropped pages included)
   exclude: ["^/logout"]          # Go regexes matched against paths
 
 tests:
   - id: home                     # required, unique; keep it stable - it is part
                                  # of every violation's baseline identity
-    path: /                      # relative to the server's base URL
+    path: /                      # joined to the server's base URL (a leading / is
+                                 # added unless the path starts with /, ? or #)
     # url: https://example.com/  # or an absolute URL (exactly one of path/url)
     scan: true                   # scan the initial state after load (default true)
     waitFor: "[data-testid=app]" # per-test readiness override
@@ -248,6 +267,8 @@ tests:
                                  # state (default false; see Keyboard audit)
     transcript: true             # also record a screen reader transcript of
                                  # the initial state (default false)
+    auth: false                  # run without the configured auth: no session,
+                                 # no login guard (public pages, signed-out states)
     expect:                      # per-test enforcement override
       severity: critical
     steps: []                    # see the step table below
@@ -422,8 +443,8 @@ PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
 |------|---------|
 | 0 | ran to completion, nothing broke the enforcement contract (report-only mode always exits 0) |
 | 1 | new violations broke the configured `expect` contract |
-| 2 | invalid config |
-| 3 | environment failure (browser, server unreachable, page load, step failure) |
+| 2 | invalid config, including an `auth` block that is wrong (no `signedIn`, both `setup` and `storageState`, a missing or malformed storage-state file, a `url:` test off the app's origin without `auth: false`) and an unset `${VAR}` |
+| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, and a failed login flow |
 
 Distinct codes mean CI can tell "the pages are broken" from "the tool couldn't
 run".
@@ -462,6 +483,343 @@ then profile, then command-line flags.
 For values rather than structure, environment interpolation is often enough:
 `baseUrl: ${APP_URL:-http://localhost:5173}`.
 
+## Auth: scan pages behind a login
+
+Most real apps put their interesting pages behind a login. Frostfall signs in
+once and starts every test with that session. The smallest config that works:
+
+```yaml
+version: 1
+server:
+  baseUrl: http://localhost:3000
+auth:
+  setup:
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER}" }
+      - fill: { "#password": "${A11Y_PASS}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=account-menu]"
+  signedIn: "[data-testid=account-menu]"   # on every signed-in page, on no login page
+tests:
+  - id: dashboard
+    path: /dashboard
+```
+
+Run it with `A11Y_USER` and `A11Y_PASS` in the environment (an unset `${VAR}` fails
+the run with exit 2, which matters for pull requests from forks, where secrets are
+not passed). The rest of this section explains each part. A config sets exactly
+one of `setup` and `storageState` (both or neither is exit 2), and always sets
+`signedIn`.
+
+**`signedIn` (required).** A selector for something that exists on every
+signed-in page and on no login page, such as `[data-testid=account-menu]`. After
+each test's first navigation settles, Frostfall waits for it; if it is missing
+the test fails as an environment error (exit 3) instead of being scanned. It is
+required because a URL alone cannot tell a login page from the app: a login can
+be rendered in place at the same URL, an identity provider's page lives on
+another origin, and a route can be renamed. A marker in the page can. It must
+be present on every page your tests load while signed in (use `auth: false` for
+the ones that are public, below). The wait is up to 5 seconds, or a quarter of
+`defaults.timeout` when that is under 20 seconds, so a missing session costs that
+long, not the whole test timeout.
+
+*Choosing it.* Pick a test id or element that only the signed-in app renders,
+such as the account menu (`[data-testid=account-menu]`) or a piece of content
+that needs the user. Do not use `main`, `nav`, `header` or a layout shell: those
+render before authentication resolves, on the login page too, and the guard
+would pass a login form. Frostfall checks your choice at startup; see
+[the startup probe](#the-startup-probe).
+
+**A login flow (`setup`).** Frostfall opens `setup.path`, runs the steps, and
+captures what the login left behind: every cookie of the browser context
+(`HttpOnly` ones included) plus the app origin's `localStorage` and
+`sessionStorage`. Each test's fresh context gets that state before its first
+navigation, so the page sees a signed-in session from its first request.
+
+That is the example above; `reuse` (default `true`) is covered below.
+
+A selector `defaults.waitFor` is ignored throughout setup (the first load and
+every `goto` step use `load` instead), since it is usually something only
+signed-in pages render. To wait for a page to hydrate, start the steps with an
+explicit `- waitFor: "<selector>"`.
+
+Setup steps are the interaction steps only (`click`, `fill`, `press`, `hover`,
+`select`, `waitFor`, `wait`, `goto`). `scan`, `keyboard`, `transcript` and
+`expectFocus` are rejected there. End the steps with a `waitFor` for something
+only the signed-in app shows, so the capture happens after the login finished.
+
+Frostfall checks that the flow worked: it must end on the app's origin, not on
+the login page, with `signedIn` present. Otherwise setup fails with exit 3
+instead of handing every test an empty session. A flow that finishes but leaves
+no cookies or storage behind prints a `warning:` line even without `--verbose`.
+
+With `reuse: true` the flow runs once, before the first test (and before
+`--discover` crawls), and the state is restored into each test. With
+`reuse: false` each test runs the flow itself inside its own context before
+loading its page. That is slower and logs in once per test, so use it only
+when the session cannot be shared (single-use tokens, per-session server
+state). `--discover` honors it too: it logs in once per page it loads, up to
+`discover.maxPages` loads, and each discovered test logs in again when it runs;
+a warning at the start of the crawl says so. `reuse` only applies to `setup`.
+
+**A storage-state file (`storageState`).** Point at a Playwright-compatible
+storage-state JSON (`cookies` plus `origins[].localStorage`) captured
+elsewhere, and Frostfall injects it the same way and skips the flow. This is
+the path for CI when credentials should not be near this config. A relative
+path resolves against the config file's directory. The file is read when the
+config loads, so a missing or malformed one is a config error, and
+`frostfall --validate` needs it to exist: write it first (see below). Cookies in
+the file that have already expired are not sent; the browser would drop them
+anyway, and the expired session then shows up as the guard below.
+
+`loginPath` is the one optional key here: the URL a signed-out visitor lands on,
+used for a clearer message when a test lands there and so that discovery skips
+it (it is explained under the guard below).
+
+```yaml
+auth:
+  storageState: .auth/state.json
+  signedIn: "[data-testid=account-menu]"
+  loginPath: /login   # optional
+```
+
+To produce the file with Playwright, log in once in a script and save the
+context's state:
+
+```js
+await context.storageState({ path: '.auth/state.json' });
+```
+
+Playwright writes `cookies` and `origins[].localStorage`, which is what Frostfall
+reads (it does not read `sessionStorage` or IndexedDB from the file).
+
+**The guard.** On the app's origin, a test fails with exit 3 when `signedIn` is
+absent. The login route is a second signal and gives a clearer message:
+
+```
+run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired
+```
+
+- **`loginPath` (optional, no default).** The path, relative to the base URL,
+  that a signed-out visitor lands on. Landing there fails the test with a
+  clearer message, and `--discover` never follows it. `setup.path` is not a
+  default: it is often a protected page that bounces through your identity
+  provider and back, which is not a login page. With a base URL of
+  `http://host/app` a `loginPath` of `/login` means `/app/login`; a trailing
+  slash on the base changes nothing. Hash-router routes count as part of the
+  path, the same way discovery treats them, so `loginPath: "/#/login"` guards a
+  HashRouter app, and a query on the hash route (`/#/login?redirect=/x`) is still
+  the login route. If your login is rendered in place at the same URL as the
+  app, leave it out: `signedIn` alone tells them apart.
+- **No exemptions.** Every guarded test is checked the same way, including one
+  whose own path is the login page. To test the login page itself, or any
+  signed-out state, set `auth: false` on that test.
+- **Other origins.** A test on the app's origin that ends up on any other origin
+  was bounced somewhere, usually an identity provider, and fails as a redirect.
+  `allowedOrigins` does not change that. The session's cookies are sent to every
+  host a test loads, so with auth configured a test whose `url:` is not on the
+  base URL's origin (`localhost` is not `127.0.0.1`) is a config error (exit 2)
+  unless it sets `auth: false`. Only the tests a run selects (`--id`, `--path`)
+  are checked. `--validate` runs the check when the base URL is known without
+  starting anything (`server.baseUrl` or `--base-url`); with `serve:` the origin
+  is an ephemeral port, so the check runs at scan time.
+- **Later in the test.** The guard runs again before and after every `scan`,
+  `keyboard`, `transcript` and `expectFocus` step, so a `goto` or click that
+  walks into the login page, or a page that redirects while it is being
+  checked, fails there, rather than reporting the login page's results. The
+  check looks at where the page is once it is ready; an app that redirects a
+  few seconds later is not caught between checks, so use a `waitFor` selector
+  for those.
+
+**Public pages and the login page: `auth: false`.** A test with `auth: false`
+gets a fresh context with no session and no guard, for a public page, a
+signed-out state, the login page itself, or a page on another origin. It is a
+no-op without an `auth` block, and `auth: true` without one is a config error:
+
+```yaml
+tests:
+  - id: pricing
+    path: /pricing
+    auth: false
+```
+
+Discovered tests use the configured auth. A page `--discover` finds that is not
+signed in (it lands on the login page or another origin, or lacks the `signedIn`
+marker) is dropped with a log line, and the crawl ends with `discover: dropped N
+of M pages (not signed in)`, printed even when N is 0. The cause is one of two:
+a public page, which you add as an explicit test with `auth: false`, or a
+signed-in page that does not render the marker, in which case pick a marker
+every signed-in page renders.
+
+**SSO and `allowedOrigins`.** If sign-in goes through an identity provider on
+another origin (Okta, Entra, Keycloak), list that origin so the setup flow may
+pass through it, and so storage the provider keeps for the session is captured.
+The flow must still finish back on the app, with `signedIn` present. An
+Okta-style setup (the selectors are illustrative; use your provider's):
+
+```yaml
+auth:
+  setup:
+    path: /login
+    steps:
+      - click: "#sign-in-with-okta"                       # leaves the app for the provider
+      - fill: { "#okta-signin-username": "${A11Y_USER}" }  # on the provider's origin
+      - fill: { "#okta-signin-password": "${A11Y_PASS}" }
+      - click: "#okta-signin-submit"
+      - waitFor: "[data-testid=account-menu]"                # back on the app
+  allowedOrigins: ["https://example.okta.com"]
+  signedIn: "[data-testid=account-menu]"
+```
+
+Entries are absolute `http(s)` origins (no path); the host is lower-cased and a
+default port dropped. Frostfall captures the storage of the base origin and of
+every allowed origin the flow visited. A setup that ends anywhere but the app's
+origin fails with a message saying where it ended, which also catches a base URL
+that redirects (to `https`, or to `www`): set `baseUrl` to the app's real origin.
+
+**Timeouts.** With `reuse: false` the login flow has its own `defaults.timeout`
+budget and the test's budget starts after it, so a slow login does not eat
+into the test. The same holds for `--discover`, whose pages get 15 seconds
+each apart from any login.
+
+**Secrets.** Put credentials in environment variables and reference them as
+`${A11Y_PASS}`. Frostfall prints a warning to stderr (it does not fail) when a
+`fill` into a field whose selector contains `password`, `passwd` or
+`type=password` has a literal value in the file. Setup steps are logged under
+`--verbose` as the action and selector only, never the value, and error
+messages never include a filled value. With auth configured, URLs in errors, logs and
+reports (the report's Target line, and each result's page URL) are printed without
+userinfo, query string, `;params` or fragment (a `#/hash-route` is kept), and a
+path segment that looks like a secret is shown as `[redacted]`, so
+`--base-url http://user:pw@host` and `setup.path: /login?token=...` cannot leak.
+A path of your own is otherwise printed as written. The masking
+also catches UUIDs and MongoDB ObjectIds, which look like tokens: they appear as
+`[redacted]` in report URLs, and discovery skips links that contain them (it logs
+how many).
+
+For tests that use auth, axe's selectors are scrubbed before they are
+fingerprinted or reported: every attribute value is dropped, whatever the
+attribute, so `a[href="/dl?token=..."]` becomes `a[href]` and
+`input[value="..."]` becomes `input[value]`. The selector is parsed, so quoted
+values containing `]` or escaped quotes and escaped names (`button[\@click=...]`)
+are handled, and nothing outside attribute brackets changes. The cost is that
+elements which differ only in an attribute value share a fingerprint, and that a
+signed-in test's fingerprints differ from an unauthenticated run of the same page
+(so baseline entries made without auth do not carry over to it). A test with
+`auth: false` is untouched, and so is a config without auth. A failing
+`expectFocus` summary for such a test omits the focused field's value. The captured cookies and storage live only in memory for the run: they
+are never written to disk, reports or logs. A `storageState` file is a
+credential in itself; keep it out of version control (for example `.auth/` in
+`.gitignore`).
+
+**Screenshots and reports show signed-in pages.** The cookies and storage are
+never written out, but what the signed-in pages display can be: element
+screenshots of violations, the HTML report, and transcripts may contain account
+data (names, emails, records), and a transcript records the visible values of
+form fields. Screenshots are on by default under GitHub
+Actions and written to `frostfall-artifacts/`, which you may then upload as a
+build artifact. For a sensitive account, pass `--no-screenshots`, use a test
+account with synthetic data, or do not upload the artifacts.
+
+A failed login (a step times out, a selector is missing) stops the run with
+exit 3 and a message naming the step: `auth setup: steps[1]: fill "#email": ...`.
+
+**Credentials in CI.** The GitHub Action runs the binary in your job, so it
+reads whatever environment the job has. Map secrets to variables at job level
+(or workflow level) and reference them with `${...}` in the config:
+
+```yaml
+jobs:
+  a11y:
+    runs-on: ubuntu-latest
+    env:
+      A11Y_USER: ${{ secrets.A11Y_USER }}
+      A11Y_PASS: ${{ secrets.A11Y_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquia-inc/frostfall@v1
+        with:
+          base-url: https://staging.example.com
+```
+
+With the Docker image, pass the variables by name so the values stay out of the
+command line and shell history:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -e A11Y_USER -e A11Y_PASS \
+  -v "$PWD:/work" ghcr.io/aquia-inc/frostfall:v1 --base-url https://staging.example.com
+```
+
+To use a `storageState` from a CI secret, store the file's JSON in the secret
+and write it to disk before the scan (and before anything that loads the config,
+`--validate` included), through `env` (never interpolated into the script):
+
+```yaml
+- name: Write storage state
+  env:
+    FROSTFALL_STATE: ${{ secrets.FROSTFALL_STORAGE_STATE }}
+  run: |
+    mkdir -p .auth
+    printf '%s' "$FROSTFALL_STATE" > .auth/state.json
+    chmod 600 .auth/state.json
+- uses: aquia-inc/frostfall@v1
+```
+
+If the secret holds the file base64-encoded, use `printf '%s' "$FROSTFALL_STATE" | base64 -d > .auth/state.json`.
+For the Docker image, put the file under the directory you mount at `/work`;
+the path in the config resolves against the config file as usual.
+
+`--discover` crawls with the same session, so it sees the app and not the
+login page, and it never follows what would end that session: with auth on it
+skips paths that look like a logout (`/logout`, `/sign-out`, `/log_off`,
+`/signoff`, matched case-insensitively) and the login page itself, on top of
+your `discover.exclude`. A page that turns out to be the login page, another
+origin, or unmarked when the crawl loads it is dropped rather than recorded as a
+page. If the root page itself does that, the crawl fails the same way a test
+does. Discovered paths become test ids in reports, baselines and issues, so with
+auth on they are cleaned first, before your excludes and the login page exclusion
+see them: a `?` in the path and `;params` are cut, and a hash route's query and
+any nested fragment are dropped (`/#/home#access_token=...` becomes `/#/home`).
+A link is skipped when its path still names a credential (`token=`,
+`access_token`, `sig=`, `code=`, `password=`, `passwd=`, `key=`, `api_key`,
+`apikey`, `session=`, `sessionid`, `ticket=`, `signature`, `x-amz-`, `auth=`,
+`otp=`, matched case-insensitively, so a page called `/signature-pad` is skipped
+too and goes in as an explicit test) or has a segment that looks like a secret: a
+JWT (three base64url parts joined by dots), 32 or more hex characters, or 24 or
+more base64url characters that carry a digit or mixed case and no recognizable
+word (a slug like `release-notes-2024-summary` has words and is kept). The check
+is a heuristic: it can miss a short or all-lowercase token, and it also skips
+subtrees of opaque ids (UUIDs, ObjectIds), which is why the crawl logs how many
+links it skipped (`discover: skipped N links that looked like they carry
+credentials`). Without auth discovery output is unchanged.
+
+`discover.maxPages` caps the pages scanned. Signed out that is the pages found.
+Signed in it caps page loads, dropped pages included, since each load can cost a
+login and a crawl whose pages keep being dropped must still stop.
+
+### The startup probe
+
+Before anything is scanned, Frostfall loads these pages in fresh contexts with no
+session and no storage: the base URL, `loginPath` (when set), the setup page (in
+setup mode), and the first explicit test that uses auth. They load in parallel
+with `load` readiness whatever `defaults.waitFor` is (waiting for the network to
+go idle would run out the timeout on an identity provider's page that keeps a
+request open), and the marker is waited for the same way the guard waits for it.
+If `signedIn` matches on any of them, the run stops with exit 3 and says which
+page.
+
+Two things print a `warning:` instead of failing: a probed page that lands off
+the app's origin (the root bouncing to your identity provider, say), where the
+marker could not be checked, shown as one line however many pages bounced; and,
+if no probed page loaded on the app's origin at all, that the marker could not be
+verified as absent when signed out. A page that lands off the app's origin and
+then fails to settle is still just that warning. A base URL that cannot be loaded
+warns, since a run that never loads it does not need it; any other probed page on
+the app that fails to load stops the run. When every selected test says
+`auth: false` and `--discover` is off, there is nothing to sign in for, and the
+probe and the login flow are skipped.
+
 ## Discovery: scan pages you didn't list
 
 ```bash
@@ -479,6 +837,9 @@ It understands real SPAs:
 - **Numeric route parameters** are deduplicated by shape: a data table linking
   to `/items/1` through `/items/1000` gets one representative scan, not a
   thousand.
+
+With `auth` configured the crawl is signed in and skips logout-like paths and
+the login page (see Auth above).
 
 Discovered pages get generated test ids (`discovered:/#/users`) and use your
 defaults. Two caveats: a crawler cannot reach the states behind clicks, so keep
@@ -523,11 +884,19 @@ these are normalized away:
 - sibling reordering (`:nth-child` is dropped when anything better identifies
   the element)
 
+With auth, a test that uses it fingerprints a selector with its attribute values
+dropped (see Auth), so elements that differ only in an attribute value are one
+violation there, and its fingerprints differ from an unauthenticated run's.
+Tests with `auth: false` keep their exact fingerprints.
+
 The baseline records the axe-core version it was created with. When the binary
 embeds a different axe version, Frostfall warns instead of reporting phantom
 "new" violations; run `--update-baseline` to realign.
 
 ## GitHub Action
+
+To scan pages behind a login, see [Auth](#auth-scan-pages-behind-a-login) for the
+minimal config and for passing credentials to the action.
 
 ```yaml
 - uses: aquia-inc/frostfall@v1

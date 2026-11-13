@@ -20,6 +20,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/fingerprint"
 	"github.com/aquia-inc/frostfall/internal/keyboard"
 	"github.com/aquia-inc/frostfall/internal/screenreader"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // Result is one classified violation.
@@ -139,9 +140,12 @@ func (r *Run) EnforcedFailures(def config.Expect, perTest map[string]config.Expe
 }
 
 type Runner struct {
-	Browser  *browser.Browser
-	Engine   engine.Engine
-	Config   *config.Config
+	Browser *browser.Browser
+	Engine  engine.Engine
+	Config  *config.Config
+	// Auth seeds every test's context with the configured session; nil runs
+	// signed out.
+	Auth     *browser.Auth
 	BaseURL  string
 	Baseline *baseline.File
 	// ScreenshotDir enables element screenshots for new (non-baselined)
@@ -152,6 +156,24 @@ type Runner struct {
 	Log           func(format string, args ...any)
 
 	baselineIdx map[string]baseline.Violation
+	// afterOp, when set, runs right after a check that reports on the page
+	// and just before its landing re-check. Tests use it to move the page
+	// into the login page at exactly that point, which no real page can be
+	// timed to do.
+	afterOp func(s *browser.Session, op string)
+}
+
+// recheck is the landing check that follows a check which reported on the
+// page: if the check walked the page somewhere it must not be, its results
+// describe that page, and the redirect is reported instead of them.
+func (r *Runner) recheck(s *browser.Session, op string) error {
+	if r.afterOp != nil {
+		r.afterOp(s, op)
+	}
+	if err := s.CheckLanding(); err != nil {
+		return fmt.Errorf("after %s: %w", op, err)
+	}
+	return nil
 }
 
 func (r *Runner) logf(format string, args ...any) {
@@ -189,19 +211,36 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	d := r.Config.Defaults
 	url := t.URL
 	if url == "" {
-		url = r.BaseURL + t.Path
+		url = config.JoinURL(r.BaseURL, t.Path)
 	}
 	waitFor := t.WaitFor
 	if waitFor == "" {
 		waitFor = d.WaitFor
 	}
 
-	r.logf("test %s: loading %s", t.ID, url)
-	session, err := r.Browser.NewSession(url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
+	auth := r.Auth
+	if !t.UsesAuth() {
+		// auth: false is a fresh, signed-out context with no guard. It still
+		// belongs to a run with auth, whose URLs are printed redacted.
+		auth = auth.Anonymous()
+	}
+	shown := url
+	if r.Auth != nil {
+		shown = browser.RedactURL(url) // a signed-in run's URLs can carry tokens
+	}
+	r.logf("test %s: loading %s", t.ID, shown)
+	session, err := r.Browser.NewAuthSession(auth, url, d.Viewport, waitFor, d.SettleTime.Std(), d.Timeout.Std())
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	defer session.Close()
+	// From here url is only ever reported, as the PageURL of results and
+	// transcripts (SARIF locations, the HTML report). With auth configured it
+	// goes out redacted, like every other printed URL: userinfo, the query,
+	// ;params and the fragment are dropped, and a path segment that looks like a
+	// secret is masked. A path of your own is otherwise printed as written, so
+	// keep credentials out of it.
+	url = shown
 	cov = newCoverage()
 
 	scanInitial := t.Scan == nil || *t.Scan
@@ -213,8 +252,14 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 		results = append(results, res...)
 	}
 	if tr := t.Transcript; tr != nil && !tr.Off {
+		if err := session.CheckLanding(); err != nil {
+			return nil, nil, nil, fmt.Errorf("before the initial transcript: %w", err)
+		}
 		lines, err := screenreader.Transcript(session, tr.Scope)
 		if err != nil {
+			return nil, nil, nil, err
+		}
+		if err := r.recheck(session, "the initial transcript"); err != nil {
 			return nil, nil, nil, err
 		}
 		transcripts = append(transcripts, Transcript{TestID: t.ID, Label: "initial", PageURL: url, Lines: lines})
@@ -223,6 +268,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	// found it, but its Tab presses can fire focus handlers that change the
 	// DOM, which the scan and transcript above must not see.
 	if k := r.Config.KeyboardFor(t); k != nil {
+		if err := session.CheckLanding(); err != nil {
+			return nil, nil, nil, fmt.Errorf("before the initial keyboard audit: %w", err)
+		}
 		res, err := r.keyboard(ctx, session, t, url, "initial", *k, cov)
 		if err != nil {
 			return nil, nil, nil, err
@@ -232,6 +280,14 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 
 	for i, step := range t.Steps {
 		label := "step-" + strconv.Itoa(i)
+		// A goto or click can walk into the login page after the first load
+		// passed its check. Every step that reports on the page re-checks
+		// first, so nothing is ever scanned, audited or transcribed from it.
+		if reports(step) {
+			if err := session.CheckLanding(); err != nil {
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
+			}
+		}
 		if tr := step.Transcript; tr != nil {
 			if tr.Label != "" {
 				label = tr.Label
@@ -239,6 +295,9 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 			r.logf("test %s: transcript (%s)", t.ID, label)
 			lines, err := screenreader.Transcript(session, tr.Scope)
 			if err != nil {
+				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
+			}
+			if err := r.recheck(session, "the transcript"); err != nil {
 				return nil, nil, nil, fmt.Errorf("steps[%d]: %w", i, err)
 			}
 			transcripts = append(transcripts, Transcript{TestID: t.ID, Label: label, PageURL: url, Lines: lines})
@@ -285,6 +344,17 @@ func (r *Runner) runTest(ctx context.Context, t config.Test) (results []Result, 
 	return results, transcripts, cov, nil
 }
 
+// signedIn reports whether t runs with the config's auth: there is an auth
+// block and the test has not opted out. Such a test sees account data, which
+// is what the scrubbing and masking of what it reports is for.
+func (r *Runner) signedIn(t config.Test) bool { return r.Auth != nil && t.UsesAuth() }
+
+// reports is whether a step produces findings or evidence from the page, as
+// opposed to driving it.
+func reports(st config.Step) bool {
+	return st.Scan != nil || st.Keyboard != nil || st.Transcript != nil || st.ExpectFocus != nil
+}
+
 // mergeRules layers rule toggles (defaults, then test, then step) and keeps
 // only the keyboard rules or only the engine's: axe rejects ids it does not
 // know, so frostfall/ toggles must never reach it.
@@ -310,6 +380,12 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 	}
 	if err != nil {
 		return nil, fmt.Errorf("keyboard audit %q: %w", label, err)
+	}
+	// Tab presses can fire handlers that navigate. If the audit walked the
+	// page into the login page, its findings describe that page: report the
+	// redirect, not them.
+	if err := r.recheck(session, fmt.Sprintf("keyboard audit %q", label)); err != nil {
+		return nil, err
 	}
 	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
 	return r.results(session, t, url, label, audit.Violations), nil
@@ -338,8 +414,13 @@ func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label
 		return nil, nil
 	}
 	r.logf("test %s: expectFocus (%s)", t.ID, label)
-	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name})
+	ok, actual, err := screenreader.CheckFocus(session, screenreader.Expectation{Within: e.Within, Role: e.Role, Name: e.Name, OmitValue: r.signedIn(t)})
 	if err != nil {
+		return nil, err
+	}
+	// Reading focus can run handlers too; do not judge or report a page the
+	// check left behind.
+	if err := r.recheck(session, fmt.Sprintf("expectFocus %q", label)); err != nil {
 		return nil, err
 	}
 	cov.record(checkExpectFocus, nil)
@@ -377,6 +458,11 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	if err != nil {
 		return nil, fmt.Errorf("scan %q: %w", label, err)
 	}
+	// A page that navigates while axe runs (a late client-side redirect)
+	// would have its login page's findings reported as this page's.
+	if err := r.recheck(session, fmt.Sprintf("scan %q", label)); err != nil {
+		return nil, err
+	}
 	cov.record(checkAxe, rules)
 	return r.results(session, t, url, label, violations), nil
 }
@@ -385,6 +471,19 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 func (r *Runner) results(session *browser.Session, t config.Test, url, label string, violations []engine.Violation) []Result {
 	results := make([]Result, 0, len(violations))
 	for _, v := range violations {
+		// The raw selector finds the element for its screenshot; everything
+		// that is fingerprinted, stored or printed gets the scrubbed one: axe
+		// puts attribute values in selectors (a link's href, a field's value, a
+		// data-* token), and every one of them is dropped. This is for tests that
+		// use auth, which see account data. A test with auth: false, or a config
+		// without auth, is untouched and its fingerprints are exactly what they
+		// always were. For a signed-in test, elements that differ only in an
+		// attribute value now share a fingerprint, and the fingerprints differ
+		// from those of an unauthenticated run of the same page.
+		raw := v.Target
+		if r.signedIn(t) {
+			v.Target = secrets.ScrubSelector(raw)
+		}
 		res := Result{
 			Violation:    v,
 			TestID:       t.ID,
@@ -399,7 +498,7 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 		// assertion), so there is nothing to photograph.
 		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation {
 			if _, known := r.baselineIdx[res.Fingerprint]; !known {
-				res.ScreenshotPath = r.captureScreenshot(session, res)
+				res.ScreenshotPath = r.captureScreenshot(session, res, raw, r.signedIn(t))
 			}
 		}
 		results = append(results, res)
@@ -409,9 +508,15 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 
 // captureScreenshot best-effort shoots the violating element. Failure is
 // logged, never fatal: a violation without a picture still counts.
-func (r *Runner) captureScreenshot(session *browser.Session, res Result) string {
-	png, err := session.CaptureElement(res.Target)
+func (r *Runner) captureScreenshot(session *browser.Session, res Result, target string, signedIn bool) string {
+	png, err := session.CaptureElement(target)
 	if err != nil {
+		if signedIn {
+			// The error names the raw selector, which is the one thing that was
+			// scrubbed before anything else saw it.
+			r.logf("screenshot %s: the element could not be captured", res.Fingerprint)
+			return ""
+		}
 		r.logf("screenshot %s: %v", res.Fingerprint, err)
 		return ""
 	}

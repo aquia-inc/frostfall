@@ -55,37 +55,94 @@ func (b *Browser) Close() {
 // Session is one test's page in its own incognito browser context.
 // It implements engine.Page.
 type Session struct {
+	// raw is the page with no deadline; page is raw under the current
+	// budget. They are kept apart so the budget can be restarted (a login
+	// flow runs under its own, then the test's starts fresh).
+	raw     *rod.Page
 	page    *rod.Page
 	ctx     *rod.Browser
 	timeout time.Duration
+	// seed unregisters the auth storage script; nil when there is none.
+	seed func() error
+	// auth lets a step re-check that the session is still signed in; nil
+	// for an unauthenticated session, and for an auth: false test's.
+	auth *Auth
+	// redact prints URLs in this session's errors without their query and
+	// other secrets; set for authenticated runs only, so a config without
+	// auth reports exactly what it always did.
+	redact bool
+}
+
+// setTimeout restarts the session's time budget at d.
+func (s *Session) setTimeout(d time.Duration) {
+	s.page.CancelTimeout()
+	s.timeout = d
+	s.page = s.raw.Timeout(d)
 }
 
 // NewSession opens a page at url in a fresh incognito context and waits for
 // per-page readiness.
 func (b *Browser) NewSession(url string, vp config.Viewport, waitFor string, settle, timeout time.Duration) (*Session, error) {
+	return b.NewAuthSession(nil, url, vp, waitFor, settle, timeout)
+}
+
+// open creates a session in a fresh incognito context, seeded with state
+// (nil for none) but not yet navigated anywhere. Cookies go in on the
+// context and storage through a script that runs before any page script of
+// the first load, so the page sees its session from its very first request.
+func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) (*Session, error) {
 	ctx, err := b.rod.Incognito()
 	if err != nil {
 		return nil, fmt.Errorf("creating browser context: %w", err)
 	}
+	if state != nil && len(state.cookies) > 0 {
+		// SetCookies(nil) would clear instead; the guard above keeps it non-nil.
+		if err := ctx.SetCookies(state.cookies); err != nil {
+			ctx.Close()
+			return nil, fmt.Errorf("injecting auth cookies (the browser rejected one: check each cookie's name, domain and path): %w", err)
+		}
+	}
 	page, err := ctx.Page(proto.TargetCreateTarget{URL: ""})
 	if err != nil {
+		ctx.Close()
 		return nil, err
 	}
 	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width: vp.Width, Height: vp.Height, DeviceScaleFactor: 1,
 	}); err != nil {
 		page.Close()
+		ctx.Close()
 		return nil, err
 	}
-	s := &Session{page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
-	if err := s.navigate(url, waitFor, settle); err != nil {
-		page.Close()
-		return nil, err
+	s := &Session{raw: page, page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
+	if state != nil && len(state.origins) > 0 {
+		src, err := state.seedScript()
+		if err == nil {
+			s.seed, err = page.EvalOnNewDocument(src)
+		}
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("injecting auth storage: %w", err)
+		}
 	}
 	return s, nil
 }
 
-func (s *Session) Close() { s.page.CancelTimeout().Close() }
+// Close closes the page and disposes its context, so a signed-in context's
+// cookies do not outlive its test.
+func (s *Session) Close() {
+	s.page.CancelTimeout().Close()
+	s.ctx.Close()
+}
+
+// dropSeed stops the auth storage script from running on later documents.
+// Best effort: the page is closing soon either way.
+func (s *Session) dropSeed() {
+	if s.seed != nil {
+		_ = s.seed()
+		s.seed = nil
+	}
+}
 
 // idleWindow is how long the network must be quiet before networkIdle
 // readiness completes. Shared by the navigation and step paths so they
@@ -126,6 +183,9 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 		idle = s.newIdleWaiter()
 	}
 	if err := s.page.Navigate(url); err != nil {
+		if s.redact {
+			url = RedactURL(url)
+		}
 		return fmt.Errorf("navigating to %s: %w", url, err)
 	}
 	if idle != nil {
@@ -232,7 +292,7 @@ func (s *Session) Step(st config.Step, baseURL, defaultWait string, settle time.
 		time.Sleep(st.Wait.Std())
 		return nil
 	case st.Goto != "":
-		return s.navigate(baseURL+st.Goto, defaultWait, settle)
+		return s.navigate(config.JoinURL(baseURL, st.Goto), defaultWait, settle)
 	}
 	return fmt.Errorf("unhandled step")
 }

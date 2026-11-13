@@ -109,7 +109,28 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "config error:", err)
 		return exitBadConfig
 	}
+	for _, w := range cfg.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
 	if *validateOnly {
+		// The filters are compiled and applied the way a real run would, so a bad
+		// --id or --path regex fails here too, with the same error, whatever the
+		// config has in it.
+		selected, ferr := filterTests(cfg.Tests, *idFilter, *pathFilter)
+		if ferr != nil {
+			fmt.Fprintln(os.Stderr, "config error:", ferr)
+			return exitBadConfig
+		}
+		// With auth, a test on another origin is a config error. Where the base
+		// URL is known without starting anything (baseUrl or --base-url) that is
+		// checked here; with serve: the origin is an ephemeral port, so it is
+		// checked at scan time.
+		if base := knownBaseURL(cfg, *baseURL, *serveDir); cfg.Auth != nil && base != "" {
+			if cerr := cfg.CheckTestOrigins(base, selected); cerr != nil {
+				fmt.Fprintln(os.Stderr, "config error:", cerr)
+				return exitBadConfig
+			}
+		}
 		fmt.Println("config OK")
 		return exitOK
 	}
@@ -130,6 +151,15 @@ func run(args []string) int {
 		return code
 	}
 	defer cleanup()
+	// The session reaches every host a test loads, so with auth a test must
+	// stay on the app's origin (or opt out). Known only now: --base-url and
+	// serve: decide the origin.
+	// Only the tests this run selects: --id and --path must not be refused over
+	// tests they do not run.
+	if err := cfg.CheckTestOrigins(base, tests); err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
+		return exitBadConfig
+	}
 
 	bp := cfg.Baseline
 	if *baselinePath != "" {
@@ -179,8 +209,40 @@ func run(args []string) int {
 	if (*screenshots || os.Getenv("GITHUB_ACTIONS") == "true") && !*noScreenshots {
 		shotDir = *screenshotDir
 	}
+	// Auth runs its login flow (reuse: true) here, once, before the first test
+	// or the crawl: both need the session, and a broken login should stop the
+	// run before any page is scanned signed out.
+	authOpts := browser.AuthOptions{
+		Warn: func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) },
+	}
+	if *verbose {
+		authOpts.Log = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+	}
+	// Nothing to sign in for when every selected test says auth: false and
+	// there is no discovery: skip the probe and the login flow, and keep only
+	// the redaction a run with an auth block has.
+	needAuth := *discoverFlag
+	for _, t := range tests {
+		if t.UsesAuth() {
+			needAuth = true
+			if authOpts.FirstTest == "" {
+				authOpts.FirstTest = t.Path
+				if t.URL != "" {
+					authOpts.FirstTest = t.URL
+				}
+			}
+		}
+	}
+	var authn *browser.Auth
+	if cfg.Auth != nil && !needAuth {
+		authn = browser.RedactingAuth()
+	} else if authn, err = browser.NewAuth(b, cfg, base, authOpts); err != nil {
+		fmt.Fprintln(os.Stderr, "auth error:", err)
+		return exitEnvironment
+	}
 	r := &runner.Runner{
 		Browser:       b,
+		Auth:          authn,
 		Engine:        eng,
 		Config:        cfg,
 		BaseURL:       base,
@@ -190,7 +252,10 @@ func run(args []string) int {
 		Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
 	if *discoverFlag {
-		discovered, derr := discoverTests(b, base, cfg, tests)
+		if w := discoverAuthWarning(cfg); w != "" {
+			fmt.Fprintln(os.Stderr, "warning:", w)
+		}
+		discovered, derr := discoverTests(b, authn, base, cfg, tests)
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "discover error:", derr)
 			return exitEnvironment
@@ -283,7 +348,7 @@ func run(args []string) int {
 			ferr = format.HTML(f, res, format.RunMeta{
 				Date:        time.Now(),
 				App:         appname.Detect(".", cfg.Name),
-				BaseURL:     base,
+				BaseURL:     reportedBase(base, cfg),
 				Standard:    cfg.Defaults.Standard,
 				Profile:     activeProfileName(profileReq, cfg),
 				ToolVersion: version,
@@ -437,16 +502,56 @@ func activeProfileName(req string, cfg *config.Config) string {
 	}
 }
 
+// reportedBase is the base URL as a report may show it. With auth configured it
+// is redacted (userinfo, query, params, fragment): the report header would
+// otherwise print ciuser:password@host straight into a file that gets
+// uploaded. Without auth it is unchanged.
+func reportedBase(base string, cfg *config.Config) string {
+	if cfg.Auth != nil {
+		return browser.RedactURL(base)
+	}
+	return base
+}
+
+// knownBaseURL is the base URL a run would use when it can be known without
+// starting a server: --base-url, else the config's baseUrl. "" for serve mode,
+// whose origin is an ephemeral port.
+func knownBaseURL(cfg *config.Config, baseURLFlag, serveFlag string) string {
+	switch {
+	case baseURLFlag != "":
+		return baseURLFlag
+	case serveFlag != "", cfg.Server == nil:
+		return ""
+	}
+	return cfg.Server.BaseURL
+}
+
+// discoverAuthWarning says what a crawl costs when the session cannot be
+// shared: with auth.reuse: false every page it loads runs the login flow, up
+// to discover.maxPages of them. "" when it does not apply.
+func discoverAuthWarning(cfg *config.Config) string {
+	if cfg.Auth == nil || cfg.Auth.Setup == nil || cfg.Auth.ReuseSetup() {
+		return ""
+	}
+	max := 100
+	if cfg.Discover != nil && cfg.Discover.MaxPages > 0 {
+		max = cfg.Discover.MaxPages
+	}
+	return fmt.Sprintf("auth.reuse is false, so discovery logs in once per page it loads, up to discover.maxPages (%d) loads, "+
+		"and each discovered test logs in again when it runs", max)
+}
+
 // discoverTests crawls from the root and synthesizes fresh-load tests for
 // pages no explicit test covers. Explicit tests always win on a path
 // collision — discovery adds breadth, never overrides depth.
-func discoverTests(b *browser.Browser, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
 	opts := config.Discover{MaxDepth: 3, MaxPages: 100}
 	if cfg.Discover != nil {
 		opts = *cfg.Discover
 	}
 	crawler := &discover.Crawler{
 		Browser:  b,
+		Auth:     authn,
 		BaseURL:  base,
 		Options:  opts,
 		Defaults: cfg.Defaults,
@@ -496,14 +601,14 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	noop := func() {}
 	switch {
 	case baseURLFlag != "":
-		return probeAttach(baseURLFlag, noop)
+		return probeAttach(baseURLFlag, noop, cfg.Auth != nil)
 	case serveFlag != "":
 		return startStatic(serveFlag, true)
 	case cfg.Server == nil:
 		fmt.Fprintln(os.Stderr, "no server configured: set server: in config or pass --base-url / --serve")
 		return "", noop, exitBadConfig
 	case cfg.Server.BaseURL != "":
-		return probeAttach(cfg.Server.BaseURL, noop)
+		return probeAttach(cfg.Server.BaseURL, noop, cfg.Auth != nil)
 	case cfg.Server.Serve != "":
 		spa := cfg.Server.SPAFallback == nil || *cfg.Server.SPAFallback
 		return startStatic(cfg.Server.Serve, spa)
@@ -513,15 +618,19 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	}
 }
 
-func probeAttach(url string, cleanup func()) (string, func(), int) {
+func probeAttach(url string, cleanup func(), redact bool) (string, func(), int) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
 	if err != nil || resp.StatusCode >= 500 {
+		shown := url
+		if redact {
+			shown = browser.RedactURL(url) // userinfo in the base URL is a credential
+		}
 		fmt.Fprintf(os.Stderr,
-			"cannot reach %s — is the server running? (or use --serve for a static build)\n", url)
+			"cannot reach %s — is the server running? (or use --serve for a static build)\n", shown)
 		return "", cleanup, exitEnvironment
 	}
 	return url, cleanup, exitOK

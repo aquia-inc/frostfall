@@ -5,6 +5,7 @@
 package discover
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/aquia-inc/frostfall/internal/browser"
 	"github.com/aquia-inc/frostfall/internal/config"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 type Crawler struct {
@@ -21,16 +23,23 @@ type Crawler struct {
 	BaseURL  string
 	Options  config.Discover
 	Defaults config.Defaults
-	Log      func(format string, args ...any)
+	// Auth seeds every crawled page's context; nil crawls signed out. With
+	// auth.reuse: false each page loaded runs the login flow itself, up to
+	// MaxPages times.
+	Auth *browser.Auth
+	Log  func(format string, args ...any)
 }
 
 // Run crawls breadth-first from the root path and returns discovered paths in
-// visit order, root first. Pages that fail to load are skipped, not fatal:
-// partial discovery beats none.
+// visit order, root first. A page that fails to load is not fatal and is not
+// expanded, but it stays in the result: its failure is then reported when it
+// is scanned, rather than the page going unmentioned. Signed in, a page that
+// turns out to be the login page (or an unallowed origin) is dropped from the
+// result instead, and the crawl fails if that is the root.
 func (c *Crawler) Run() ([]string, error) {
 	base, err := url.Parse(c.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parsing base url: %w", err)
+		return nil, fmt.Errorf("base url %s is not a valid URL", browser.RedactURL(c.BaseURL))
 	}
 	excludes := make([]*regexp.Regexp, 0, len(c.Options.Exclude))
 	for _, pat := range c.Options.Exclude {
@@ -39,6 +48,21 @@ func (c *Crawler) Run() ([]string, error) {
 			return nil, fmt.Errorf("discover.exclude %q: %w", pat, err)
 		}
 		excludes = append(excludes, re)
+	}
+	if c.Auth != nil {
+		// A crawl that follows a logout link signs itself out and reads every
+		// later page as the login page; the login page itself is no page to
+		// scan. Neither is configurable away, both are always wrong.
+		excludes = append(excludes, c.Auth.DiscoverExcludes()...)
+	}
+
+	// These paths become test ids in reports, baselines and issues, so a
+	// signed-in crawl cleans them before anything else looks at them. Signed
+	// out nothing is touched: the output stays as it always was.
+	var clean func(string) (string, bool)
+	credentialLooking := map[string]bool{}
+	if c.Auth != nil {
+		clean = cleanAuthPath
 	}
 
 	type node struct {
@@ -49,23 +73,56 @@ func (c *Crawler) Run() ([]string, error) {
 	seen := map[string]bool{"/": true}
 	seenShape := map[string]bool{ShapeKey("/"): true}
 	var found []string
+	dropped, loads := 0, 0
+	// maxPages caps what is scanned. Signed out that is the pages found. Signed
+	// in it caps page loads, dropped pages included: each load can cost a
+	// login (reuse: false), and a crawl whose pages keep being dropped would
+	// otherwise never stop.
+	more := func() bool {
+		if c.Auth != nil {
+			return loads < c.Options.MaxPages
+		}
+		return len(found) < c.Options.MaxPages
+	}
 
-	for len(queue) > 0 && len(found) < c.Options.MaxPages {
+	for len(queue) > 0 && more() {
 		n := queue[0]
 		queue = queue[1:]
+		// Signed in, pages at the depth limit are still loaded once: their
+		// links are not followed, but a page that redirects to login must not
+		// become a test that fails the run.
+		var links []string
+		var err error
+		if n.depth < c.Options.MaxDepth || c.Auth != nil {
+			links, err = c.collectLinks(n.path)
+			loads++
+		}
+		if errors.Is(err, browser.ErrLoginRedirect) {
+			// A root that redirects to the login page means the session was not
+			// applied: every link on it would be the login page's, and the crawl
+			// would quietly cover nothing. Deeper pages that do it are dropped,
+			// never recorded as pages.
+			if n.depth == 0 {
+				return nil, err
+			}
+			dropped++
+			if c.Log != nil {
+				c.Log("discover: dropping %s: %s (a public page belongs in the config as an explicit test with auth: false; "+
+					"a signed-in page that does not render the signedIn marker needs a marker every signed-in page renders)", c.shown(n.path), err)
+			}
+			continue
+		}
 		found = append(found, n.path)
 		if n.depth >= c.Options.MaxDepth {
 			continue
 		}
-
-		links, err := c.collectLinks(n.path)
 		if err != nil {
 			if c.Log != nil {
-				c.Log("discover: skipping %s: %v", n.path, err)
+				c.Log("discover: not following links of %s: %v", c.shown(n.path), err)
 			}
 			continue
 		}
-		for _, p := range FilterLinks(base, links, excludes) {
+		for _, p := range filterLinks(base, links, excludes, clean, func(p string) { credentialLooking[p] = true }) {
 			shape := ShapeKey(p)
 			if !seen[p] && !seenShape[shape] {
 				seen[p] = true
@@ -74,11 +131,72 @@ func (c *Crawler) Run() ([]string, error) {
 			}
 		}
 	}
+	if c.Auth != nil && c.Log != nil && len(credentialLooking) > 0 {
+		// Whole subtrees of opaque ids (UUIDs, ObjectIds) look like tokens too, so
+		// say how many links were left out and why.
+		c.Log("discover: skipped %d links that looked like they carry credentials", len(credentialLooking))
+	}
+	if c.Auth != nil && c.Log != nil {
+		// Always said, zero included: a crawl that dropped nothing and one
+		// that was not told are different things to a reader.
+		c.Log("discover: dropped %d of %d pages (not signed in)", dropped, dropped+len(found))
+	}
 	return found, nil
 }
 
+var pathParams = regexp.MustCompile(`;[^/]*`)
+
+// cleanAuthPath makes a discovered path safe to use as a test id when signed
+// in: a percent-decoded '?' in the path is cut like a real query, ;params are
+// stripped, a hash route keeps only the route (its query and any nested
+// fragment are dropped, as in browser.RedactURL), and a path that still looks
+// like it carries a credential, by name (credentialMarks) or by shape
+// (tokenLike), is rejected. Without auth nothing is changed: discovery output
+// stays as it always was.
+func cleanAuthPath(p string) (string, bool) {
+	route, hash, hasHash := strings.Cut(p, "#")
+	if i := strings.IndexByte(route, '?'); i >= 0 {
+		route = route[:i]
+	}
+	route = pathParams.ReplaceAllString(route, "")
+	if route == "" {
+		route = "/"
+	}
+	if hasHash {
+		if i := strings.IndexAny(hash, "#?&="); i >= 0 {
+			hash = hash[:i]
+		}
+		if hash = pathParams.ReplaceAllString(hash, ""); hash != "" {
+			route += "#" + hash
+		}
+	}
+	lower := strings.ToLower(route)
+	for _, mark := range secrets.CredentialNames {
+		if strings.Contains(lower, mark) {
+			return "", false
+		}
+	}
+	for _, seg := range strings.FieldsFunc(route, func(r rune) bool { return r == '/' || r == '#' }) {
+		if secrets.TokenLike(seg) {
+			return "", false
+		}
+	}
+	return route, true
+}
+
+// shown is path as it may be printed: redacted when signed in, unchanged
+// otherwise so an unauthenticated crawl logs exactly what it always did.
+func (c *Crawler) shown(path string) string {
+	if c.Auth != nil {
+		return browser.RedactURL(path)
+	}
+	return path
+}
+
 func (c *Crawler) collectLinks(path string) ([]string, error) {
-	session, err := c.Browser.NewSession(c.BaseURL+path, c.Defaults.Viewport,
+	// The 15s is the crawl's per-page budget; a login flow (reuse: false)
+	// runs under its own, not inside it.
+	session, err := c.Browser.NewAuthSession(c.Auth, config.JoinURL(c.BaseURL, path), c.Defaults.Viewport,
 		c.Defaults.WaitFor, c.Defaults.SettleTime.Std(), 15*time.Second)
 	if err != nil {
 		return nil, err
@@ -102,6 +220,14 @@ func (c *Crawler) collectLinks(path string) ([]string, error) {
 // app into "/". Plain fragments and queries are dropped, trailing slashes
 // trimmed (except root). Sorted for deterministic queueing.
 func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []string {
+	return filterLinks(base, hrefs, excludes, nil, nil)
+}
+
+// filterLinks is FilterLinks with an optional clean step, run on each path
+// before the excludes and the dedupe see it, so that a ;param or a token
+// cannot slip a login page or a user's exclude past its regex, and two links
+// that differ only in a secret are one page. Nil leaves every path as it was.
+func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean func(string) (string, bool), onSkip func(string)) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, href := range hrefs {
@@ -115,15 +241,18 @@ func FilterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp) []str
 		if u.Host != base.Host {
 			continue
 		}
-		p := u.Path
-		if p == "" {
-			p = "/"
-		}
-		if p != "/" {
-			p = strings.TrimSuffix(p, "/")
-		}
-		if frag := u.Fragment; strings.HasPrefix(frag, "/") && frag != "/" {
-			p += "#" + strings.TrimSuffix(frag, "/")
+		p := browser.RouteKey(u)
+		if clean != nil {
+			raw := p
+			var ok bool
+			if p, ok = clean(p); !ok {
+				// A link the user's own excludes would have removed anyway is not
+				// news about credentials.
+				if onSkip != nil && !excluded(raw, excludes) {
+					onSkip(raw)
+				}
+				continue
+			}
 		}
 		if seen[p] || excluded(p, excludes) {
 			continue
