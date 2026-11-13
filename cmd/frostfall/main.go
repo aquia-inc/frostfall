@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
@@ -127,7 +126,7 @@ func run(args []string) int {
 		// checked here; with serve: the origin is an ephemeral port, so it is
 		// checked at scan time.
 		if base := knownBaseURL(cfg, *baseURL, *serveDir); cfg.Auth != nil && base != "" {
-			if cerr := cfg.CheckTestOrigins(strings.TrimRight(base, "/"), selected); cerr != nil {
+			if cerr := cfg.CheckTestOrigins(base, selected); cerr != nil {
 				fmt.Fprintln(os.Stderr, "config error:", cerr)
 				return exitBadConfig
 			}
@@ -152,9 +151,6 @@ func run(args []string) int {
 		return code
 	}
 	defer cleanup()
-	// "path relative to the base URL" is base + path everywhere, so a
-	// trailing slash on the base would put a double slash in every URL.
-	base = strings.TrimRight(base, "/")
 	// The session reaches every host a test loads, so with auth a test must
 	// stay on the app's origin (or opt out). Known only now: --base-url and
 	// serve: decide the origin.

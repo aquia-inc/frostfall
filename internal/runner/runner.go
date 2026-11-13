@@ -498,7 +498,7 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 		// assertion), so there is nothing to photograph.
 		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation {
 			if _, known := r.baselineIdx[res.Fingerprint]; !known {
-				res.ScreenshotPath = r.captureScreenshot(session, res, raw)
+				res.ScreenshotPath = r.captureScreenshot(session, res, raw, r.signedIn(t))
 			}
 		}
 		results = append(results, res)
@@ -508,9 +508,15 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 
 // captureScreenshot best-effort shoots the violating element. Failure is
 // logged, never fatal: a violation without a picture still counts.
-func (r *Runner) captureScreenshot(session *browser.Session, res Result, target string) string {
+func (r *Runner) captureScreenshot(session *browser.Session, res Result, target string, signedIn bool) string {
 	png, err := session.CaptureElement(target)
 	if err != nil {
+		if signedIn {
+			// The error names the raw selector, which is the one thing that was
+			// scrubbed before anything else saw it.
+			r.logf("screenshot %s: the element could not be captured", res.Fingerprint)
+			return ""
+		}
 		r.logf("screenshot %s: %v", res.Fingerprint, err)
 		return ""
 	}

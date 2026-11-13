@@ -137,8 +137,8 @@ func scrubBracket(sel string, start int) (int, string) {
 		i++
 	}
 	i++ // the '='
-	for i < len(sel) && sel[i] == ' ' {
-		i++
+	for i < len(sel) && strings.IndexByte(" \t\n\r\f", sel[i]) >= 0 {
+		i++ // CSS whitespace, not just spaces, may precede a value
 	}
 	if i < len(sel) && (sel[i] == '"' || sel[i] == '\'') {
 		quote := sel[i]
@@ -162,8 +162,8 @@ func scrubBracket(sel string, start int) (int, string) {
 
 var pathParamRe = regexp.MustCompile(`;[^/]*`)
 
-// userinfoRe finds user:password@ in a URL that did not parse.
-var userinfoRe = regexp.MustCompile(`(?i)(://)[^/?#@]*@`)
+// schemeRe reads "scheme://" from the start of a string.
+var schemeRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
 
 // MaskSegments replaces each path segment that looks like a secret (TokenLike)
 // with [redacted]. Explicit paths are otherwise printed as written; a token in
@@ -188,12 +188,16 @@ func MaskSegments(p string) string {
 // cannot smuggle a query past it. Path segments that look like secrets are
 // masked. Setup paths, base URLs and navigation targets are printed in errors,
 // logs and reports, and any of those parts can carry a token or credential.
-// A URL that does not parse is cut at its first '?', '#' or ';' and stripped
-// of user:password@, which is the most that can be promised of it.
+// A URL that does not parse has no structure to redact by (a password can
+// contain '/', '?', '#' and ';', so there is no safe place to cut), so it is
+// replaced by a placeholder, keeping only a scheme that can be read.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return userinfoRe.ReplaceAllString(cutAtAny(raw, "?#;"), "$1")
+		if m := schemeRe.FindString(raw); m != "" {
+			return m + "<unparsable url>"
+		}
+		return "<unparsable url>"
 	}
 	path := u.Path
 	if i := strings.IndexAny(path, "?#"); i >= 0 {
@@ -210,11 +214,4 @@ func RedactURL(raw string) string {
 		out += "#" + MaskSegments(pathParamRe.ReplaceAllString(frag, ""))
 	}
 	return out
-}
-
-func cutAtAny(s, chars string) string {
-	if i := strings.IndexAny(s, chars); i >= 0 {
-		return s[:i]
-	}
-	return s
 }

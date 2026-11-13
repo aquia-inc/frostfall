@@ -361,19 +361,27 @@ func (c *Config) CheckTestOrigins(baseURL string, tests []Test) error {
 	return nil
 }
 
-// JoinURL appends a test's path to the base URL. The base's trailing slash is
-// dropped, and a "/" is put between them unless the path starts with one, or
-// with "?" or "#" (a query or hash route on the base itself). So "index.html"
-// under "http://app/" is http://app/index.html, "?a=1" and "#/route" attach to
-// the base, and a path such as "@evil.example/" stays a path on the same host
-// (http://app/@evil.example/) instead of becoming userinfo.
+// JoinURL appends a test's path to the base URL, producing what plain
+// concatenation did for every path that worked before:
+//
+//   - "/x": the base's trailing slash is dropped, so there is no "//" ("/" under
+//     "http://h/sub/" is http://h/sub/);
+//   - "?a=1" and "#/route": appended to the base as it is, so the base's own
+//     slash stays ("http://h/sub/" gives http://h/sub/?a=1, "http://h/sub" gives
+//     http://h/sub?a=1);
+//   - anything else ("index.html"): joined with a "/" unless the base already
+//     ends in one, so "@evil.example/" stays a path on the same host instead of
+//     becoming userinfo.
 func JoinURL(base, path string) string {
-	base = strings.TrimRight(base, "/")
-	if path == "" {
+	switch {
+	case path == "":
 		return base
+	case path[0] == '/':
+		return strings.TrimRight(base, "/") + path
+	case path[0] == '?' || path[0] == '#':
+		return base + path
+	case strings.HasSuffix(base, "/"):
+		return base + path
 	}
-	if path[0] != '/' && path[0] != '?' && path[0] != '#' {
-		return base + "/" + path
-	}
-	return base + path
+	return base + "/" + path
 }

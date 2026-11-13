@@ -123,7 +123,7 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 		return nil, fmt.Errorf("auth: base url: %w", err)
 	}
 	a := &Auth{
-		baseURL:  strings.TrimRight(baseURL, "/"),
+		baseURL:  baseURL,
 		basePath: strings.TrimRight(bu.Path, "/"),
 		origin:   origin,
 		allowed:  map[string]bool{},
@@ -225,7 +225,7 @@ func (a *Auth) probeSignedOut(b *Browser) error {
 		what, url string
 		root      bool
 	}
-	pages := []page{{"the base URL", a.baseURL + "/", true}}
+	pages := []page{{"the base URL", config.JoinURL(a.baseURL, "/"), true}}
 	add := func(what, u string) {
 		for _, p := range pages {
 			if p.url == u {
