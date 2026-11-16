@@ -424,16 +424,15 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
 | `--browser-path PATH` | auto-detect | use this Chrome/Chromium binary instead of detection |
-| `--format NAME` | `text` | report format: `text` (terminal), `html` (single-file report), or `sarif` (GitHub code scanning) |
-| `--output PATH` | `frostfall-report.html` / `frostfall.sarif` | where to write the formatted report |
+| `--format NAME` | `text` | report format: `text` (terminal), `html` (single-file report), `sarif` (GitHub code scanning), `json` (structured results), or `junit` (CI test dashboards). Text is always printed; the others are also written to `--output` |
+| `--output PATH` | `frostfall-report.html` / `frostfall.sarif` / `frostfall.json` / `frostfall-junit.xml` | where to write the formatted report |
 | `--gh-issues` | off | file/maintain GitHub issues for failing violations (CI; needs `GITHUB_TOKEN`, `GITHUB_REPOSITORY`) |
 | `--gh-issues-dry-run` | off | print the issue actions without calling GitHub |
 | `--validate` | off | check the config and exit (0 = valid, 2 = invalid) |
 | `--verbose` | off | log page loads, steps, and scans to stderr |
 | `--version` | - | print the frostfall and embedded axe-core versions |
 
-In development, not yet functional: json and junit formats, and `--watch`
-(rescan on change).
+In development, not yet functional: `--watch` (rescan on change).
 
 The regex filters make the common CI split easy: a fast subset on pre-push or
 PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
@@ -449,6 +448,177 @@ PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
 
 Distinct codes mean CI can tell "the pages are broken" from "the tool couldn't
 run".
+
+## Output formats
+
+`--format` picks the report written to `--output`, alongside the text summary
+that always goes to stdout. The exit code is the same whatever the format.
+`html` and `sarif` are covered in their own sections; `json` and `junit` are
+for machines.
+
+With auth configured, both carry the same redacted page URLs and scrubbed
+selectors as every other format (see [Auth](#auth-scan-pages-behind-a-login)).
+Neither ever prints a raw URL. In the GitHub Action, set `output:` next to
+`format:` (its default is the HTML report's file name).
+
+### JSON
+
+```sh
+frostfall --serve dist --format json --output frostfall.json
+```
+
+The complete result of a run, and the thing to assert against in integration
+tests. Keys are camelCase, like the baseline file. Lists are `[]`, never
+`null`. Tests and scan points are in run order, and violations within a scan
+point are worst impact first, then rule, target, fingerprint, so equal runs
+give equal files.
+
+```json
+{
+  "schemaVersion": 1,
+  "run": {
+    "toolVersion": "1.7.0",
+    "axeVersion": "4.10.3",
+    "baseUrl": "http://127.0.0.1:41233",
+    "standard": "wcag21aa",
+    "mode": "enforcing (serious+)",
+    "enforcing": true,
+    "startedAt": "2026-11-16T09:30:00Z",
+    "durationMs": 3716,
+    "exitStatus": 1,
+    "testsRun": 1,
+    "totals": { "violations": 2, "new": 1, "flagged": 1, "baselined": 1, "stale": 0 }
+  },
+  "tests": [
+    {
+      "id": "home",
+      "checks": ["axe", "keyboard"],
+      "uncheckedRules": [],
+      "scanPoints": [
+        {
+          "label": "initial",
+          "pageUrl": "http://127.0.0.1:41233/",
+          "violations": [
+            {
+              "ruleId": "image-alt",
+              "impact": "critical",
+              "tags": ["wcag2a", "wcag111", "section508"],
+              "target": "#hero > img",
+              "summary": "Ensure <img> elements have alternative text or a role of none or presentation",
+              "help": "Images must have alternative text",
+              "helpUrl": "https://dequeuniversity.com/rules/axe/4.10/image-alt?application=axeAPI",
+              "fingerprint": "f784165ebae6dff8c9c1152f80ab8ba8",
+              "baselined": false,
+              "flagged": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "stale": []
+}
+```
+
+| field | meaning |
+|-------|---------|
+| `schemaVersion` | `1`. Bumped only when an existing field is renamed, removed, or changes meaning; new fields are additive, so ignore keys you do not know |
+| `run.toolVersion`, `run.axeVersion` | the frostfall build and the embedded axe-core |
+| `run.baseUrl`, `run.standard`, `run.mode`, `run.profile` | where the run pointed (redacted under auth), the conformance standard, the enforcement posture, and the profile when one applied |
+| `run.enforcing` | `true` when an `expect` block (the default or a test's) can fail the build, `false` for a report-only run. A report-only run always has `exitStatus` 0 or an environment or config error |
+| `run.startedAt`, `run.durationMs` | UTC start time (RFC 3339) and the run's length in milliseconds |
+| `run.exitStatus` | **the pass/fail signal for scripts**: the exit code the process returns. 0 passed, 1 the gate failed on violations, 2 config error, 3 environment error. Gate on this, not on `totals.flagged` |
+| `run.error` | `{ "testId", "message" }`, present only when the run stopped before it finished: an environment or config error, including one before any test ran (`testId` is then absent). Such a file has no `tests`: a run stops at the first test that cannot run, and what ran before it is not kept |
+| `run.testsRun`, `run.totals` | tests run, and violation counts: all, `new` (not baselined), `flagged` (informational, see below), `baselined`, `stale` |
+| `tests[].id` | the test id (tests have no separate name) |
+| `tests[].checks` | the checks that ran: `axe`, `keyboard`, `expectFocus` |
+| `tests[].uncheckedRules` | rules switched off, or not fully evaluated by a cut-short keyboard audit, every time their check ran. Their absence from `violations` is not a pass |
+| `tests[].scanPoints[]` | one per labelled point in the test (`initial`, `step-2`, or a step's `label`); a scan, keyboard audit, and focus assertion sharing a label are one point. A clean point is listed with `"violations": []` |
+| `scanPoints[].label`, `.pageUrl` | the point's label and the page URL it ran against |
+| `scanPoints[].transcript` | screen reader transcript lines, when the point has one |
+| `violations[].ruleId`, `.impact` | the rule (axe's, or `frostfall/...` for keyboard and focus findings) and `minor`/`moderate`/`serious`/`critical` |
+| `violations[].tags` | the rule's axe tags (`wcag111`, `wcag2a`, `section508`, ...) |
+| `violations[].target`, `.summary`, `.help`, `.helpUrl` | the stable selector, what is wrong, axe's remediation text, and its docs link |
+| `violations[].fingerprint` | the identity the baseline matches on |
+| `violations[].baselined`, `.flagged` | accepted debt; and the same informational serious-or-worse marker the text, HTML and SARIF reports use (never true when baselined). It is not the pass/fail signal: a report-only run, or one within `maxViolations`, has flagged violations and `exitStatus` 0 |
+| `violations[].screenshotPath` | the element screenshot, when one was captured |
+| `stale[]` | baseline entries that no longer occur: `fingerprint`, `testId`, `scanLabel`, `ruleId`, `stableTarget` (scrubbed like every other selector when auth is configured) |
+
+When a run fails before it scans (the config does not load, the browser will
+not start, the login fails), `json` and `junit` still write the report, over
+whatever file was there, so an older passing report never stands in for the
+failed run. The JSON then has `run.exitStatus` 2 or 3, `run.error`, and no
+`tests`. If the config itself failed to load, the run has no contract to
+describe: `run.mode` is `"unknown"` and `run.enforcing` is `false`, so scripts
+should read `run.exitStatus`, not `enforcing`, to decide pass or fail. The
+message in `run.error` is the one printed on stderr, except that with auth
+configured the report's copy is redacted word by word: anything from a `?`,
+or from a `#` that does not start the word, on is cut (so an id selector like
+`#login` is kept), a word that still holds `=` or `@` or an unclosed bracket
+becomes `[redacted]`, and selector values and URL paths are then cleaned the
+way the rest of the report is. These runs still print `report written to
+<path>` on stdout. The report is written in place, like the other formats: the
+file keeps its mode, owner and links, a symlinked `--output` is written
+through to its target, and `/dev/stdout` works. If the write fails partway,
+no partial report is left to contradict the exit code: a regular file is
+removed (or, behind a symlink, emptied), and a device or pipe is left alone.
+In a run that fails before it scans, `text`, `html` and `sarif` leave their
+file alone, and so does `--validate`. The one gap: a mistake in the flags themselves
+(an unparsable flag, or an unknown `--format`) is rejected before the format
+is known, so no report is written and an older file stays.
+
+### JUnit
+
+```sh
+frostfall --serve dist --format junit --output frostfall-junit.xml
+```
+
+Standard JUnit XML for CI test dashboards: one `testsuite` per test, one
+`testcase` per scan point (`name` is the scan label, `classname` the test id).
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="frostfall" tests="2" failures="1" errors="0" time="3.716">
+  <testsuite name="home" tests="2" failures="1" errors="0" skipped="0" timestamp="2026-11-16T09:30:00">
+    <testcase name="initial" classname="home">
+      <failure message="1 violation(s) counted against the gate" type="accessibility">image-alt (critical)
+  target: #hero &gt; img
+  summary: Ensure &lt;img&gt; elements have alternative text or a role of none or presentation
+</failure>
+      <system-out>page: http://127.0.0.1:41233/
+</system-out>
+    </testcase>
+    <testcase name="modal" classname="home">
+      <system-out>page: http://127.0.0.1:41233/
+1 baselined violation(s)
+</system-out>
+    </testcase>
+  </testsuite>
+</testsuites>
+```
+
+- The file contains a `<failure>` **if and only if** the run exits 1 because
+  of violations, so a dashboard is red exactly when the gate is. A testcase
+  fails for the violations the exit code counts: at or above the enforced
+  `severity` (or on an enforced rule), not baselined, under an enforcing
+  contract. `maxViolations` is a run-level threshold: while the run's counted
+  total is at or under it nothing fails, and once it is over, every testcase
+  holding a counted violation fails.
+- Everything else is information in the testcase's `system-out`: new
+  violations in a report-only run, ones below the enforced severity, ones the
+  `maxViolations` tolerance absorbs, a count of **baselined** violations, the
+  page URL, and any screen reader transcript.
+- An **environment error** (a test that cannot load, a login redirect) is an
+  `<error>` on a testcase named `run` in that test's suite. An error before
+  any test ran (browser, auth, config) goes in a suite named `run`. The run
+  stops at the first such test, so the file holds only the error. (A test
+  whose id is `run` shares that suite with such an error.)
+- If the gate fails but no testcase can carry the failure (a negative
+  `maxViolations` fails the gate even with zero violations), a `run` suite
+  holds one failed testcase, `gate`, saying how many counted violations went
+  over which limit.
+- Text is escaped by `encoding/xml`: selectors containing `<`, `&`, quotes,
+  or `]]>` are safe.
 
 ## Profiles: one config, different environments
 

@@ -47,12 +47,42 @@ type Transcript struct {
 	Lines   []string
 }
 
+// ScanPoint is one place in a test where a check ran, named by its label
+// ("initial", "step-2", or a step's own label). A scan, a keyboard audit and a
+// focus assertion that share a label are one point. PageURL is the URL the
+// test ran against, already redacted when the run has auth.
+type ScanPoint struct {
+	Label   string
+	PageURL string
+}
+
+// TestRecord is one test as it ran: its id and the scan points that checked
+// it, in the order they ran. Results hold only violations, so this is what
+// tells a clean scan point from one that never ran.
+type TestRecord struct {
+	ID     string
+	Points []ScanPoint
+}
+
+// TestError is the failure of one test. Its text is what a run has always
+// printed for it ("test "id": ..."); the type only lets a caller name the
+// test that stopped the run.
+type TestError struct {
+	TestID string
+	Err    error
+}
+
+func (e *TestError) Error() string { return fmt.Sprintf("test %q: %v", e.TestID, e.Err) }
+func (e *TestError) Unwrap() error { return e.Err }
+
 // Run holds a full run's outcome.
 type Run struct {
 	Results     []Result
 	Transcripts []Transcript
 	Stale       []baseline.Violation // baselined entries that no longer occur
 	TestsRun    int
+	// Tests lists every test that ran, in run order, with its scan points.
+	Tests []TestRecord
 	// ran records, per test id, which checks actually executed and which
 	// rules they ran with switched off: a violation may only be treated as
 	// fixed (a stale baseline entry, a closed issue) where its rule was
@@ -65,12 +95,23 @@ type Run struct {
 // its check ran more often than the rule was off - so one step toggling it
 // off does not hide another step that checked it.
 type coverage struct {
-	runs map[string]int
-	off  map[string]int
+	runs   map[string]int
+	off    map[string]int
+	points []ScanPoint
 }
 
 func newCoverage() *coverage {
 	return &coverage{runs: map[string]int{}, off: map[string]int{}}
+}
+
+// point notes that a check ran at label, once per label.
+func (c *coverage) point(label, url string) {
+	for _, p := range c.points {
+		if p.Label == label {
+			return
+		}
+	}
+	c.points = append(c.points, ScanPoint{Label: label, PageURL: url})
 }
 
 func (c *coverage) record(check string, rules map[string]bool) {
@@ -105,6 +146,39 @@ func checkFor(ruleID string) string {
 func (r *Run) Covered(testID, ruleID string) bool {
 	c := r.ran[testID]
 	return c != nil && c.runs[checkFor(ruleID)] > c.off[ruleID]
+}
+
+// Checks lists, sorted, the checks (axe, keyboard, expectFocus) that ran on
+// testID's page.
+func (r *Run) Checks(testID string) []string {
+	c := r.ran[testID]
+	if c == nil {
+		return []string{}
+	}
+	out := []string{}
+	for check, n := range c.runs {
+		if n > 0 {
+			out = append(out, check)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Uncovered lists, sorted, the rules that were switched off, or could not be
+// fully evaluated, every time their check ran on testID's page: the rules
+// whose absence from the results does not mean the page passes them.
+func (r *Run) Uncovered(testID string) []string {
+	out := []string{}
+	if c := r.ran[testID]; c != nil {
+		for id := range c.off {
+			if !r.Covered(testID, id) {
+				out = append(out, id)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // Failing reports whether a single result breaks the expect contract, judged
@@ -196,8 +270,9 @@ func (r *Runner) Execute(ctx context.Context, tests []config.Test) (*Run, error)
 	for _, t := range tests {
 		results, transcripts, cov, err := r.runTest(ctx, t)
 		if err != nil {
-			return nil, fmt.Errorf("test %q: %w", t.ID, err)
+			return nil, &TestError{TestID: t.ID, Err: err}
 		}
+		run.Tests = append(run.Tests, TestRecord{ID: t.ID, Points: cov.points})
 		run.Transcripts = append(run.Transcripts, transcripts...)
 		run.ran[t.ID] = cov
 		run.Results = append(run.Results, results...)
@@ -388,6 +463,7 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 		return nil, err
 	}
 	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
+	cov.point(label, url)
 	return r.results(session, t, url, label, audit.Violations), nil
 }
 
@@ -424,6 +500,7 @@ func (r *Runner) expectFocus(session *browser.Session, t config.Test, url, label
 		return nil, err
 	}
 	cov.record(checkExpectFocus, nil)
+	cov.point(label, url)
 	if ok {
 		return nil, nil
 	}
@@ -464,6 +541,7 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 		return nil, err
 	}
 	cov.record(checkAxe, rules)
+	cov.point(label, url)
 	return r.results(session, t, url, label, violations), nil
 }
 

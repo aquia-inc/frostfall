@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -187,6 +190,49 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// The hint reaches the json and junit failure reports too: it carries no
+	// '=', '@', '?' or '#', so the report copy's redaction (auth is on) keeps
+	// it word for word.
+	for _, formatName := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+formatName)
+		code, _, stderr := runBoth(t, "--config", good, "--profile", "none", "--no-screenshots", "--baseline", "none", "--format", formatName, "--output", out)
+		if code != exitEnvironment || !strings.Contains(stderr, hint) {
+			t.Fatalf("%s: exit = %d, stderr = %q, want %d and the hint", formatName, code, stderr, exitEnvironment)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(report), hint) || strings.Contains(string(report), secret) {
+			t.Errorf("%s report lacks the hint or carries the secret:\n%s", formatName, report)
+		}
+		if formatName != "json" {
+			continue
+		}
+		// The whole line, not only the hint, is the one stderr printed.
+		var line string
+		for _, l := range strings.Split(stderr, "\n") {
+			if strings.Contains(l, hint) {
+				line = l
+			}
+		}
+		var doc struct {
+			Run struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(report, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if strings.ContainsAny(line, "=@?#") {
+			t.Logf("stderr line has a character the redaction cuts, skipping the exact match: %q", line)
+		} else if doc.Run.Error.Message != line {
+			t.Errorf("json run.error.message = %q, want the stderr line %q", doc.Run.Error.Message, line)
+		}
 	}
 }
 
@@ -392,7 +438,7 @@ func TestScanChecksOnlySelectedTestsForOrigins(t *testing.T) {
 
 // Every output of a run whose config has auth, even one where nothing signs in,
 // is free of what the paths and the base URL carry: stdout, stderr (verbose),
-// the SARIF file and the HTML report.
+// the SARIF file, the HTML report, and the json and junit files.
 func TestSkippedAuthStillRedactsEveryOutput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
@@ -402,7 +448,7 @@ func TestSkippedAuthStillRedactsEveryOutput(t *testing.T) {
 	cfg := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /p?token=SECRETTOK123\n    auth: false\n")
 	base := strings.Replace(srv.URL, "http://", "http://ciuser:S3cretBasicPW@", 1)
 	secrets := []string{"SECRETTOK123", "S3cretBasicPW"}
-	for _, format := range []string{"sarif", "html"} {
+	for _, format := range []string{"sarif", "html", "json", "junit"} {
 		out := filepath.Join(t.TempDir(), "report."+format)
 		code, stdout, stderr := runBoth(t, "--config", cfg, "--base-url", base, "--verbose", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
 		if code != exitOK {
@@ -582,6 +628,48 @@ func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
 		if code != exitBadConfig || !strings.Contains(stderr, tc.want) || stdout != "" {
 			t.Errorf("%v: exit code = %d, stdout = %q, stderr = %q, want exit %d and %q", tc.args, code, stdout, stderr, exitBadConfig, tc.want)
 		}
+	}
+}
+
+// A dry run never writes a report. Refusing --format json or junit, or
+// --output, is exit 2 with the dry-run message, found before the config is
+// read, and existing json and junit reports (and an --output file) are left
+// byte for byte as they were, with nothing new beside them.
+func TestDiscoverDryRunWritesNoReport(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	files := map[string]string{
+		"frostfall.json":      `{"previous":"json"}`,
+		"frostfall-junit.xml": "<previous/>",
+		"x.json":              `{"previous":"x"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(name, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	missing := filepath.Join(dir, "missing.yml") // never read: the flags are refused first
+	for _, extra := range [][]string{
+		{"--format", "json"},
+		{"--format", "junit"},
+		{"--output", "x.json"},
+		{"--format", "json", "--output", "x.json"},
+		{"--format", "junit", "--output", "new.xml"},
+	} {
+		args := append([]string{"--config", missing, "--discover", "--dry-run"}, extra...)
+		code, stdout, stderr := runBoth(t, args...)
+		if code != exitBadConfig || stdout != "" || !strings.Contains(stderr, "--format and --output have no effect") {
+			t.Errorf("%v: exit = %d, stdout = %q, stderr = %q, want exit %d and the dry-run message", extra, code, stdout, stderr, exitBadConfig)
+		}
+		if strings.Contains(stderr, "config error") {
+			t.Errorf("%v: the config was read: %q", extra, stderr)
+		}
+		for name, body := range files {
+			if b, err := os.ReadFile(name); err != nil || string(b) != body {
+				t.Errorf("%v: %s = %q (%v), want it untouched", extra, name, b, err)
+			}
+		}
+		onlyEntries(t, dir, "frostfall.json", "frostfall-junit.xml", "x.json")
 	}
 }
 
@@ -994,6 +1082,92 @@ func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
 	}
 }
 
+// A signed-in run through the real entry point: json and junit carry the same
+// redacted page URL and scrubbed target the other formats do. The page is
+// reached with a token in its query string, and its image-alt violation is
+// found, so there is both a URL and a selector for a secret to ride in.
+func TestStructuredOutputsRedactUnderAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	body := "version: 1\nserver:\n  serve: " + filepath.Join(root, "testdata/auth/site") + "\n" +
+		"auth:\n  storageState: " + filepath.Join(root, "testdata/auth/state-valid.json") + "\n" +
+		"  loginPath: /login.html\n  signedIn: \"[data-testid=app-shell]\"\n" +
+		"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
+		"tests:\n  - id: protected\n    path: /protected.html?token=SECRETTOK123#access_token=FRAGSECRET\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, format := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+format)
+		code, stdout, stderr := runBoth(t, "--config", cfg, "--verbose", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitViolations {
+			t.Fatalf("%s: exit code = %d, want %d (stderr: %s)", format, code, exitViolations, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(report)
+		for _, secret := range []string{"SECRETTOK123", "FRAGSECRET"} {
+			for name, haystack := range map[string]string{"stdout": stdout, "stderr": stderr, format + " report": text} {
+				if strings.Contains(haystack, secret) {
+					t.Errorf("%s: %q reached the %s", format, secret, name)
+				}
+			}
+		}
+		if !strings.Contains(text, "/protected.html") || !strings.Contains(text, "image-alt") {
+			t.Errorf("%s report lost the page or its violation:\n%s", format, text)
+		}
+	}
+}
+
+// A run that stops on an environment error still writes the json and junit
+// report CI reads, with the error and exit status 3 in it.
+func TestStructuredOutputsReportAnEnvironmentError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	t.Chdir("../..")
+	dir := t.TempDir()
+	for _, format := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+format)
+		code, stderr := runCaptured(t, "--config", "testdata/auth/frostfall-nosession.yml", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitEnvironment {
+			t.Fatalf("%s: exit code = %d (stderr: %s)", format, code, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("%s: no report written on an environment error: %v", format, err)
+		}
+		text := string(report)
+		if !strings.Contains(text, "landed on the login page") {
+			t.Errorf("%s report lacks the error:\n%s", format, text)
+		}
+		if !strings.Contains(text, "run error: ") {
+			t.Errorf("%s report does not carry the stderr line (run error: ...):\n%s", format, text)
+		}
+		if format == "json" && !strings.Contains(text, `"exitStatus": 3`) {
+			t.Errorf("json report lacks exit status 3:\n%s", text)
+		}
+		// The abort path reports the contract the run had (this config
+		// enforces serious), not a hardcoded "report only".
+		if format == "json" && (!strings.Contains(text, `"enforcing": true`) || !strings.Contains(text, `"mode": "enforcing (serious+)"`)) {
+			t.Errorf("json report lacks the real mode:\n%s", text)
+		}
+		if format == "junit" && !strings.Contains(text, "<error ") {
+			t.Errorf("junit report lacks an <error>:\n%s", text)
+		}
+	}
+}
+
 // Signed in, a link whose decoded path starts with // is listed as it is (not
 // as <unparsable url>, not with a slash lost), a hash route is listed, and a
 // token in a query or a path never reaches stdout or stderr. Any path left
@@ -1056,5 +1230,598 @@ func TestDiscoverDryRunWithAuthSkipsUnsafePathsAndLeaksNoTokens(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "discovered 5 page(s), 4 not covered by an explicit test") {
 		t.Errorf("stderr = %q, want 5 discovered and 4 not covered", stderr)
+	}
+}
+
+func TestUnknownFormatListsJSONAndJUnit(t *testing.T) {
+	code, stderr := runCaptured(t, "--format", "yaml")
+	if code != exitBadConfig || !strings.Contains(stderr, "text, html, sarif, json, junit") {
+		t.Errorf("exit = %d, stderr = %q", code, stderr)
+	}
+}
+
+// serveDirWith writes a one-page site and returns the config body prefix that
+// serves it.
+func serveDirWith(t *testing.T, bodyHTML string) string {
+	t.Helper()
+	dir := t.TempDir()
+	page := `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>` + bodyHTML + `</body></html>`
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(page), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return "version: 1\nserver:\n  serve: " + dir + "\ndefaults:\n  waitFor: load\n"
+}
+
+// The junit file holds a <failure> if and only if the run exits 1, and the json
+// file's exitStatus and enforcing tell a script the same story. Violations
+// that do not count toward the gate (report-only mode, under the enforced
+// severity, tolerated by maxViolations, baselined) never turn the file red.
+func TestStructuredOutputsFailOnlyWhenTheGateFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	critical := `<main><h1>x</h1><img src="x.png"><input type="text"></main>`
+	// scrollable-region-focusable: axe rates it moderate.
+	moderate := `<main><h1>x</h1><div style="overflow:auto;width:40px;height:20px"><p>` + strings.Repeat("scrolling text ", 40) + `</p></div></main>`
+	clean := `<main><h1>x</h1></main>`
+	cases := []struct {
+		name, html    string
+		defaultExpect string // under defaults:
+		testExpect    string // under the test
+		baselined     bool   // accept the page's violations in a baseline first
+		wantExit      int
+		wantEnforce   bool
+		wantViol      bool   // the run found violations
+		wantInfo      string // in the junit file when it has no failure
+	}{
+		{name: "report only with violations", html: critical, wantExit: exitOK, wantViol: true, wantInfo: "not failing the run"},
+		{name: "under maxViolations", html: critical, defaultExpect: "    severity: critical\n    maxViolations: 10\n", wantExit: exitOK, wantEnforce: true, wantViol: true, wantInfo: "not failing the run"},
+		{name: "severity critical with only moderate violations", html: moderate, defaultExpect: "    severity: critical\n", wantExit: exitOK, wantEnforce: true, wantViol: true, wantInfo: "not failing the run"},
+		{name: "over the threshold", html: critical, defaultExpect: "    severity: critical\n    maxViolations: 1\n", wantExit: exitViolations, wantEnforce: true, wantViol: true},
+		{name: "baselined violations only", html: critical, defaultExpect: "    severity: critical\n", baselined: true, wantExit: exitOK, wantEnforce: true, wantViol: true, wantInfo: "baselined violation(s)"},
+		{name: "a per-test expect is the only contract and is met", html: moderate, testExpect: "    expect:\n      severity: critical\n", wantExit: exitOK, wantEnforce: true, wantViol: true, wantInfo: "not failing the run"},
+		{name: "a per-test expect is the only contract and is broken", html: critical, testExpect: "    expect:\n      severity: critical\n", wantExit: exitViolations, wantEnforce: true, wantViol: true},
+		// The config accepts a negative limit, so even a clean run is over it.
+		{name: "negative maxViolations on a clean page", html: clean, defaultExpect: "    severity: critical\n    maxViolations: -1\n", wantExit: exitViolations, wantEnforce: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expect := ""
+			if tc.defaultExpect != "" {
+				expect = "  expect:\n" + tc.defaultExpect
+			}
+			cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+			body := serveDirWith(t, tc.html) + expect + "tests:\n  - id: home\n    path: /\n" + tc.testExpect
+			if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(t.TempDir())
+			bl := "none"
+			if tc.baselined {
+				bl = filepath.Join(t.TempDir(), "baseline.json")
+				if code, _, stderr := runBoth(t, "--config", cfg, "--update-baseline", "--baseline", bl, "--no-screenshots"); code != exitOK {
+					t.Fatalf("baseline run: exit code = %d (stderr: %s)", code, stderr)
+				}
+			}
+			for _, format := range []string{"junit", "json"} {
+				out := filepath.Join(t.TempDir(), "report."+format)
+				code, _, stderr := runBoth(t, "--config", cfg, "--format", format, "--output", out, "--no-screenshots", "--baseline", bl)
+				if code != tc.wantExit {
+					t.Fatalf("%s: exit code = %d, want %d (stderr: %s)", format, code, tc.wantExit, stderr)
+				}
+				report, err := os.ReadFile(out)
+				if err != nil {
+					t.Fatal(err)
+				}
+				text := string(report)
+				if format == "junit" {
+					if got := strings.Contains(text, "<failure"); got != (code == exitViolations) {
+						t.Errorf("junit has a <failure> = %v with exit code %d:\n%s", got, code, text)
+					}
+					if tc.wantInfo != "" && !strings.Contains(text, tc.wantInfo) {
+						t.Errorf("junit lacks %q:\n%s", tc.wantInfo, text)
+					}
+					continue
+				}
+				var doc struct {
+					Run struct {
+						ExitStatus int  `json:"exitStatus"`
+						Enforcing  bool `json:"enforcing"`
+						Totals     struct{ Violations int }
+					} `json:"run"`
+				}
+				if err := json.Unmarshal(report, &doc); err != nil {
+					t.Fatal(err)
+				}
+				if doc.Run.ExitStatus != code || doc.Run.Enforcing != tc.wantEnforce || (doc.Run.Totals.Violations > 0) != tc.wantViol {
+					t.Errorf("json run = %+v, want exitStatus %d enforcing %v violations %v", doc.Run, code, tc.wantEnforce, tc.wantViol)
+				}
+			}
+		})
+	}
+}
+
+// A run that fails before it scans must not leave an older report on disk
+// reading as success: json and junit overwrite it with a failure report. The
+// other formats leave their file as it was. Each case also pins stderr: the
+// error line is printed once, exactly as it is recorded in the report.
+func TestPreScanFailureReplacesAStaleStructuredReport(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(serveDirWith(t, `<main><h1>x</h1></main>`)+"tests:\n  - id: home\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badBaseline := filepath.Join(t.TempDir(), "baseline.json")
+	if err := os.WriteFile(badBaseline, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	staleJSON := `{"schemaVersion":1,"run":{"exitStatus":0}}`
+	staleXML := `<testsuites tests="1" failures="0"/>`
+	missing := filepath.Join(t.TempDir(), "missing.yml")
+	cases := []struct {
+		name, format, stale string
+		args                []string
+		wantExit            int
+		wantStderr          string // the line stderr holds exactly once
+		wantInReport        []string
+	}{
+		{"browser launch json", "json", staleJSON, []string{"--config", cfg, "--browser-path", "/nonexistent/chrome"}, exitEnvironment,
+			"browser error:", []string{`"exitStatus": 3`, `"error"`, "browser error:", `"enforcing": false`}},
+		{"browser launch junit", "junit", staleXML, []string{"--config", cfg, "--browser-path", "/nonexistent/chrome"}, exitEnvironment,
+			"browser error:", []string{`<testsuite name="run"`, `<error `, "browser error:"}},
+		{"config error json", "json", staleJSON, []string{"--config", missing}, exitBadConfig,
+			"config error:", []string{`"exitStatus": 2`, "config error:", `"mode": "unknown"`, `"enforcing": false`}},
+		{"config error junit", "junit", staleXML, []string{"--config", missing}, exitBadConfig,
+			"config error:", []string{`<testsuite name="run"`, "config error:"}},
+		{"no matching tests junit", "junit", staleXML, []string{"--config", cfg, "--id", "nothing-matches"}, exitBadConfig,
+			"no tests match the given filters", []string{"no tests match the given filters"}},
+		{"server unreachable json", "json", staleJSON, []string{"--config", cfg, "--base-url", "http://127.0.0.1:1"}, exitEnvironment,
+			"cannot reach http://127.0.0.1:1", []string{`"exitStatus": 3`, "cannot reach http://127.0.0.1:1"}},
+		{"server unreachable junit", "junit", staleXML, []string{"--config", cfg, "--base-url", "http://127.0.0.1:1"}, exitEnvironment,
+			"cannot reach http://127.0.0.1:1", []string{`<testsuite name="run"`, "cannot reach http://127.0.0.1:1"}},
+		{"bad baseline json", "json", staleJSON, []string{"--config", cfg, "--baseline", badBaseline}, exitBadConfig,
+			"baseline error:", []string{`"exitStatus": 2`, "baseline error:"}},
+		{"bad baseline junit", "junit", staleXML, []string{"--config", cfg, "--baseline", badBaseline}, exitBadConfig,
+			"baseline error:", []string{`<testsuite name="run"`, "baseline error:"}},
+		{"update-baseline with a filter json", "json", staleJSON, []string{"--config", cfg, "--update-baseline", "--id", "home"}, exitBadConfig,
+			"--update-baseline cannot be combined with --id/--path", []string{`"exitStatus": 2`, "cannot be combined"}},
+		{"update-baseline save fails junit", "junit", staleXML, []string{"--config", cfg, "--update-baseline", "--baseline", filepath.Join(t.TempDir(), "no-such-dir", "b.json")}, exitEnvironment,
+			"baseline error:", []string{`<testsuite name="run"`, "baseline error:"}},
+		{"watch json", "json", staleJSON, []string{"--config", cfg, "--watch"}, exitBadConfig,
+			"--watch is not implemented yet", []string{`"exitStatus": 2`, "--watch is not implemented yet"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if testing.Short() && strings.Contains(tc.name, "save fails") {
+				t.Skip("launches a browser")
+			}
+			out := filepath.Join(t.TempDir(), "report")
+			if err := os.WriteFile(out, []byte(tc.stale), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			args := append(tc.args, "--format", tc.format, "--output", out, "--no-screenshots")
+			if !slices.Contains(tc.args, "--baseline") {
+				args = append(args, "--baseline", "none")
+			}
+			code, stdout, stderr := runBoth(t, args...)
+			if code != tc.wantExit {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, tc.wantExit, stderr)
+			}
+			if n := strings.Count(stderr, tc.wantStderr); n != 1 {
+				t.Errorf("stderr has %q %d times, want exactly once:\n%s", tc.wantStderr, n, stderr)
+			}
+			if !strings.Contains(stdout, "report written to "+out) {
+				t.Errorf("stdout lacks the report notice: %q", stdout)
+			}
+			report, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatalf("the report was removed: %v", err)
+			}
+			if string(report) == tc.stale {
+				t.Fatalf("the stale report is still there:\n%s", report)
+			}
+			// The message in the report is the line stderr printed.
+			var line string
+			for _, l := range strings.Split(stderr, "\n") {
+				if strings.Contains(l, tc.wantStderr) {
+					line = l
+				}
+			}
+			if tc.format == "junit" {
+				var doc junitReportDoc
+				if err := xml.Unmarshal(report, &doc); err != nil || len(doc.Suites) != 1 || doc.Suites[0].Name == "" {
+					t.Fatalf("junit report is not one named suite (%v):\n%s", err, report)
+				}
+				if got := doc.Suites[0].Cases[0].Error.Message; got != line {
+					t.Errorf("junit message = %q, stderr line = %q", got, line)
+				}
+			} else {
+				var doc struct {
+					SchemaVersion int `json:"schemaVersion"`
+					Run           struct {
+						Error struct {
+							Message string `json:"message"`
+						} `json:"error"`
+					} `json:"run"`
+				}
+				if err := json.Unmarshal(report, &doc); err != nil || doc.SchemaVersion != 1 {
+					t.Fatalf("not a schemaVersion 1 json report (%v):\n%s", err, report)
+				}
+				if doc.Run.Error.Message != line {
+					t.Errorf("json message = %q, stderr line = %q", doc.Run.Error.Message, line)
+				}
+			}
+			for _, want := range tc.wantInReport {
+				if !strings.Contains(string(report), want) {
+					t.Errorf("failure report lacks %q:\n%s", want, report)
+				}
+			}
+			if left, _ := filepath.Glob(filepath.Join(filepath.Dir(out), ".report.tmp-*")); len(left) > 0 {
+				t.Errorf("temp files left behind: %v", left)
+			}
+		})
+	}
+
+	t.Run("other formats keep their file", func(t *testing.T) {
+		for _, format := range []string{"text", "html", "sarif"} {
+			out := filepath.Join(t.TempDir(), "report")
+			if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if code, _ := runCaptured(t, "--config", cfg, "--browser-path", "/nonexistent/chrome", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none"); code != exitEnvironment {
+				t.Fatalf("%s: exit code = %d", format, code)
+			}
+			if b, err := os.ReadFile(out); err != nil || string(b) != "previous" {
+				t.Errorf("%s: the file changed: %q, %v", format, b, err)
+			}
+		}
+	})
+}
+
+type junitReportDoc struct {
+	Suites []struct {
+		Name  string `xml:"name,attr"`
+		Cases []struct {
+			Error struct {
+				Message string `xml:"message,attr"`
+			} `xml:"error"`
+		} `xml:"testcase"`
+	} `xml:"testsuite"`
+}
+
+// --validate never writes a report, even for json or junit, and even when
+// the config is broken: the existing file stays as it was.
+func TestValidateNeverWritesAReport(t *testing.T) {
+	t.Chdir(t.TempDir())
+	good := filepath.Join(t.TempDir(), "frostfall.yml")
+	if err := os.WriteFile(good, []byte(serveDirWith(t, `<main><h1>x</h1></main>`)+"tests:\n  - id: home\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing.yml")
+	for _, format := range []string{"json", "junit"} {
+		for name, args := range map[string][]string{
+			"broken config": {"--config", missing},
+			"bad filter":    {"--config", good, "--id", "("},
+			"valid config":  {"--config", good},
+		} {
+			out := filepath.Join(t.TempDir(), "report")
+			if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			code, stderr := runCaptured(t, append(args, "--validate", "--format", format, "--output", out)...)
+			wantCode := exitBadConfig
+			if name == "valid config" {
+				wantCode = exitOK
+			}
+			if code != wantCode {
+				t.Errorf("%s/%s: exit code = %d, want %d (stderr: %s)", format, name, code, wantCode, stderr)
+			}
+			if b, err := os.ReadFile(out); err != nil || string(b) != "previous" {
+				t.Errorf("%s/%s: --validate touched the report: %q, %v", format, name, b, err)
+			}
+		}
+	}
+}
+
+// A failed login before the scan (here the startup probe refuses the page)
+// replaces an older report too.
+func TestAuthFailureReplacesAStaleStructuredReport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := authSite(t)
+	t.Chdir(t.TempDir())
+	cfg := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /\n")
+	for _, format := range []string{"json", "junit"} {
+		out := filepath.Join(t.TempDir(), "report")
+		if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code, stderr := runCaptured(t, "--config", cfg, "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitEnvironment || strings.Count(stderr, "auth error:") != 1 {
+			t.Fatalf("%s: exit code = %d, stderr: %s", format, code, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil || strings.Contains(string(report), "previous") || !strings.Contains(string(report), "auth error:") {
+			t.Errorf("%s: the report was not replaced by the auth failure (%v):\n%s", format, err, report)
+		}
+	}
+}
+
+// A report that cannot be written (here the output path is a directory) fails
+// the run with the file untouched and no temp file left behind.
+func TestFailedReportWriteLeavesNoPartialFile(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(serveDirWith(t, `<main><h1>x</h1></main>`)+"tests:\n  - id: home\n    path: /\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	out := filepath.Join(dir, "report.json")
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr := runCaptured(t, "--config", cfg, "--browser-path", "/nonexistent/chrome", "--format", "json", "--output", out, "--baseline", "none")
+	if code != exitEnvironment || !strings.Contains(stderr, "report error:") {
+		t.Errorf("exit code = %d, stderr: %s", code, stderr)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".report.json.tmp-*")); len(left) > 0 {
+		t.Errorf("temp files left behind: %v", left)
+	}
+	if fi, err := os.Stat(out); err != nil || !fi.IsDir() {
+		t.Errorf("the existing path changed: %v, %v", fi, err)
+	}
+}
+
+// The json stale list repeats entries from the baseline file. With auth, an
+// entry that holds a token in its target is scrubbed, like the selectors the
+// scan reports.
+func TestJSONStaleEntriesAreScrubbedUnderAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	body := "version: 1\nserver:\n  serve: " + filepath.Join(root, "testdata/auth/site") + "\n" +
+		"auth:\n  storageState: " + filepath.Join(root, "testdata/auth/state-valid.json") + "\n" +
+		"  loginPath: /login.html\n  signedIn: \"[data-testid=app-shell]\"\n" +
+		"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
+		"tests:\n  - id: protected\n    path: /protected.html\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bl := filepath.Join(dir, "baseline.json")
+	entry := `{"version":1,"violations":[{"fingerprint":"deadbeef","testId":"protected","scanLabel":"initial","ruleId":"label","stableTarget":"a[href=\"/cb?token=SECRETTOK123\"] > input"}]}`
+	if err := os.WriteFile(bl, []byte(entry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	out := filepath.Join(dir, "report.json")
+	code, stdout, stderr := runBoth(t, "--config", cfg, "--format", "json", "--output", out, "--no-screenshots", "--baseline", bl)
+	if code != exitViolations {
+		t.Fatalf("exit code = %d (stderr: %s)", code, stderr)
+	}
+	report, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(report), "SECRETTOK123") || strings.Contains(stdout+stderr, "SECRETTOK123") {
+		t.Errorf("the baseline's token reached an output:\n%s", report)
+	}
+	var doc struct {
+		Stale []struct {
+			StableTarget string `json:"stableTarget"`
+		} `json:"stale"`
+	}
+	if err := json.Unmarshal(report, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Stale) != 1 || doc.Stale[0].StableTarget != "a[href] > input" {
+		t.Errorf("stale = %+v, want the one entry with its target scrubbed", doc.Stale)
+	}
+}
+
+// writeNew is a render that writes "new".
+func writeNew(w io.Writer) error { _, err := io.WriteString(w, "new"); return err }
+
+// failMidway is a render that writes part of a report and then fails.
+func failMidway(w io.Writer) error {
+	io.WriteString(w, "partial")
+	return fmt.Errorf("disk full")
+}
+
+// onlyEntries fails if dir holds anything but the named entries.
+func onlyEntries(t *testing.T, dir string, want ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s holds %v, want only %v", dir, got, want)
+	}
+}
+
+// A render that fails midway leaves no partial report, whether the file
+// existed before or not, so a half-written report can never contradict the
+// exit code. A good render then writes the file as usual.
+func TestWriteReportFileLeavesNoPartialFileOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "frostfall.json")
+	if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReportFile(out, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if _, err := os.Lstat(out); !os.IsNotExist(err) {
+		t.Errorf("a partial report was left over an existing file: %v", err)
+	}
+	if err := writeReportFile(out, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if _, err := os.Lstat(out); !os.IsNotExist(err) {
+		t.Errorf("a partial report was left as a new file: %v", err)
+	}
+	onlyEntries(t, dir)
+	if err := writeReportFile(out, writeNew); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "new" {
+		t.Errorf("file after a good write = %q", b)
+	}
+}
+
+// An existing report keeps its mode: a 0600 file is not made world-readable
+// by being rewritten.
+func TestWriteReportFileKeepsAnExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "frostfall.json")
+	if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(out, 0o600); err != nil { // independent of the umask
+		t.Fatal(err)
+	}
+	if err := writeReportFile(out, writeNew); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600 kept", fi.Mode().Perm())
+	}
+	if b, _ := os.ReadFile(out); string(b) != "new" {
+		t.Errorf("content = %q", b)
+	}
+	onlyEntries(t, dir, "frostfall.json")
+}
+
+// A new report gets the mode os.Create gives under this process's umask,
+// compared against a file os.Create makes so the test does not depend on, or
+// change, the umask.
+func TestWriteReportFileNewFileFollowsTheUmask(t *testing.T) {
+	dir := t.TempDir()
+	ref := filepath.Join(dir, "reference")
+	f, err := os.Create(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out := filepath.Join(dir, "frostfall.json")
+	if err := writeReportFile(out, writeNew); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.Stat(ref)
+	got, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode().Perm() != want.Mode().Perm() {
+		t.Errorf("mode = %v, want %v (what os.Create gives)", got.Mode().Perm(), want.Mode().Perm())
+	}
+	onlyEntries(t, dir, "frostfall.json", "reference")
+}
+
+// --output naming a symlink writes through it: the target gets the report and
+// the link stays a link. A failed render empties the target rather than
+// removing the link or leaving a partial report in it.
+func TestWriteReportFileWritesThroughASymlink(t *testing.T) {
+	linkDir, targetDir := t.TempDir(), t.TempDir()
+	target := filepath.Join(targetDir, "real.json")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(linkDir, "frostfall.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	isLink := func() bool {
+		fi, err := os.Lstat(link)
+		return err == nil && fi.Mode()&os.ModeSymlink != 0
+	}
+	if err := writeReportFile(link, writeNew); err != nil {
+		t.Fatal(err)
+	}
+	if !isLink() {
+		t.Error("the link was replaced")
+	}
+	if b, _ := os.ReadFile(target); string(b) != "new" {
+		t.Errorf("target content = %q, want the report", b)
+	}
+	if err := writeReportFile(link, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if !isLink() {
+		t.Error("a failed write removed or replaced the link")
+	}
+	if b, err := os.ReadFile(target); err != nil || len(b) != 0 {
+		t.Errorf("target after a failed write = %q (%v), want it empty", b, err)
+	}
+	onlyEntries(t, linkDir, "frostfall.json")
+	onlyEntries(t, targetDir, "real.json")
+}
+
+// A destination that is not a regular file is written in place and never
+// removed, even when the render fails.
+func TestWriteReportFileWritesToADevice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no /dev/null")
+	}
+	before, err := os.Stat(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReportFile(os.DevNull, writeNew); err != nil {
+		t.Fatalf("writing to %s: %v", os.DevNull, err)
+	}
+	if err := writeReportFile(os.DevNull, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	after, err := os.Stat(os.DevNull)
+	if err != nil || after.Mode() != before.Mode() || !os.SameFile(before, after) {
+		t.Errorf("%s changed: before %v, after %v (%v)", os.DevNull, before.Mode(), after, err)
+	}
+}
+
+// Errors name the path the user gave: a missing output directory, and a
+// write that fails partway (/dev/full answers every write with ENOSPC).
+func TestWriteReportFileErrorNamesTheOutputPath(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "missing", "frostfall.json")
+	err := writeReportFile(out, writeNew)
+	if err == nil {
+		t.Fatal("writing into a missing directory succeeded")
+	}
+	if !strings.Contains(err.Error(), out) {
+		t.Errorf("error = %q, want it to name %s", err, out)
+	}
+	onlyEntries(t, dir)
+
+	const full = "/dev/full"
+	if _, serr := os.Stat(full); serr != nil {
+		t.Skipf("no %s: %v", full, serr)
+	}
+	err = writeReportFile(full, writeNew)
+	if err == nil || !strings.Contains(err.Error(), full) {
+		t.Errorf("write error = %v, want it to name %s", err, full)
+	}
+	if fi, serr := os.Stat(full); serr != nil || fi.Mode().IsRegular() {
+		t.Errorf("%s was replaced or removed: %v %v", full, fi, serr)
 	}
 }
