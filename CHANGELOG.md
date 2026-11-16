@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.7.0](https://github.com/aquia-inc/frostfall/compare/v1.6.1...v1.7.0) (2026-11-16)
+
+### Features
+
+* **discover:** add --discover --dry-run to list pages without scanning ([#68](https://github.com/aquia-inc/frostfall/issues/68)) ([7e78036](https://github.com/aquia-inc/frostfall/commit/7e7803665aabe76961c210b14c97baf3277d3e38))
+
 ## [1.6.1](https://github.com/aquia-inc/frostfall/compare/v1.6.0...v1.6.1) (2026-11-16)
 
 ### Bug Fixes
