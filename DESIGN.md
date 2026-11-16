@@ -499,8 +499,12 @@ is not a single `#/` hash route, is skipped and counted on stderr, never printed
 layer to look for a hidden credential was tried and has no stopping point (a stray `%` ends the
 decode, and each new encoding needs a new check), while a character rule has nothing to decode. The
 cost is that a signed-in `/100%` is skipped too; `//x` still prints. A plain secret in an ordinary
-segment (`/a/s3cr3t`) carries none of those characters and is not caught. A path with a control
-character is skipped signed in or out, since it would print as more than one line.
+segment (`/a/s3cr3t`) carries none of those characters and is not caught, and neither is a
+lookalike of `?` or `=` (fullwidth `？` `＝`, U+037E), which is plain text to the rule. Token-shaped
+segments are masked on the printed line and on each test's `path:` before coverage is compared. A
+path with an unprintable character (a control character, invalid UTF-8 such as a raw `%9B` CSI byte,
+a format character such as a bidi override, or a line or paragraph separator) is skipped signed in
+or out, since it would not print as the one line it is.
 Discovery is additive to the config, not a replacement — the recommended shape is a
 handful of explicit stateful tests plus discovery for coverage breadth. (Next.js routes-manifest
 parsing is future work, §10.)

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aquia-inc/frostfall/internal/config"
 )
@@ -438,8 +440,10 @@ func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
 	}{
 		{[]string{"--dry-run"}, "--discover --dry-run"},
 		{[]string{"--discover", "--dry-run", "--update-baseline"}, "--update-baseline"},
-		{[]string{"--discover", "--dry-run", "--gh-issues"}, "--gh-issues"},
-		{[]string{"--discover", "--dry-run", "--gh-issues-dry-run"}, "--gh-issues"},
+		// The flag named is the one that was passed.
+		{[]string{"--discover", "--dry-run", "--gh-issues"}, "drop --gh-issues\n"},
+		{[]string{"--discover", "--dry-run", "--gh-issues-dry-run"}, "drop --gh-issues-dry-run\n"},
+		{[]string{"--discover", "--dry-run", "--gh-issues", "--gh-issues-dry-run"}, "drop --gh-issues and --gh-issues-dry-run\n"},
 		// Flags a path listing cannot use are refused, not ignored. --format
 		// has a default, so passing the default value counts as passing it.
 		{[]string{"--discover", "--dry-run", "--validate"}, "--validate"},
@@ -595,18 +599,53 @@ func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
 	}
 }
 
-// A path with a control character in it would print as more than one line, so
-// it is skipped, not listed, not counted as a page, and counted as skipped.
-// That holds signed in and out, and for any control character, not just \n.
-func TestDryRunListingSkipsControlCharacters(t *testing.T) {
-	paths := []string{"/alpha\n/beta", "/ok", "/tab\there", "/cr\r", "/nul\x00", "/ok2"}
+// unprintableInputs are paths that would not print as the one line they are:
+// control characters (C0, DEL and C1), a raw 8-bit CSI byte that is not valid
+// UTF-8, bidi controls and other format characters, and the Unicode line and
+// paragraph separators.
+var unprintableInputs = []string{
+	"/alpha\n/beta", "/tab\there", "/cr\r", "/nul\x00", "/del\x7f", "/c1\u009b",
+	"/csi\x9b[2J", "/bad\xff",
+	"/rlo\u202e", "/alm\u061c", "/lri\u2066", "/zw\u200b", "/bom\ufeff",
+	"/ls\u2028x", "/ps\u2029x",
+}
+
+// A path with an unprintable character in it is skipped, not listed, not
+// counted as a page, and counted as skipped, signed in and out.
+func TestDryRunListingSkipsUnprintableCharacters(t *testing.T) {
+	paths := append([]string{"/ok", "/ok2", "/caf\u00e9"}, unprintableInputs...)
 	for _, auth := range []bool{false, true} {
 		lines, uncovered, skipped := dryRunListing(paths, auth, nil)
-		if want := []string{"/ok", "/ok2"}; !slices.Equal(lines, want) {
+		if want := []string{"/caf\u00e9", "/ok", "/ok2"}; !slices.Equal(lines, want) {
 			t.Errorf("auth=%v: lines = %q, want %q", auth, lines, want)
 		}
-		if uncovered != 2 || skipped != 4 {
-			t.Errorf("auth=%v: uncovered = %d, skipped = %d, want 2 and 4", auth, uncovered, skipped)
+		if uncovered != 3 || skipped != len(unprintableInputs) {
+			t.Errorf("auth=%v: uncovered = %d, skipped = %d, want 3 and %d", auth, uncovered, skipped, len(unprintableInputs))
+		}
+	}
+}
+
+// The skipped line names no path, and signed out it gives the only reason
+// there is.
+func TestDryRunSkippedLine(t *testing.T) {
+	if got, want := dryRunSkippedLine(2, false), "skipped 2 path(s) with unprintable characters (a newline would split the listing)"; got != want {
+		t.Errorf("signed out: %q, want %q", got, want)
+	}
+	if got, want := dryRunSkippedLine(3, true), "skipped 3 path(s) that can't be listed safely (encoded characters, query-like characters, or unprintable characters)"; got != want {
+		t.Errorf("signed in: %q, want %q", got, want)
+	}
+}
+
+// Signed in, a printed line has its token-shaped segments masked, and a test's
+// path is masked the same way before it is compared, so a test of that page
+// still covers it. Signed out nothing is masked on either side.
+func TestDryRunListingAuthCoverageMatchesMaskedLines(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	tests := []config.Test{{ID: "reset", Path: "/reset/" + token}}
+	for _, auth := range []bool{false, true} {
+		lines, uncovered, _ := dryRunListing([]string{"/reset/" + token, "/other"}, auth, tests)
+		if len(lines) != 2 || uncovered != 1 {
+			t.Errorf("auth=%v: lines = %q, uncovered = %d, want 2 lines and 1 (only /other)", auth, lines, uncovered)
 		}
 	}
 }
@@ -616,7 +655,7 @@ func TestDryRunListingSkipsControlCharacters(t *testing.T) {
 // collapses into a placeholder line. A literal % is skipped and counted, as
 // any % is when signed in. A path that is a secret by shape is still masked,
 // so a token cannot be printed.
-func TestDryRunListingAuthKeepsDecodedPathsAndMasksTokens(t *testing.T) {
+func TestDryRunListingAuthSkipsPercentKeepsSlashesAndMasksTokens(t *testing.T) {
 	const token = "0123456789abcdef0123456789abcdef"
 	lines, uncovered, skipped := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
 	want := []string{"//x", "/reset/[redacted]"}
@@ -633,14 +672,27 @@ func TestDryRunListingAuthKeepsDecodedPathsAndMasksTokens(t *testing.T) {
 	}
 }
 
-// listableLine is the signed-in listing's character rule, written out here on
-// its own so the tests do not check the code against itself: no % ? ; & =, no
-// control character, and no '#' but a single one directly followed by '/'.
-func listableLine(l string) bool {
+// printableLine is the rule every listed line obeys, signed in or out,
+// written out here on its own so the tests do not check the code against
+// itself: valid UTF-8, no C0 or C1 control or DEL, no format character, and no
+// line or paragraph separator.
+func printableLine(l string) bool {
+	if !utf8.ValidString(l) {
+		return false
+	}
 	for _, r := range l {
-		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || strings.ContainsRune("%?;&=", r) {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 || unicode.Is(unicode.Cf, r) {
 			return false
 		}
+	}
+	return true
+}
+
+// listableLine is the signed-in listing's rule: printable, no % ? ; & =, and
+// no '#' but a single one directly followed by '/'.
+func listableLine(l string) bool {
+	if !printableLine(l) || strings.ContainsAny(l, "%?;&=") {
+		return false
 	}
 	switch strings.Count(l, "#") {
 	case 0:
@@ -665,7 +717,8 @@ func encodeN(c byte, n int) string {
 // decoded a link once, each with secret planted behind a character that can
 // carry or hide it. They cover every carrier at every encoding depth from 0 to
 // 6, behind a clean prefix, a stray %, a literal % segment, a hash route and a
-// stray % in front of a hash route, plus the exact probes reviewers sent.
+// stray % in front of a hash route, unprintable characters in front of the
+// secret, and the exact probes reviewers sent.
 func dryRunLeakProbes(secret string) []string {
 	probes := []string{
 		"/%zz%253Ftoken%253Ds3cr3t",
@@ -678,6 +731,13 @@ func dryRunLeakProbes(secret string) []string {
 		"/%25zz%25253Ftoken%25253Ds3cr3t",
 	}
 	prefixes := []string{"/x", "/%zz", "/100%/x", "/#/x", "/x%zz#/y", "/%/#/x"}
+	// An unprintable character in front of the secret: a raw CSI byte, a bidi
+	// override or mark, and a line or paragraph separator.
+	for _, u := range []string{"\x9b", "\u202e", "\u061c", "\u2028", "\u2029"} {
+		for _, pre := range []string{"/x", "/#/x"} {
+			probes = append(probes, pre+u+secret, pre+"/"+u+"/"+secret)
+		}
+	}
 	for _, c := range []byte("?#;&=") {
 		for depth := 0; depth <= 6; depth++ {
 			carrier := encodeN(c, depth)
@@ -730,7 +790,7 @@ func TestDryRunListingAuthSkipsCarriersAtAnyDepth(t *testing.T) {
 }
 
 // Signed out the listing is unchanged from a plain --discover run: the same
-// probes print as they are, and only a control character is skipped.
+// probes print as they are, and only an unprintable character is skipped.
 func TestDryRunListingSignedOutKeepsEncodedPaths(t *testing.T) {
 	paths := []string{"/100%", "/a%3Bfoo=x", "/r&pw=x", "/x%253Fk", "/a#b", "/alpha\n/beta"}
 	lines, uncovered, skipped := dryRunListing(paths, false, nil)
@@ -743,23 +803,29 @@ func TestDryRunListingSignedOutKeepsEncodedPaths(t *testing.T) {
 	}
 }
 
-// Whatever path reaches a signed-in listing, every printed line obeys the
-// character rule, and the listed and skipped paths add up to what came in.
-func FuzzDryRunListingAuth(f *testing.F) {
+// Whatever path reaches the listing, every printed line is printable, signed
+// in every line also obeys the character rule, and the listed and skipped
+// paths add up to what came in.
+func FuzzDryRunListing(f *testing.F) {
 	for _, p := range dryRunLeakProbes("s3cr3tvalue") {
 		f.Add(p)
 	}
-	for _, p := range []string{"/", "//x", "/#/app/page", "/#/a#/b", "/#x", "/a#", "/100%", "/\u202e"} {
+	for _, p := range unprintableInputs {
+		f.Add(p)
+	}
+	for _, p := range []string{"/", "//x", "/#/app/page", "/#/a#/b", "/#x", "/a#", "/100%", "/caf\u00e9", "/x\uff1f\uff1d", "/x\u037e"} {
 		f.Add(p)
 	}
 	f.Fuzz(func(t *testing.T, p string) {
-		lines, uncovered, skipped := dryRunListing([]string{p}, true, nil)
-		if len(lines)+skipped != 1 || uncovered != len(lines) {
-			t.Fatalf("%q: lines = %q, uncovered = %d, skipped = %d", p, lines, uncovered, skipped)
-		}
-		for _, l := range lines {
-			if !listableLine(l) {
-				t.Errorf("%q: listed %q, which breaks the character rule", p, l)
+		for _, auth := range []bool{false, true} {
+			lines, uncovered, skipped := dryRunListing([]string{p}, auth, nil)
+			if len(lines)+skipped != 1 || uncovered != len(lines) {
+				t.Fatalf("auth=%v %q: lines = %q, uncovered = %d, skipped = %d", auth, p, lines, uncovered, skipped)
+			}
+			for _, l := range lines {
+				if !printableLine(l) || (auth && !listableLine(l)) {
+					t.Errorf("auth=%v %q: listed %q, which breaks the rule", auth, p, l)
+				}
 			}
 		}
 	})
@@ -808,7 +874,7 @@ func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
 // holding a %, ?, ;, &, = or a stray # after the crawl's cleaning (a literal
 // /100% included) is skipped and counted on stderr, as is one that decodes to
 // a newline; none of them is printed.
-func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
+func TestDiscoverDryRunWithAuthSkipsUnsafePathsAndLeaksNoTokens(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}

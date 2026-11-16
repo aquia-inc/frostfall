@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
 	"github.com/aquia-inc/frostfall/internal/baseline"
@@ -107,7 +108,14 @@ func run(args []string) int {
 			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there is no baseline to update: drop --update-baseline")
 			return exitBadConfig
 		case *ghIssues || *ghIssuesDry:
-			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there are no issues to file: drop --gh-issues")
+			var given []string
+			if *ghIssues {
+				given = append(given, "--gh-issues")
+			}
+			if *ghIssuesDry {
+				given = append(given, "--gh-issues-dry-run")
+			}
+			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there are no issues to file: drop "+strings.Join(given, " and "))
 			return exitBadConfig
 		case *validateOnly:
 			fmt.Fprintln(os.Stderr, "--dry-run lists the pages a crawl finds and does not validate the config: drop --validate")
@@ -634,18 +642,31 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 		fmt.Println(p)
 	}
 	if skipped > 0 {
-		fmt.Fprintf(os.Stderr, "skipped %d path(s) that can't be listed safely (encoded characters, query-like characters, or control characters)\n", skipped)
+		fmt.Fprintln(os.Stderr, dryRunSkippedLine(skipped, cfg.Auth != nil))
 	}
 	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
 	return exitOK
 }
 
+// dryRunSkippedLine says how many paths a dry run left out, and why, without
+// naming any of them. Signed out the only reason is an unprintable character;
+// signed in the character rule of signedInListable applies too.
+func dryRunSkippedLine(n int, auth bool) string {
+	if auth {
+		return fmt.Sprintf("skipped %d path(s) that can't be listed safely (encoded characters, query-like characters, or unprintable characters)", n)
+	}
+	return fmt.Sprintf("skipped %d path(s) with unprintable characters (a newline would split the listing)", n)
+}
+
 // dryRunListing turns the crawl's paths into the sorted, deduped lines to
 // print, and counts how many of those lines no test in tests covers.
 //
-// A path with a control character in it (a %0A in a link decodes to a real
-// newline) would print as two lines, signed in or out: it is skipped, not
-// listed or counted, and skipped says how many so the caller can report it.
+// A path with an unprintable character in it would not print as the one line
+// it is, signed in or out: a %0A in a link decodes to a real newline, a raw
+// %9B to an 8-bit CSI byte a terminal acts on, and a bidi override (U+202E)
+// or a line separator (U+2028) reorders or splits what is shown. Such a path
+// is skipped, not listed or counted, and skipped says how many so the caller
+// can report it.
 //
 // Signed in, the crawler cuts queries, ;params and hash payloads, but a link
 // can hide a credential behind any number of encoding layers (%253F is a ?
@@ -654,16 +675,22 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 // it, and every other path is skipped and counted the same way. The paths are
 // not parsed as URLs again (that misreads a literal % as a bad escape and a
 // leading // as a host); MaskSegments, which works on the text, still masks a
-// segment that is a secret by shape. The count is of printed lines, after the
-// dedupe, so it cannot exceed the number listed.
+// segment that is a secret by shape, and a test's path is masked the same way
+// before it is compared, so a test of a token-shaped page still covers its
+// line. The count is of printed lines, after the dedupe, so it cannot exceed
+// the number listed.
 func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered, skipped int) {
 	covered := map[string]bool{}
 	for _, t := range tests {
-		covered[t.Path] = true
+		if auth {
+			covered[secrets.MaskSegments(t.Path)] = true
+		} else {
+			covered[t.Path] = true
+		}
 	}
 	listed := map[string]bool{}
 	for _, p := range paths {
-		if strings.ContainsFunc(p, unicode.IsControl) || (auth && !signedInListable(p)) {
+		if unprintable(p) || (auth && !signedInListable(p)) {
 			skipped++
 			continue
 		}
@@ -681,6 +708,19 @@ func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []stri
 	}
 	sort.Strings(lines)
 	return lines, uncovered, skipped
+}
+
+// unprintable reports whether p would not print as the single line it is:
+// invalid UTF-8 (a raw 8-bit byte such as CSI), a control character, a format
+// character (bidi overrides and marks, zero-width characters) or a line or
+// paragraph separator.
+func unprintable(p string) bool {
+	if !utf8.ValidString(p) {
+		return true
+	}
+	return strings.ContainsFunc(p, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.In(r, unicode.Zl, unicode.Zp)
+	})
 }
 
 // signedInListable reports whether a signed-in dry run may print p: it holds

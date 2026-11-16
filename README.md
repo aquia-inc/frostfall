@@ -901,11 +901,20 @@ not printed and not counted as uncovered, and stderr says how many
 (`%253Ftoken%253D...`, any number of layers deep) is skipped that way, and so
 is an ordinary page whose path has a literal `%`: signed in, `/100%` is skipped,
 while `//x` and `/#/app/page` still print. A segment shaped like a token is
-masked as `[redacted]`. A plain secret in an ordinary segment (`/a/s3cr3t`, or
-after `#/`) looks like any other path to a character rule, so it is not caught.
-A path with a control character in it (a link that decodes to a newline) would
-print as two lines, so it is skipped signed in or out and counted the same way;
-signed out, that is the only path the listing skips.
+masked as `[redacted]`, and a test's `path:` is masked the same way before
+coverage is counted, so a test of that page still covers its line. A plain
+secret in an ordinary segment (`/a/s3cr3t`, or after `#/`) looks like any other
+path to a character rule, so it is not caught, and neither is a lookalike of
+`?` or `=` (fullwidth `？` or `＝`, or the Greek question mark U+037E), which is
+plain text to the rule and falls under the same residual.
+
+A path with an unprintable character in it would not print as the one line it
+is: a newline splits it, a raw 8-bit byte (a link's `%9B` decodes to a terminal
+CSI byte) or invalid UTF-8 can act on the terminal, and a bidi override (U+202E,
+U+061C), another format character or a line separator (U+2028, U+2029)
+reorders or breaks what is shown. Such a path is skipped signed in or out.
+Signed out it is the only path the listing skips, and stderr says
+`skipped N path(s) with unprintable characters (a newline would split the listing)`.
 
 ## Screenshots
 
