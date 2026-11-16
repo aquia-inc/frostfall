@@ -130,6 +130,25 @@ func TestKeyboardAudit(t *testing.T) {
 			want: map[string][]string{keyboard.RuleHidden: {"#skip"}},
 		},
 		{
+			// A visually hidden radio whose label draws the ring: the common
+			// segmented-control pattern. Its focus is visible, on the label.
+			name: "hidden radio, ring on its label",
+			body: `<style>
+				.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+				label:has(:focus-visible) { outline: 2px solid blue; outline-offset: 2px; }
+				</style>
+				<label id="l1"><input type="radio" name="t" id="r1" class="sr-only" checked> Light</label>
+				<label id="l2"><input type="radio" name="t" id="r2" class="sr-only"> Dark</label>`,
+			want: map[string][]string{},
+		},
+		{
+			name: "hidden radio, nothing shows focus",
+			body: `<style>.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }</style>
+				<button id="ok">ok</button>
+				<label id="l1"><input type="radio" name="t" id="r1" class="sr-only" checked> Light</label>`,
+			want: map[string][]string{keyboard.RuleHidden: {"#r1"}},
+		},
+		{
 			name: "Tab swallowed",
 			body: `<button id="ok">ok</button><input id="eat"><button id="after">after</button>
 				<script>eat.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })</script>`,

@@ -66,16 +66,18 @@ type element struct {
 }
 
 type stop struct {
-	Out     bool       `json:"out"`
-	View    [4]float64 `json:"view"`
-	ID      int        `json:"id"`
-	Frame   bool       `json:"frame"`
-	Sel     string     `json:"sel"`
-	HTML    string     `json:"html"`
-	Hidden  string     `json:"hidden"`
-	InModal bool       `json:"inModal"`
-	InScope bool       `json:"inScope"`
-	Box     [4]float64 `json:"box"`
+	Out    bool       `json:"out"`
+	View   [4]float64 `json:"view"`
+	ID     int        `json:"id"`
+	Frame  bool       `json:"frame"`
+	Sel    string     `json:"sel"`
+	HTML   string     `json:"html"`
+	Hidden string     `json:"hidden"`
+	// Labelled: a hidden stop whose label is visible, so Box is the label's.
+	Labelled bool       `json:"labelled"`
+	InModal  bool       `json:"inModal"`
+	InScope  bool       `json:"inScope"`
+	Box      [4]float64 `json:"box"`
 }
 
 type audit struct {
@@ -248,7 +250,9 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	// A labelled hidden stop is judged by its label's pixels, like any stop.
 	checkVisible := a.enabled(RuleNotVisible)
+	checkHidden := a.enabled(RuleHidden)
 	reached := map[int]bool{}
 	var (
 		first int
@@ -274,7 +278,7 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		if err := page.PressTab(); err != nil {
 			return nil, fmt.Errorf("pressing Tab: %w", err)
 		}
-		if checkVisible {
+		if checkVisible || checkHidden {
 			if err := a.call("settle", nil); err != nil {
 				return nil, err
 			}
@@ -370,11 +374,15 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		if !cur.InScope {
 			continue
 		}
-		if cur.Hidden != "" {
+		if cur.Hidden != "" && !cur.Labelled {
 			a.report(RuleHidden, cur.Sel, cur.HTML, "Focus landed on this element, but "+cur.Hidden)
 			continue
 		}
-		if checkVisible && !curRegion.Empty() {
+		judge := checkVisible
+		if cur.Hidden != "" {
+			judge = checkHidden
+		}
+		if judge && !curRegion.Empty() {
 			shot, err := shots.pixels(curRegion)
 			if err != nil {
 				return nil, err
@@ -432,7 +440,7 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		}
 		res.Violations = a.out
 		if !complete {
-			res.Unchecked = append(res.Unchecked, RuleNotVisible)
+			res.Unchecked = append(res.Unchecked, RuleNotVisible, RuleHidden)
 		}
 	}
 	return res, nil
@@ -501,32 +509,40 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (c
 		if err != nil {
 			return false, err
 		}
-		// Off the page and back if the suspect was the last stop: see the
-		// fast pass on why a page without focus cannot be compared. Twice
-		// out in a row means focus is not coming back; stop the lap.
-		cur, err = next(true)
-		if err == nil && cur.Out {
-			cur, err = next(true)
-		}
-		if err != nil {
+		// Blur rather than Tab to the next stop: the neighbour's ring, and the
+		// mask that hides it, can cover most of a tiny element's region (an 8px
+		// chip in a zoomed-out diagram). The page keeps focus, so it repaints.
+		if err := a.call("blurActive", nil); err != nil {
 			return false, err
 		}
-		if cur.Out {
-			return false, nil
+		if err := a.call("settle", nil, confirmDelay); err != nil {
+			return false, err
 		}
-		if cur.ID == s.ID || !before.In(viewport(cur.View)) {
+		var after stop
+		if err := a.call("state", &after); err != nil {
+			return false, err
+		}
+		if !before.In(viewport(after.View)) {
 			complete = false
 		} else {
-			after := region(cur.Box, cur.View)
-			blurred, err := newFrame(a.page, cur.View, before, after).pixels(before)
+			blurred, err := newFrame(a.page, after.View, before).pixels(before)
 			if err != nil {
 				return false, err
 			}
-			if sameOutside(focused, blurred, after.Intersect(before).Sub(before.Min)) {
-				a.report(RuleNotVisible, s.Sel, s.HTML, "")
+			if sameOutside(focused, blurred, image.Rectangle{}) {
+				if s.Hidden != "" {
+					a.report(RuleHidden, s.Sel, s.HTML,
+						"Focus landed on this element, but "+s.Hidden+", and its label does not show focus either")
+				} else {
+					a.report(RuleNotVisible, s.Sel, s.HTML, "")
+				}
 			}
 		}
-		if len(suspects) == 0 || cur.ID == first {
+		// Tab from where the blurred stop was continues the lap.
+		if cur, err = next(false); err != nil {
+			return false, err
+		}
+		if len(suspects) == 0 || (!cur.Out && cur.ID == first) {
 			return complete && len(suspects) == 0, nil
 		}
 	}
