@@ -3,11 +3,16 @@
 package browser
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/cdp"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
@@ -159,7 +164,7 @@ func (s *Session) newIdleWaiter() func() {
 // finishIdle waits for the load event, then for the already-subscribed idle
 // monitor, then settles.
 func (s *Session) finishIdle(idle func(), settle time.Duration) error {
-	if err := s.page.WaitLoad(); err != nil {
+	if err := s.waitLoad(); err != nil {
 		return fmt.Errorf("waiting for load: %w", err)
 	}
 	idle()
@@ -194,6 +199,73 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 	return s.WaitReady(waitFor, settle)
 }
 
+// followNavigation runs a readiness wait (the load event, a selector),
+// starting it over when the page navigates itself mid-wait. A script redirect
+// (an auth guard's location.replace, a login form's submit) destroys the
+// context the wait runs in, which CDP reports as an error rather than as the
+// new page loading; whether the wait began before the navigation is a race
+// that slow CI runners lose. The page's own timeout still bounds the whole
+// wait, a target that closed or crashed fails at once, and a page that keeps
+// navigating itself (a redirect loop, where a wait hangs rather than errors)
+// fails once it passes maxSelfNavigations.
+func (s *Session) followNavigation(wait func(p *rod.Page) error) error {
+	ctx, cancel := context.WithCancel(s.page.GetContext())
+	defer cancel()
+	p := s.page.Context(ctx)
+	var looped atomic.Bool
+	hops := 0
+	go p.EachEvent(func(e *proto.PageFrameNavigated) bool {
+		if e.Frame.ParentID != "" {
+			return false
+		}
+		if hops++; hops > maxSelfNavigations {
+			looped.Store(true)
+			cancel()
+			return true
+		}
+		return false
+	})()
+	for {
+		err := wait(p)
+		if looped.Load() {
+			return fmt.Errorf("the page navigated more than %d times on its own while waiting; is it redirecting in a loop?", maxSelfNavigations)
+		}
+		var cdpErr *cdp.Error
+		if err == nil || !errors.As(err, &cdpErr) || !navigatedAway(cdpErr.Message) {
+			return err
+		}
+		// CDP's message is the same for a target that closed or crashed: only
+		// one that still exists navigated, and only that is worth waiting on.
+		if _, infoErr := (proto.TargetGetTargetInfo{TargetID: s.page.TargetID}).Call(s.page); infoErr != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			if looped.Load() {
+				return fmt.Errorf("the page navigated more than %d times on its own while waiting; is it redirecting in a loop?", maxSelfNavigations)
+			}
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// maxSelfNavigations bounds followNavigation: well above an SSO flow's hops.
+const maxSelfNavigations = 20
+
+func (s *Session) waitLoad() error {
+	return s.followNavigation(func(p *rod.Page) error { return p.WaitLoad() })
+}
+
+func navigatedAway(msg string) bool {
+	for _, m := range []string{"navigated or closed", "Execution context was destroyed", "Cannot find context"} {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitReady applies the readiness strategy: networkIdle (no in-flight
 // requests for 500ms), load, or a CSS selector. When called after an action
 // (a waitFor step), the idle monitor can only observe requests still open or
@@ -206,11 +278,14 @@ func (s *Session) WaitReady(waitFor string, settle time.Duration) error {
 			return err
 		}
 	case "load":
-		if err := s.page.WaitLoad(); err != nil {
+		if err := s.waitLoad(); err != nil {
 			return fmt.Errorf("waiting for load: %w", err)
 		}
 	default: // CSS selector
-		if _, err := s.page.Element(waitFor); err != nil {
+		if err := s.followNavigation(func(p *rod.Page) error {
+			_, err := p.Element(waitFor)
+			return err
+		}); err != nil {
 			return fmt.Errorf("waiting for selector %q: %w", waitFor, err)
 		}
 	}

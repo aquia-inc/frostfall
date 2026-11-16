@@ -85,6 +85,16 @@
     return false;
   }
 
+  // A visually hidden native input (sr-only) draws its focus on its label;
+  // visibility is judged there rather than on the 1px input. Only the element's
+  // own labels count (el.labels covers a wrapping label too): a hidden link that
+  // merely sits inside a checkbox's label is not drawn by it.
+  function labelOf(el) {
+    const label = el.labels && el.labels[0];
+    // A label that is itself out of sight cannot show focus either.
+    return label && shown(label) && !hiddenReason(label) ? label : null;
+  }
+
   function hiddenReason(el) {
     if (!hasSize(el)) return 'it renders at 1px or smaller';
     const cs = getComputedStyle(el);
@@ -223,6 +233,8 @@
       if (!document.hasFocus() || !a || a === document.body || a === document.documentElement) {
         return { out: true, view };
       }
+      const hidden = hiddenReason(a);
+      const label = hidden ? labelOf(a) : null;
       return {
         out: false,
         view,
@@ -230,11 +242,20 @@
         frame: a.localName === 'iframe',
         sel: selectorOf(a),
         html: snippet(a),
-        hidden: hiddenReason(a),
+        hidden,
+        labelled: !!label,
         inModal: !modal || containsDeep(modal, a),
         inScope: inScope(a),
-        box: focusBox(a),
+        box: focusBox(label || a),
+        own: label ? (() => { const r = a.getBoundingClientRect(); return [r.left + scrollX, r.top + scrollY, r.width, r.height]; })() : [0, 0, 0, 0],
       };
+    },
+
+    // Drops focus without moving it to another element, so a re-check sees
+    // the stop unfocused with no neighbour's ring beside it.
+    blurActive() {
+      const a = deepActive();
+      if (a && a !== document.body) a.blur();
     },
 
     // Puts focus and scroll back where the audit found them, so steps after

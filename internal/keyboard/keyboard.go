@@ -14,7 +14,9 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
+	"maps"
 	"math"
+	"slices"
 
 	"github.com/aquia-inc/frostfall/internal/engine"
 	"github.com/aquia-inc/frostfall/internal/fingerprint"
@@ -66,13 +68,17 @@ type element struct {
 }
 
 type stop struct {
-	Out     bool       `json:"out"`
-	View    [4]float64 `json:"view"`
-	ID      int        `json:"id"`
-	Frame   bool       `json:"frame"`
-	Sel     string     `json:"sel"`
-	HTML    string     `json:"html"`
-	Hidden  string     `json:"hidden"`
+	Out    bool       `json:"out"`
+	View   [4]float64 `json:"view"`
+	ID     int        `json:"id"`
+	Frame  bool       `json:"frame"`
+	Sel    string     `json:"sel"`
+	HTML   string     `json:"html"`
+	Hidden string     `json:"hidden"`
+	// Labelled: a hidden stop whose label is visible, so Box is the label's.
+	Labelled bool `json:"labelled"`
+	// Own is a labelled stop's own box, Box being its label's.
+	Own     [4]float64 `json:"own"`
 	InModal bool       `json:"inModal"`
 	InScope bool       `json:"inScope"`
 	Box     [4]float64 `json:"box"`
@@ -115,9 +121,11 @@ func (a *audit) call(fn string, out any, args ...any) error {
 // captures of a stop must crop alike. Nothing outside the viewport is
 // captured, because captureBeyondViewport stretches the viewport to the
 // page, which moves position: fixed elements out of their own region.
-func region(box, view [4]float64) image.Rectangle {
-	r := image.Rect(int(math.Floor(box[0]-focusPad)), int(math.Floor(box[1]-focusPad)),
-		int(math.Ceil(box[0]+box[2]+focusPad)), int(math.Ceil(box[1]+box[3]+focusPad)))
+func region(box, view [4]float64) image.Rectangle { return padded(box, view, focusPad) }
+
+func padded(box, view [4]float64, pad float64) image.Rectangle {
+	r := image.Rect(int(math.Floor(box[0]-pad)), int(math.Floor(box[1]-pad)),
+		int(math.Ceil(box[0]+box[2]+pad)), int(math.Ceil(box[1]+box[3]+pad)))
 	return r.Intersect(viewport(view))
 }
 
@@ -180,18 +188,51 @@ const (
 	faint = 12
 )
 
+func masked(p image.Point, masks []image.Rectangle) bool {
+	for _, m := range masks {
+		if p.In(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// ownMask is a labelled hidden stop's own box within its label's region (in
+// region coordinates), padded by ownPad for the ring a browser draws around
+// it, and no further, so a small label's own ring stays visible. Judged
+// through its label, the input's own default ring, a few pixels around a 1px
+// unclipped input, is not an indicator anyone can use, so it must not count
+// as the label showing focus. Empty for any other stop.
+func ownMask(s stop, reg image.Rectangle) image.Rectangle {
+	if !s.Labelled {
+		return image.Rectangle{}
+	}
+	return padded(s.Own, s.View, ownPad).Sub(reg.Min)
+}
+
+// ownPad covers a browser's default focus ring around a tiny input.
+const ownPad = 3
+
+// minCompared is how many pixels a "looks the same" verdict needs. When the
+// masks (a neighbour's region, a hidden input's own box) cover nearly all of
+// a stop's region, too little is left to say nothing changed. A difference is
+// evidence at any count.
+const minCompared = 40
+
 // sameOutside reports whether two captures of one region look the same
-// outside mask (in region coordinates).
-func sameOutside(a, b *image.RGBA, mask image.Rectangle) bool {
+// outside the masks (in region coordinates), and how many pixels it compared;
+// a same verdict from fewer than minCompared is no verdict.
+func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) (same bool, compared int) {
 	if a.Bounds() != b.Bounds() {
-		return false
+		return false, 0
 	}
 	changed := 0
 	for y := range a.Bounds().Dy() {
 		for x := range a.Bounds().Dx() {
-			if image.Pt(x, y).In(mask) {
+			if masked(image.Pt(x, y), masks) {
 				continue
 			}
+			compared++
 			i := a.PixOffset(x, y)
 			for c := range 3 {
 				if d := int(a.Pix[i+c]) - int(b.Pix[i+c]); d > faint || d < -faint {
@@ -200,11 +241,11 @@ func sameOutside(a, b *image.RGBA, mask image.Rectangle) bool {
 				}
 			}
 			if changed > noise {
-				return false
+				return false, compared
 			}
 		}
 	}
-	return true
+	return true, compared
 }
 
 // Result is an audit's outcome.
@@ -248,7 +289,9 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	// A labelled hidden stop is judged by its label's pixels, like any stop.
 	checkVisible := a.enabled(RuleNotVisible)
+	checkHidden := a.enabled(RuleHidden)
 	reached := map[int]bool{}
 	var (
 		first int
@@ -274,7 +317,7 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		if err := page.PressTab(); err != nil {
 			return nil, fmt.Errorf("pressing Tab: %w", err)
 		}
-		if checkVisible {
+		if checkVisible || checkHidden {
 			if err := a.call("settle", nil); err != nil {
 				return nil, err
 			}
@@ -310,9 +353,23 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 				return nil, err
 			}
 			mask := curRegion.Intersect(pendRegion).Sub(pendRegion.Min)
-			if sameOutside(pendShot, now, mask) {
+			same, n := sameOutside(pendShot, now, mask, ownMask(*pend, pendRegion))
+			switch {
+			case same && n < minCompared:
+				comparing = false
+			case same:
 				suspects[pend.ID] = *pend
 			}
+		}
+		// A labelled hidden stop the fast pass could not compare (Tab came
+		// straight back to it, or scrolled its label away) goes to the
+		// confirming lap, which blurs in place: before it was judged by pixels,
+		// such a stop was always reported, and must not now go silently
+		// unjudged. A visible stop stays on the old path, which can only miss a
+		// finding: sending those too costs ~0.9s each on a long page, where
+		// Chrome scrolls nearly every stop out of view for the next.
+		if pend != nil && !cur.Out && !comparing && pend.Hidden != "" {
+			suspects[pend.ID] = *pend
 		}
 		if pend != nil && !cur.Out {
 			pend, pendShot = nil, nil
@@ -370,11 +427,16 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 		if !cur.InScope {
 			continue
 		}
-		if cur.Hidden != "" {
+		// A label off screen cannot show focus either, and has no pixels to judge.
+		if cur.Hidden != "" && (!cur.Labelled || curRegion.Empty()) {
 			a.report(RuleHidden, cur.Sel, cur.HTML, "Focus landed on this element, but "+cur.Hidden)
 			continue
 		}
-		if checkVisible && !curRegion.Empty() {
+		judge := checkVisible
+		if cur.Hidden != "" {
+			judge = checkHidden
+		}
+		if judge && !curRegion.Empty() {
 			shot, err := shots.pixels(curRegion)
 			if err != nil {
 				return nil, err
@@ -426,14 +488,12 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 	// Last: the confirming lap can re-render what it scrolls past (a
 	// virtualized grid's rows), which would make reached elements look new.
 	if len(suspects) > 0 {
-		complete, err := a.confirm(ctx, last, suspects)
+		unjudged, err := a.confirm(ctx, last, suspects)
 		if err != nil {
 			return nil, err
 		}
 		res.Violations = a.out
-		if !complete {
-			res.Unchecked = append(res.Unchecked, RuleNotVisible)
-		}
+		res.Unchecked = append(res.Unchecked, unjudged...)
 	}
 	return res, nil
 }
@@ -445,92 +505,146 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 const confirmDelay = 400
 
 // confirm makes a second lap from cur, the first stop, and re-compares each
-// suspect with confirmDelay on both sides, reporting only those that still
-// look unchanged. A suspect the lap cannot judge (a virtualized row
-// re-rendered, focus moved on by itself) is dropped, since a gate must not
-// fail on a guess, and complete reports false: the rule was not fully
-// evaluated, so its absence must not read as fixed.
-func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (complete bool, err error) {
+// suspect focused and then blurred, with confirmDelay on both sides, reporting
+// only those that still look unchanged. A suspect the lap cannot judge (a
+// virtualized row re-rendered, focus moved on or was pulled back by itself) is
+// dropped, since a gate must not fail on a guess, and its rule is returned as
+// unchecked: not fully evaluated, so a missing finding must not read as fixed.
+func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (unchecked []string, err error) {
 	first := cur.ID
-	complete = true
-	// next presses Tab, waiting confirmDelay first only when slow: getting
-	// from one suspect to the next needs no settling at all.
-	next := func(slow bool) (stop, error) {
+	unjudged := map[string]bool{}
+	skip := func(s stop) { unjudged[ruleOf(s)] = true }
+	done := func() []string {
+		for _, s := range suspects {
+			skip(s)
+		}
+		return slices.Sorted(maps.Keys(unjudged))
+	}
+	// next presses Tab, without settling: getting from one suspect to the next
+	// needs none.
+	next := func() (stop, error) {
 		var st stop
 		if err := a.page.PressTab(); err != nil {
 			return st, fmt.Errorf("pressing Tab: %w", err)
-		}
-		if slow {
-			if err := a.call("settle", nil, confirmDelay); err != nil {
-				return st, err
-			}
 		}
 		return st, a.call("state", &st)
 	}
 	for range a.opts.MaxTabs {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return nil, err
 		}
 		s, ok := suspects[cur.ID]
 		if !ok || cur.Out {
-			if cur, err = next(false); err != nil {
-				return false, err
+			if cur, err = next(); err != nil {
+				return nil, err
 			}
 			// Back at the start with suspects left: the lap could not find
 			// them again.
 			if !cur.Out && cur.ID == first {
-				return complete && len(suspects) == 0, nil
+				return done(), nil
 			}
 			continue
 		}
 		delete(suspects, cur.ID)
 		if err := a.call("settle", nil, confirmDelay); err != nil {
-			return false, err
+			return nil, err
 		}
 		if err := a.call("state", &cur); err != nil {
-			return false, err
+			return nil, err
 		}
 		// Focus may have moved on by itself during the wait (a grid moving
 		// it into a row): then this capture is not the suspect's to judge.
 		if cur.Out || cur.ID != s.ID {
-			complete = false
+			skip(s)
 			continue
 		}
 		before := region(cur.Box, cur.View)
+		own := ownMask(cur, before)
 		focused, err := newFrame(a.page, cur.View, before).pixels(before)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		// Off the page and back if the suspect was the last stop: see the
-		// fast pass on why a page without focus cannot be compared. Twice
-		// out in a row means focus is not coming back; stop the lap.
-		cur, err = next(true)
-		if err == nil && cur.Out {
-			cur, err = next(true)
+		// Blur rather than Tab to the next stop: the neighbour's ring, and the
+		// mask that hides it, can cover most of a tiny element's region (an 8px
+		// chip in a zoomed-out diagram). The page keeps focus, so it repaints.
+		if err := a.call("blurActive", nil); err != nil {
+			return nil, err
 		}
-		if err != nil {
-			return false, err
+		if err := a.call("settle", nil, confirmDelay); err != nil {
+			return nil, err
 		}
-		if cur.Out {
-			return false, nil
+		var after stop
+		if err := a.call("state", &after); err != nil {
+			return nil, err
 		}
-		if cur.ID == s.ID || !before.In(viewport(cur.View)) {
-			complete = false
-		} else {
-			after := region(cur.Box, cur.View)
-			blurred, err := newFrame(a.page, cur.View, before, after).pixels(before)
-			if err != nil {
-				return false, err
+		judge := func(blurred *image.RGBA, mask image.Rectangle) {
+			same, n := sameOutside(focused, blurred, mask, own)
+			if same && n < minCompared {
+				skip(s)
+				return
 			}
-			if sameOutside(focused, blurred, after.Intersect(before).Sub(before.Min)) {
+			if !same {
+				return
+			}
+			if s.Hidden != "" {
+				a.report(RuleHidden, s.Sel, s.HTML,
+					"Focus landed on this element, but "+s.Hidden+", and its label does not show focus either")
+			} else {
 				a.report(RuleNotVisible, s.Sel, s.HTML, "")
 			}
 		}
-		if len(suspects) == 0 || cur.ID == first {
-			return complete && len(suspects) == 0, nil
+		if after.Out {
+			if !before.In(viewport(after.View)) {
+				skip(s)
+			} else {
+				blurred, err := newFrame(a.page, after.View, before).pixels(before)
+				if err != nil {
+					return nil, err
+				}
+				judge(blurred, image.Rectangle{})
+			}
+			// Tab from where the blurred stop was continues the lap.
+			if cur, err = next(); err != nil {
+				return nil, err
+			}
+		} else {
+			// Focus is on an element again: a focus trap (MUI's, focus-trap's)
+			// pulled it back. Compare against the next stop instead, masking its
+			// region, as the fast pass does; only when that cannot be made either
+			// is the suspect left unjudged.
+			if cur, err = next(); err != nil {
+				return nil, err
+			}
+			if err := a.call("settle", nil, confirmDelay); err != nil {
+				return nil, err
+			}
+			if err := a.call("state", &cur); err != nil {
+				return nil, err
+			}
+			if cur.Out || cur.ID == s.ID || !before.In(viewport(cur.View)) {
+				skip(s)
+			} else {
+				neighbour := region(cur.Box, cur.View)
+				blurred, err := newFrame(a.page, cur.View, before, neighbour).pixels(before)
+				if err != nil {
+					return nil, err
+				}
+				judge(blurred, neighbour.Intersect(before).Sub(before.Min))
+			}
+		}
+		if len(suspects) == 0 || (!cur.Out && cur.ID == first) {
+			return done(), nil
 		}
 	}
-	return false, nil
+	return done(), nil
+}
+
+// ruleOf is the visibility rule a suspect is judged under.
+func ruleOf(s stop) string {
+	if s.Hidden != "" {
+		return RuleHidden
+	}
+	return RuleNotVisible
 }
 
 // reenter gives the page focus back if the audit left it in the browser UI
