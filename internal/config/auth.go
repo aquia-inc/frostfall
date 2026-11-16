@@ -350,46 +350,64 @@ func nodeAt(n *yaml.Node, keys ...string) *yaml.Node {
 	return resolveAlias(n)
 }
 
-// yamlPair is one key/value of a mapping as the decoder sees it.
+// yamlPair is one key/value of a mapping as the decoder sees it. key is the
+// decoded name; keyNode is the alias-resolved key, for its tag and line.
 type yamlPair struct {
-	key string
-	val *yaml.Node
+	key     string
+	keyNode *yaml.Node
+	val     *yaml.Node
 }
 
 // isMergeKey matches a merge key (<<) the way yaml.v3 does: a plain or
-// !!merge-tagged scalar, not a quoted "<<" string.
+// !!merge-tagged scalar, not a quoted "<<" string or an alias to one.
 func isMergeKey(k *yaml.Node) bool {
 	return k.Kind == yaml.ScalarNode && k.Value == "<<" && (k.Tag == "" || k.Tag == "!" || k.ShortTag() == "!!merge")
 }
 
+// keyName decodes a mapping key to the field or map key the decoder would
+// see: an alias is followed and the scalar decoded as a string, so
+// `!!binary YXV0aA==` is "auth". A key that does not decode keeps its text.
+func keyName(k *yaml.Node) (string, *yaml.Node) {
+	k = resolveAlias(k)
+	var s string
+	if err := k.Decode(&s); err != nil {
+		return k.Value, k
+	}
+	return s, k
+}
+
 // effectivePairs returns the key/value pairs a mapping decodes to: aliases
-// followed, and merge keys (<<, given a mapping, an alias to one, or a
-// sequence of them) expanded in the decoder's order, so an explicit key
-// shadows a merged one wholesale and an earlier merged mapping shadows a
-// later one. Values are alias-resolved; nil unless n is a mapping. A
-// mapping that merges itself is expanded once; the real decode reports it.
+// followed, keys decoded (keyName), and merge keys (<<, given a mapping, an
+// alias to one, or a sequence of them) expanded in the decoder's order, so an
+// explicit key shadows a merged one wholesale and an earlier merged mapping
+// shadows a later one. Values are alias-resolved; nil unless n is a mapping.
+//
+// Each mapping is expanded at most once per call. Keys are first-wins, so a
+// second visit could only offer keys already taken; skipping it keeps alias
+// diamonds (&aN {<<: [*aN-1, *aN-1]}) linear rather than exponential, since
+// this runs before the decoder's own excessive-aliasing check, and it ends
+// cycles (a mapping that merges itself), which the real decode reports.
 func effectivePairs(n *yaml.Node) []yamlPair {
 	var out []yamlPair
 	seen := map[string]bool{}
-	onPath := map[*yaml.Node]bool{}
+	visited := map[*yaml.Node]bool{}
 	var walk func(m *yaml.Node)
 	walk = func(m *yaml.Node) {
 		m = resolveAlias(m)
-		if m == nil || m.Kind != yaml.MappingNode || onPath[m] {
+		if m == nil || m.Kind != yaml.MappingNode || visited[m] {
 			return
 		}
-		onPath[m] = true
-		defer delete(onPath, m)
+		visited[m] = true
 		var merge *yaml.Node
 		for i := 0; i+1 < len(m.Content); i += 2 {
-			k := m.Content[i]
-			if isMergeKey(k) {
+			if isMergeKey(m.Content[i]) {
 				merge = resolveAlias(m.Content[i+1]) // the last << wins, as in the decoder
 				continue
 			}
-			if !seen[k.Value] {
-				seen[k.Value] = true
-				out = append(out, yamlPair{k.Value, resolveAlias(m.Content[i+1])})
+			name, k := keyName(m.Content[i])
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, yamlPair{name, k, resolveAlias(m.Content[i+1])})
 			}
 		}
 		if merge != nil && merge.Kind == yaml.SequenceNode {

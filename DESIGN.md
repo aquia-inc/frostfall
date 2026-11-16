@@ -362,9 +362,16 @@ be read as "inherit". The reason for the rule is that the `ci` profile is select
 in GitHub Actions: a profile that dropped auth would silently turn off the signed-in guard and the
 URL and selector redaction for every CI run. A test that should run signed out sets `auth: false`
 on itself instead. The check walks the document, `profiles` and each profile through aliases and
-merge keys (`<<`) the way the decoder does, so a profile assembled by a merge cannot slip a null
-`auth` past it. The password lint reads every profile's `auth.setup.steps` as well as the
-top-level ones.
+merge keys (`<<`) with the decoder's precedence, and compares keys as the decoder decodes them, so
+an alias key or a `!!binary` key that decodes to `auth` counts as `auth`. A profile name must
+resolve to a string: yaml.v3 records an unquoted `2024`, `1.5`, `true`, date or null key in its own
+type but looks merged keys up as strings, so a merged profile would replace an explicit one of the
+same name, and such names are a config error that says to quote them. The walk only produces the
+error message. The safety comes from `applyProfile`, which inherits the top-level block whenever
+the decoded profile auth is nil, so a removal the walk missed would keep auth, never drop it. The
+walk expands each mapping once, so alias diamonds stay linear (it runs before the decoder's
+excessive-aliasing check) and a self-merge ends there and is reported by the decoder. The
+password lint reads every profile's `auth.setup.steps` as well as the top-level ones.
 
 **`signedIn` is the guard's main signal.** A URL comparison cannot tell a signed-out page from a
 signed-in one: a login can be rendered in place, an identity provider's page is on another origin, a

@@ -551,9 +551,8 @@ func Load(path, profile string) (*Config, error) {
 
 	// Checked for every profile, selected or not, like strict decoding, and
 	// before it, so auth: false gets this message rather than a type error.
-	if name := profileRemovingAuth(interpolated); name != "" {
-		return nil, fmt.Errorf("%s: profile %q: auth: a profile can replace the auth block but not remove it; "+
-			"set auth: false on the tests that should run signed out", path, name)
+	if err := checkProfiles(interpolated); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(interpolated))
@@ -576,28 +575,52 @@ func Load(path, profile string) (*Config, error) {
 	return &cfg, nil
 }
 
-// profileRemovingAuth names the first profile, by name, whose auth: is null
-// or a scalar rather than a block. Decoded, `auth: null` would leave the
-// pointer nil and read as "inherit"; a profile that could turn auth off would
-// drop the signed-in guard for a whole environment. Every level of the walk
-// (the document, profiles, each profile) follows merge keys and aliases the
-// way the decoder does, so a profile that arrives through << is checked too.
-// Text that does not parse yields "": the real decode reports that.
-func profileRemovingAuth(text string) string {
+// checkProfiles rejects, in every profile, selected or not, what the
+// decoder would get wrong or silently accept:
+//
+//   - A profile name that is not a string (2024, 1.5, true, a date, null).
+//     yaml.v3 records an explicit key in its own scalar type (the int 2024)
+//     but looks merged keys up as strings ("2024"), so a merged profile of
+//     the same name replaces the explicit one, the reverse of the rule
+//     everywhere else, and this walk and the decoder would disagree about
+//     what the profile holds. Quoting the name ("2024") avoids it.
+//   - A profile whose auth is null or a scalar rather than a block. Decoded,
+//     `auth: null` leaves the pointer nil, which applyProfile reads as
+//     "inherit"; a profile that could turn auth off would drop the signed-in
+//     guard for a whole environment. The safety itself comes from that
+//     inheritance: this check only turns a removal the decoder would ignore
+//     into an error that says so.
+//
+// The walk follows aliases and merge keys at the document, profiles and
+// profile levels, and decodes keys as the decoder does (keyName). Removal is
+// reported for the lowest profile name. Text that does not parse yields nil:
+// the real decode reports that.
+func checkProfiles(text string) error {
 	var doc yaml.Node
 	if yaml.Unmarshal([]byte(text), &doc) != nil || len(doc.Content) == 0 {
-		return ""
+		return nil
+	}
+	profiles := effectivePairs(effectiveAt(doc.Content[0], "profiles"))
+	for _, p := range profiles {
+		if p.keyNode.ShortTag() != "!!str" {
+			text := p.keyNode.Value
+			if text == "" {
+				text = "null"
+			}
+			return fmt.Errorf("line %d: profile name %s must be a string; quote it", p.keyNode.Line, text)
+		}
 	}
 	var names []string
-	for _, p := range effectivePairs(effectiveAt(doc.Content[0], "profiles")) {
+	for _, p := range profiles {
 		if a := effectiveAt(p.val, "auth"); a != nil && a.Kind != yaml.MappingNode {
 			names = append(names, p.key)
 		}
 	}
 	if len(names) == 0 {
-		return ""
+		return nil
 	}
-	return slices.Min(names)
+	return fmt.Errorf("profile %q: auth: a profile can replace the auth block but not remove it; "+
+		"set auth: false on the tests that should run signed out", slices.Min(names))
 }
 
 // applyProfile merges the selected overlay onto the base config. Blocks

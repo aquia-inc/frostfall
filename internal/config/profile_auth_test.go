@@ -1,11 +1,13 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -239,32 +241,124 @@ func TestProfileMergeSequenceAuthOrder(t *testing.T) {
 // decoder rejects (Load runs this check first, so it would still give the
 // removal error, but the config could not load either way), and for the
 // cases it must leave alone because the decoder never sees a null auth.
-func TestProfileRemovingAuthWalk(t *testing.T) {
+func TestCheckProfilesWalk(t *testing.T) {
 	cases := []struct {
-		name, text, want string
+		name, text, want string // want "" means no error
 	}{
-		{"profiles alias", "x: &p\n  ci:\n    auth: null\nprofiles: *p\n", "ci"},
-		{"profile alias", "x: &c\n  auth: ~\nprofiles:\n  ci: *c\n", "ci"},
-		{"merge alias", "x: &m\n  auth: false\nprofiles:\n  ci:\n    <<: *m\n", "ci"},
-		{"alias to null", "x: &n null\nprofiles:\n  ci:\n    auth: *n\n", "ci"},
-		{"lowest name wins", "profiles:\n  zz: { auth: null }\n  <<: { ab: { auth: null } }\n", "ab"},
+		{"profiles alias", "x: &p\n  ci:\n    auth: null\nprofiles: *p\n", `profile "ci": auth:`},
+		{"profile alias", "x: &c\n  auth: ~\nprofiles:\n  ci: *c\n", `profile "ci": auth:`},
+		{"merge alias", "x: &m\n  auth: false\nprofiles:\n  ci:\n    <<: *m\n", `profile "ci": auth:`},
+		{"alias to null", "x: &n null\nprofiles:\n  ci:\n    auth: *n\n", `profile "ci": auth:`},
+		{"lowest name wins", "profiles:\n  zz: { auth: null }\n  <<: { ab: { auth: null } }\n", `profile "ab": auth:`},
 		{"explicit profiles shadow a root merge", "profiles:\n  ci: {}\n<<: { profiles: { ci: { auth: null } } }\n", ""},
 		{"explicit auth shadows a merged null", "profiles:\n  ci:\n    <<: { auth: null }\n    auth: { signedIn: x }\n", ""},
 		{"first merged auth wins", "profiles:\n  ci:\n    <<: [ { auth: { signedIn: x } }, { auth: null } ]\n", ""},
 		{"quoted << is not a merge", "profiles:\n  ci:\n    \"<<\": { auth: null }\n", ""},
+		{"alias to << is not a merge", "x: &m <<\nprofiles:\n  ci:\n    *m : { auth: null }\n", ""},
 		{"no profiles", "auth: { signedIn: x }\n", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := profileRemovingAuth(tc.text); got != tc.want {
-				t.Errorf("profileRemovingAuth = %q, want %q", got, tc.want)
+			err := checkProfiles(tc.text)
+			if tc.want == "" && err != nil {
+				t.Errorf("checkProfiles = %v, want nil", err)
+			}
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Errorf("checkProfiles = %v, want it to contain %q", err, tc.want)
 			}
 		})
 	}
 }
 
-// A mapping that merges itself cannot come from yaml.v3's parser (it reports
-// the anchor), but the walk must still end if one is built.
+// Keys are compared as the decoder decodes them, not by their text. An alias
+// key or a !!binary key that decodes to auth is auth (it was missed, so a
+// null there silently inherited); an alias key whose anchor happens to be
+// named auth is whatever key it points to (it was falsely rejected).
+func TestCheckProfilesDecodesKeys(t *testing.T) {
+	removal := `profile "ci": auth: a profile can replace the auth block but not remove it`
+	for name, profiles := range map[string]string{
+		"alias key":  "profiles:\n  other:\n    &k auth: { storageState: s.json, signedIn: \"#o\" }\n  ci:\n    *k : null\n",
+		"binary key": "profiles:\n  ci:\n    !!binary YXV0aA==: null\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfigIn(t, t.TempDir(), profileAuthBase+profiles)
+			for _, req := range []string{"ci", ProfileNone} {
+				if _, err := Load(path, req); err == nil || !strings.Contains(err.Error(), removal) {
+					t.Errorf("profile %q: err = %v, want %q", req, err, removal)
+				}
+			}
+		})
+	}
+	t.Run("alias named auth", func(t *testing.T) {
+		path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  other:\n    &auth discover: null\n  ci:\n    *auth : null\n")
+		cfg, err := Load(path, "ci")
+		if err != nil {
+			t.Fatalf("an alias key named auth that points to discover was rejected: %v", err)
+		}
+		if cfg.Auth == nil || cfg.Auth.Setup == nil {
+			t.Errorf("ci profile without auth did not inherit the base block: %+v", cfg.Auth)
+		}
+	})
+}
+
+// A profile name that is not a string is a config error: yaml.v3 handles a
+// non-string key differently under a merge, so the walk and the decoder
+// could disagree about the profile. Quoted, the same name works.
+func TestProfileNameMustBeAString(t *testing.T) {
+	for _, name := range []string{"2024", "1.5", "2024-01-01", "true", "~", "!!int 7"} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+name+":\n    defaults:\n      standard: section508\n")
+			line := strings.Count(profileAuthBase, "\n") + 2
+			want := fmt.Sprintf("line %d: profile name %s must be a string; quote it", line, strings.TrimPrefix(name, "!!int "))
+			for _, req := range []string{ProfileNone, "ci"} {
+				if _, err := Load(path, req); err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("profile %q: err = %v, want %q", req, err, want)
+				}
+			}
+		})
+	}
+	t.Run("merged", func(t *testing.T) {
+		path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  <<: { 2024: { defaults: { standard: section508 } } }\n")
+		if _, err := Load(path, ProfileNone); err == nil || !strings.Contains(err.Error(), "profile name 2024 must be a string") {
+			t.Errorf("err = %v, want the merged non-string name rejected", err)
+		}
+	})
+	t.Run("quoted", func(t *testing.T) {
+		for _, quoted := range []string{`"2024"`, `'true'`, `!!str 1.5`} {
+			path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+quoted+":\n    defaults:\n      standard: section508\n")
+			want := strings.Trim(strings.TrimPrefix(quoted, "!!str "), `"'`)
+			cfg, err := Load(path, want)
+			if err != nil {
+				t.Fatalf("%s: %v", quoted, err)
+			}
+			if cfg.Defaults.Standard != "section508" {
+				t.Errorf("%s: profile not applied: standard = %q", quoted, cfg.Defaults.Standard)
+			}
+		}
+	})
+}
+
+// A mapping that merges itself: the parser builds it and the decoder reports
+// it ("contains itself"), but the walk runs first and must end on it rather
+// than recurse until the stack overflows, at the profile level and at the
+// document root.
+func TestSelfMergeIsTheDecodersError(t *testing.T) {
+	for name, body := range map[string]string{
+		"profile": profileAuthBase + "profiles:\n  ci: &c\n    <<: *c\n",
+		"root":    "--- &root\n" + profileAuthBase + "<<: *root\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfigIn(t, t.TempDir(), body)
+			for _, req := range []string{"ci", ProfileNone} {
+				if _, err := Load(path, req); err == nil || !strings.Contains(err.Error(), "contains itself") {
+					t.Errorf("profile %q: err = %v, want the decoder's self-reference error", req, err)
+				}
+			}
+		})
+	}
+}
+
+// The same, on a node built by hand: the walk stops on a cycle.
 func TestEffectivePairsStopsOnACycle(t *testing.T) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte("a: 1\n<<: { b: 2 }\n"), &doc); err != nil {
@@ -275,6 +369,34 @@ func TestEffectivePairsStopsOnACycle(t *testing.T) {
 	got := effectivePairs(m)
 	if len(got) != 1 || got[0].key != "a" {
 		t.Errorf("effectivePairs = %+v, want just a", got)
+	}
+}
+
+// An alias diamond (&pN { <<: [*pN-1, *pN-1] }) doubles its paths at every
+// level. The walk runs before the decoder's excessive-aliasing guard, so it
+// must expand each mapping once: depth 40 would be 2^40 visits otherwise.
+func TestAliasDiamondIsLinear(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(profileAuthBase + "profiles:\n  p0: &p0 { defaults: { standard: wcag21aa } }\n")
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&b, "  p%d: &p%d { <<: [ *p%d, *p%d ] }\n", i, i, i-1, i-1)
+	}
+	path := writeConfigIn(t, t.TempDir(), b.String())
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := Load(path, ProfileNone)
+		done <- err
+	}()
+	select {
+	case <-done:
+		// The decoder may accept or refuse the aliasing; either way it
+		// returned, and quickly.
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("Load took %v on a depth-40 alias diamond", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Load did not return on a depth-40 alias diamond: the walk is exponential")
 	}
 }
 
