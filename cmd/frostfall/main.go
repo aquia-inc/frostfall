@@ -24,6 +24,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/github"
 	"github.com/aquia-inc/frostfall/internal/runner"
 	"github.com/aquia-inc/frostfall/internal/scaffold"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 	"github.com/aquia-inc/frostfall/internal/server"
 )
 
@@ -92,7 +93,10 @@ func run(args []string) int {
 	}
 	if *dryRun {
 		// A dry run only lists what the crawl finds: it has no scan to dry-run
-		// on its own, and nothing it could write.
+		// on its own, and nothing it could write. --format has a default, so
+		// whether it was passed is asked of the flag set, not read off its value.
+		set := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 		switch {
 		case !*discoverFlag:
 			fmt.Fprintln(os.Stderr, "--dry-run only applies to discovery: pass --discover --dry-run to list the pages a crawl finds")
@@ -102,6 +106,12 @@ func run(args []string) int {
 			return exitBadConfig
 		case *ghIssues || *ghIssuesDry:
 			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there are no issues to file: drop --gh-issues")
+			return exitBadConfig
+		case *validateOnly:
+			fmt.Fprintln(os.Stderr, "--dry-run lists the pages a crawl finds and does not validate the config: drop --validate")
+			return exitBadConfig
+		case set["format"] || set["output"]:
+			fmt.Fprintln(os.Stderr, "--dry-run prints a path list, not a report, so --format and --output have no effect: drop them")
 			return exitBadConfig
 		}
 	}
@@ -262,7 +272,7 @@ func run(args []string) int {
 		if w := discoverAuthWarning(cfg); w != "" {
 			fmt.Fprintln(os.Stderr, "warning:", w)
 		}
-		return runDryRun(b, authn, base, cfg, tests)
+		return runDryRun(b, authn, base, cfg)
 	}
 	r := &runner.Runner{
 		Browser:       b,
@@ -606,41 +616,55 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 // runDryRun crawls and prints what it found, one path per line on stdout,
 // sorted, and runs nothing else. The paths are what a test's path: takes, so a
 // line can be pasted into the config as it is. Diagnostics, and how many of the
-// pages no explicit test covers, go to stderr, which keeps stdout clean to diff
-// or pipe.
-func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) int {
+// pages no configured test covers, go to stderr, which keeps stdout clean to
+// diff or pipe. Coverage is judged against every test in the config, not the
+// ones --id or --path select: those narrow what a run scans, and this scans
+// nothing. A test with an absolute url: instead of a path: covers no page, as
+// in a normal discovery run.
+func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config) int {
 	paths, err := newCrawler(b, authn, base, cfg).Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "discover error:", err)
 		return exitEnvironment
 	}
-	covered := map[string]bool{}
-	for _, t := range explicit {
-		covered[t.Path] = true
-	}
-	// With auth the crawl's own logs show paths redacted, and so does this
-	// listing. Redacting can make two paths one, so the listing is deduped.
-	listed := map[string]bool{}
-	uncovered := 0
-	for _, p := range paths {
-		if !covered[p] {
-			uncovered++
-		}
-		if cfg.Auth != nil {
-			p = browser.RedactURL(p)
-		}
-		listed[p] = true
-	}
-	out := make([]string, 0, len(listed))
-	for p := range listed {
-		out = append(out, p)
-	}
-	sort.Strings(out)
+	out, uncovered := dryRunListing(paths, cfg.Auth != nil, cfg.Tests)
 	for _, p := range out {
 		fmt.Println(p)
 	}
 	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
 	return exitOK
+}
+
+// dryRunListing turns the crawl's paths into the sorted, deduped lines to
+// print, and counts how many of those lines no test in tests covers.
+//
+// With auth the crawler has already cleaned every path (query, ;params and
+// hash payloads cut, credential-looking ones dropped), and these are the
+// decoded paths it returns, so they are not parsed as URLs again: that
+// misreads a literal % as a bad escape and a leading // as a host. What is
+// kept is MaskSegments, which works on the text and never parses. The count is
+// of printed lines, after the dedupe, so it cannot exceed the number listed.
+func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered int) {
+	covered := map[string]bool{}
+	for _, t := range tests {
+		covered[t.Path] = true
+	}
+	listed := map[string]bool{}
+	for _, p := range paths {
+		if auth {
+			p = secrets.MaskSegments(p)
+		}
+		if listed[p] {
+			continue
+		}
+		listed[p] = true
+		if !covered[p] {
+			uncovered++
+		}
+		lines = append(lines, p)
+	}
+	sort.Strings(lines)
+	return lines, uncovered
 }
 
 // runInit detects the project in the working directory and writes a tailored

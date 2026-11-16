@@ -439,6 +439,12 @@ func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
 		{[]string{"--discover", "--dry-run", "--update-baseline"}, "--update-baseline"},
 		{[]string{"--discover", "--dry-run", "--gh-issues"}, "--gh-issues"},
 		{[]string{"--discover", "--dry-run", "--gh-issues-dry-run"}, "--gh-issues"},
+		// Flags a path listing cannot use are refused, not ignored. --format
+		// has a default, so passing the default value counts as passing it.
+		{[]string{"--discover", "--dry-run", "--validate"}, "--validate"},
+		{[]string{"--discover", "--dry-run", "--format", "html"}, "--format"},
+		{[]string{"--discover", "--dry-run", "--format", "text"}, "--format"},
+		{[]string{"--discover", "--dry-run", "--output", "report.html"}, "--output"},
 	}
 	for _, tc := range cases {
 		code, stdout, stderr := runBoth(t, tc.args...)
@@ -560,5 +566,130 @@ func TestDiscoverDryRunWithAuthPrintsNoCredentials(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "/plain\n") || !strings.Contains(stdout, "/reports\n") {
 		t.Errorf("stdout = %q, want /plain and the cleaned /reports", stdout)
+	}
+}
+
+// The listing is what the crawl found, deduped, and the uncovered count is of
+// those lines against every test in the config: never more than were listed,
+// and not narrowed by anything else. A test with an absolute url: has no path
+// and covers nothing.
+func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
+	tests := []config.Test{
+		{ID: "home", Path: "/"},
+		{ID: "a", Path: "/a"},
+		{ID: "abs", URL: "http://example.test/c"},
+	}
+	lines, uncovered := dryRunListing([]string{"/", "/a", "/b", "/b", "/c"}, false, tests)
+	if want := []string{"/", "/a", "/b", "/c"}; !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 2 {
+		t.Errorf("uncovered = %d, want 2 (/b and /c; the url: test covers nothing)", uncovered)
+	}
+	// Duplicates that are not covered are counted once, so the count cannot
+	// exceed the pages listed.
+	lines, uncovered = dryRunListing([]string{"/x", "/x", "/x"}, false, nil)
+	if len(lines) != 1 || uncovered != 1 {
+		t.Errorf("lines = %q, uncovered = %d, want one line and 1", lines, uncovered)
+	}
+}
+
+// With auth the paths are the crawler's decoded, cleaned ones, and printing
+// them must not parse them as URLs again: a literal % and a leading // come
+// out as they are, and nothing collapses into a placeholder line. A path that
+// is a secret by shape is still masked, so a token cannot be printed.
+func TestDryRunListingAuthKeepsDecodedPathsAndMasksTokens(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	lines, _ := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
+	want := []string{"//x", "/100%", "/50%/off", "/reset/[redacted]"}
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, token) || strings.Contains(l, "<unparsable url>") {
+			t.Errorf("listed %q", l)
+		}
+	}
+}
+
+// --id and --path narrow what a run scans, not what a dry run counts as
+// covered: the same crawl reports the same uncovered count with or without
+// them, and a test with an absolute url: still covers nothing.
+func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>`)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	yml := "version: 1\ndefaults:\n  waitFor: load\ntests:\n  - id: home\n    path: /\n  - id: a\n    path: /a\n  - id: b\n    path: /b\n  - id: abs\n    url: " + srv.URL + "/c\n"
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	base := []string{"--config", cfg, "--base-url", srv.URL, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none"}
+	for _, extra := range [][]string{nil, {"--id", "^home$"}, {"--path", "^/$"}} {
+		code, stdout, stderr := runBoth(t, append(slices.Clone(base), extra...)...)
+		if code != exitOK {
+			t.Fatalf("%v: exit code = %d (stderr: %s)", extra, code, stderr)
+		}
+		if want := "/\n/a\n/b\n/c\n"; stdout != want {
+			t.Errorf("%v: stdout = %q, want %q", extra, stdout, want)
+		}
+		if !strings.Contains(stderr, "discovered 4 page(s), 1 not covered by an explicit test") {
+			t.Errorf("%v: stderr = %q, want 4 discovered and 1 not covered", extra, stderr)
+		}
+	}
+}
+
+// Signed in, links whose decoded path holds a literal % or starts with // are
+// listed as they are (not as <unparsable url>, not with a slash lost), and a
+// token in a query or a path never reaches stdout or stderr.
+func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	const secret = "s3cr3tvalue"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marker := ""
+		if c, err := r.Cookie("sid"); err == nil && c.Value == secret {
+			marker = `<i id="in"></i>`
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`+marker)
+		if r.URL.Path == "/" {
+			for _, l := range []string{"/100%25", "/%2Fx", "/reports?token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain"} {
+				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+			}
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	state := fmt.Sprintf(`{"cookies":[{"name":"sid","value":%q,"domain":"127.0.0.1","path":"/","expires":-1}],"origins":[]}`, secret)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  timeout: 8s\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n  - id: home\n    path: /\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	code, stdout, stderr := runBoth(t, "--config", cfg, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) || strings.Contains(stdout, "0123456789abcdef") {
+		t.Errorf("a token was printed: stdout = %q, stderr = %q", stdout, stderr)
+	}
+	if want := "/\n//x\n/100%\n/plain\n/reports\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
 	}
 }

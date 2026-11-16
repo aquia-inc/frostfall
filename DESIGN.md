@@ -490,7 +490,10 @@ outlive its test.
 (`discovered:/pricing`). Two SPA realities learned from dogfooding: hash-router routes (`/#/users`)
 keep the fragment as path identity rather than collapsing into `/`, and numeric path segments
 dedupe by shape (`/items/1` and `/items/999` are one route, one representative scan). Discovered tests use `defaults` for everything. Explicit tests always win on
-path collision. Discovery is additive to the config, not a replacement — the recommended shape is a
+path collision, but only a test with a `path:` can: a test with an absolute `url:` never covers a
+discovered page, so its page can still be discovered and scanned a second time. `--dry-run` lists the crawl's
+paths without scanning and counts coverage the same way, against every test in the config
+(`--id`/`--path` do not narrow it). Discovery is additive to the config, not a replacement — the recommended shape is a
 handful of explicit stateful tests plus discovery for coverage breadth. (Next.js routes-manifest
 parsing is future work, §10.)
 

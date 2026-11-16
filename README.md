@@ -862,8 +862,14 @@ screenshot, baseline check or issue sync. It prints one discovered path per
 line on stdout, sorted, and nothing else there; the crawl's log lines and a
 summary (`discovered N page(s), M not covered by an explicit test`) go to
 stderr. Exit 0 on success, 2 for a config error (including `--dry-run` without
-`--discover`, or with `--update-baseline` or `--gh-issues`), 3 when the server
-or login is unreachable. No baseline file is read.
+`--discover`, or with `--update-baseline`, `--gh-issues`, `--validate`, `--format`
+or `--output`, none of which a path listing can use), 3 when the server or login
+is unreachable. No baseline file is read.
+
+The "not covered" count is against every test in the config, whatever `--id` or
+`--path` select. Only a test with a `path:` covers a page: a test that uses an
+absolute `url:` instead never counts as covering a discovered one, the same as in
+a normal `--discover` run.
 
 The lines are `path:` values, as a discovered test uses them, so promoting a
 page into an explicit test is a paste:
@@ -875,7 +881,10 @@ tests:
 ```
 
 To flag routes your config does not list, diff the listing against the paths
-in the config in CI:
+in the config in CI. This needs [mikefarah/yq](https://github.com/mikefarah/yq)
+(v4 syntax; the Python `yq` wrapper uses a different one), and tests that use an
+absolute `url:` instead of `path:` are not compared, so a page one of them loads
+shows up as found by the crawl:
 
 ```bash
 frostfall --discover --dry-run 2>/dev/null | sort > discovered.txt
@@ -883,8 +892,8 @@ yq '.tests[].path | select(. != null)' .frostfall.yml | sort > listed.txt
 comm -23 discovered.txt listed.txt   # found by the crawl, not in the config
 ```
 
-With `auth` configured the listing goes through the same redaction as the rest
-of discovery's output, so it carries no query, `;param` or token.
+With `auth` configured the listing is discovery's own cleaned output, so it
+carries no query, `;param` or token, and a credential-looking path is left out.
 
 ## Screenshots
 
