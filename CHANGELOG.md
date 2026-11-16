@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.9.0](https://github.com/aquia-inc/frostfall/compare/v1.8.0...v1.9.0) (2026-11-16)
+
+### Features
+
+* **format:** add json and junit report formats ([#70](https://github.com/aquia-inc/frostfall/issues/70)) ([58b8794](https://github.com/aquia-inc/frostfall/commit/58b8794c402460a58dd4f58b439e5f5096070a53)), closes [#15](https://github.com/aquia-inc/frostfall/issues/15) [#15](https://github.com/aquia-inc/frostfall/issues/15) [#login](https://github.com/aquia-inc/frostfall/issues/login)
+
 ## [1.8.0](https://github.com/aquia-inc/frostfall/compare/v1.7.0...v1.8.0) (2026-11-16)
 
 ### Features
