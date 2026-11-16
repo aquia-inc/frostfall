@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
@@ -70,6 +71,7 @@ func run(args []string) int {
 	outputPath := fs.String("output", "", "write the formatted report here (default for html: frostfall-report.html)")
 	fs.Bool("watch", false, "rescan on change, print only new violations")
 	discoverFlag := fs.Bool("discover", false, "crawl same-origin paths from the root and scan discovered pages")
+	dryRun := fs.Bool("dry-run", false, "with --discover: print the discovered paths, one per line, and scan nothing")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -87,6 +89,21 @@ func run(args []string) int {
 	if fs.Lookup("watch").Value.String() == "true" {
 		fmt.Fprintln(os.Stderr, "--watch is not implemented yet")
 		return exitBadConfig
+	}
+	if *dryRun {
+		// A dry run only lists what the crawl finds: it has no scan to dry-run
+		// on its own, and nothing it could write.
+		switch {
+		case !*discoverFlag:
+			fmt.Fprintln(os.Stderr, "--dry-run only applies to discovery: pass --discover --dry-run to list the pages a crawl finds")
+			return exitBadConfig
+		case *updateBaseline:
+			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there is no baseline to update: drop --update-baseline")
+			return exitBadConfig
+		case *ghIssues || *ghIssuesDry:
+			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there are no issues to file: drop --gh-issues")
+			return exitBadConfig
+		}
 	}
 	if *updateBaseline && (*idFilter != "" || *pathFilter != "") {
 		fmt.Fprintln(os.Stderr, "--update-baseline cannot be combined with --id/--path: a filtered update would drop baseline entries for the excluded tests")
@@ -178,7 +195,8 @@ func run(args []string) int {
 		bp = ""
 	}
 	var bl *baseline.File
-	if bp != "" {
+	// A dry run scans nothing, so a baseline file, however broken, is not read.
+	if bp != "" && !*dryRun {
 		if bl, err = baseline.Load(bp); err != nil {
 			fmt.Fprintln(os.Stderr, "baseline error:", err)
 			return exitBadConfig
@@ -239,6 +257,12 @@ func run(args []string) int {
 	} else if authn, err = browser.NewAuth(b, cfg, base, authOpts); err != nil {
 		fmt.Fprintln(os.Stderr, "auth error:", err)
 		return exitEnvironment
+	}
+	if *dryRun {
+		if w := discoverAuthWarning(cfg); w != "" {
+			fmt.Fprintln(os.Stderr, "warning:", w)
+		}
+		return runDryRun(b, authn, base, cfg, tests)
 	}
 	r := &runner.Runner{
 		Browser:       b,
@@ -541,15 +565,14 @@ func discoverAuthWarning(cfg *config.Config) string {
 		"and each discovered test logs in again when it runs", max)
 }
 
-// discoverTests crawls from the root and synthesizes fresh-load tests for
-// pages no explicit test covers. Explicit tests always win on a path
-// collision — discovery adds breadth, never overrides depth.
-func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+// newCrawler builds the crawler a --discover run uses, so a dry run crawls
+// by exactly the same rules.
+func newCrawler(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config) *discover.Crawler {
 	opts := config.Discover{MaxDepth: 3, MaxPages: 100}
 	if cfg.Discover != nil {
 		opts = *cfg.Discover
 	}
-	crawler := &discover.Crawler{
+	return &discover.Crawler{
 		Browser:  b,
 		Auth:     authn,
 		BaseURL:  base,
@@ -557,7 +580,13 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 		Defaults: cfg.Defaults,
 		Log:      func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
-	paths, err := crawler.Run()
+}
+
+// discoverTests crawls from the root and synthesizes fresh-load tests for
+// pages no explicit test covers. Explicit tests always win on a path
+// collision - discovery adds breadth, never overrides depth.
+func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+	paths, err := newCrawler(b, authn, base, cfg).Run()
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +601,46 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 		}
 	}
 	return out, nil
+}
+
+// runDryRun crawls and prints what it found, one path per line on stdout,
+// sorted, and runs nothing else. The paths are what a test's path: takes, so a
+// line can be pasted into the config as it is. Diagnostics, and how many of the
+// pages no explicit test covers, go to stderr, which keeps stdout clean to diff
+// or pipe.
+func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) int {
+	paths, err := newCrawler(b, authn, base, cfg).Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "discover error:", err)
+		return exitEnvironment
+	}
+	covered := map[string]bool{}
+	for _, t := range explicit {
+		covered[t.Path] = true
+	}
+	// With auth the crawl's own logs show paths redacted, and so does this
+	// listing. Redacting can make two paths one, so the listing is deduped.
+	listed := map[string]bool{}
+	uncovered := 0
+	for _, p := range paths {
+		if !covered[p] {
+			uncovered++
+		}
+		if cfg.Auth != nil {
+			p = browser.RedactURL(p)
+		}
+		listed[p] = true
+	}
+	out := make([]string, 0, len(listed))
+	for p := range listed {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	for _, p := range out {
+		fmt.Println(p)
+	}
+	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
+	return exitOK
 }
 
 // runInit detects the project in the working directory and writes a tailored

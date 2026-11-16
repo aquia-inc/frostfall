@@ -419,6 +419,7 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--id REGEX` | - | run only tests whose id matches (Go regex) |
 | `--path REGEX` | - | run only tests whose path matches (combines with `--id`) |
 | `--discover` | off | crawl same-origin links from `/` and scan discovered pages in addition to configured tests |
+| `--dry-run` | off | with `--discover`: print the discovered paths, one per line, and scan nothing |
 | `--screenshots` | off locally, **on in GitHub Actions** | capture an element-cropped PNG of each new violation |
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
@@ -848,6 +849,42 @@ data - if a route slug changes when your database is reseeded, baseline entries
 for it go stale. Treat discovery as a scout: run it periodically, then promote
 interesting pages into explicit tests with stable ids. Gate CI on explicit
 tests against seeded, deterministic data.
+
+### Dry run: list pages without scanning
+
+```bash
+frostfall --discover --dry-run
+```
+
+Crawls exactly as `--discover` does (same `discover:` options, excludes,
+`maxPages`, and signed-in handling) but runs no axe scan, keyboard audit,
+screenshot, baseline check or issue sync. It prints one discovered path per
+line on stdout, sorted, and nothing else there; the crawl's log lines and a
+summary (`discovered N page(s), M not covered by an explicit test`) go to
+stderr. Exit 0 on success, 2 for a config error (including `--dry-run` without
+`--discover`, or with `--update-baseline` or `--gh-issues`), 3 when the server
+or login is unreachable. No baseline file is read.
+
+The lines are `path:` values, as a discovered test uses them, so promoting a
+page into an explicit test is a paste:
+
+```yaml
+tests:
+  - id: pricing
+    path: /pricing   # from the listing
+```
+
+To flag routes your config does not list, diff the listing against the paths
+in the config in CI:
+
+```bash
+frostfall --discover --dry-run 2>/dev/null | sort > discovered.txt
+yq '.tests[].path | select(. != null)' .frostfall.yml | sort > listed.txt
+comm -23 discovered.txt listed.txt   # found by the crawl, not in the config
+```
+
+With `auth` configured the listing goes through the same redaction as the rest
+of discovery's output, so it carries no query, `;param` or token.
 
 ## Screenshots
 

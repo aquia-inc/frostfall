@@ -90,6 +90,7 @@ frostfall [flags]
   --path REGEX         filter tests by path
   --watch              dev loop: rescan on change, print only newly introduced violations
   --discover           crawl same-origin from the root path, respecting discover config (§7.6)
+  --dry-run            with --discover: print the discovered paths (one per line, sorted) and scan nothing
   --browser-path PATH  use this Chrome/Chromium instead of auto-detection
   --verbose            per-step logging
   --version / --help

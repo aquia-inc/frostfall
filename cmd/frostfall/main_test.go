@@ -426,3 +426,139 @@ func TestTrailingSlashBaseURLEndToEnd(t *testing.T) {
 		t.Errorf("requests = %q, want /sub/?a=1 and /sub/x", uris)
 	}
 }
+
+// --dry-run belongs to discovery and says so when it is used alone or with a
+// flag that would write something. All of these are config errors (exit 2)
+// found before a config is read or a browser starts.
+func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--dry-run"}, "--discover --dry-run"},
+		{[]string{"--discover", "--dry-run", "--update-baseline"}, "--update-baseline"},
+		{[]string{"--discover", "--dry-run", "--gh-issues"}, "--gh-issues"},
+		{[]string{"--discover", "--dry-run", "--gh-issues-dry-run"}, "--gh-issues"},
+	}
+	for _, tc := range cases {
+		code, stdout, stderr := runBoth(t, tc.args...)
+		if code != exitBadConfig || !strings.Contains(stderr, tc.want) || stdout != "" {
+			t.Errorf("%v: exit code = %d, stdout = %q, stderr = %q, want exit %d and %q", tc.args, code, stdout, stderr, exitBadConfig, tc.want)
+		}
+	}
+}
+
+// A dry run prints the discovered paths, sorted, one per line, and nothing
+// else on stdout. It runs no scan (the page here has a violation that would
+// make a real run exit 1) and reads no baseline (the file named is not JSON).
+// The crawl follows the config's excludes, and the summary is on stderr.
+func TestDiscoverDryRunListsPaths(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		links := map[string][]string{
+			"/":      {"/zeta", "/alpha", "/admin/users", "/alpha/"},
+			"/alpha": {"/#/routes/one", "/zeta"},
+		}[r.URL.Path]
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><img src="x.png">`)
+		for _, l := range links {
+			fmt.Fprintf(w, `<a href=%q>%s</a>`, l, l)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	yml := "version: 1\ndefaults:\n  waitFor: load\ndiscover:\n  maxDepth: 2\n  maxPages: 20\n  exclude: [\"^/admin\"]\ntests:\n  - id: home\n    path: /\n"
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(dir, "baseline.json")
+	if err := os.WriteFile(broken, []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	args := []string{"--config", cfg, "--base-url", srv.URL, "--discover", "--dry-run", "--baseline", broken, "--no-screenshots"}
+	code, stdout, stderr := runBoth(t, args...)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if want := "/\n/#/routes/one\n/alpha\n/zeta\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if !strings.Contains(stderr, "discovered 4 page(s), 3 not covered by an explicit test") {
+		t.Errorf("stderr = %q, want the summary", stderr)
+	}
+	// The same crawl again lists the same thing in the same order.
+	if _, again, _ := runBoth(t, args...); again != stdout {
+		t.Errorf("second run listed %q, first listed %q", again, stdout)
+	}
+	// The exit codes are a real run's: an unreachable server is an environment
+	// error, and nothing is listed.
+	srv.Close()
+	if code, stdout, _ := runBoth(t, args...); code != exitEnvironment || stdout != "" {
+		t.Errorf("unreachable server: exit code = %d, stdout = %q, want %d and nothing", code, stdout, exitEnvironment)
+	}
+}
+
+// A bad config is exit 2 under --dry-run as it is anywhere else.
+func TestDiscoverDryRunBadConfigIsExit2(t *testing.T) {
+	code, stdout, stderr := runBoth(t, "--config", filepath.Join(t.TempDir(), "missing.yml"), "--discover", "--dry-run")
+	if code != exitBadConfig || stdout != "" || !strings.Contains(stderr, "config error") {
+		t.Errorf("exit code = %d, stdout = %q, stderr = %q, want %d", code, stdout, stderr, exitBadConfig)
+	}
+}
+
+// Signed in, the listing is what discovery's own output is: credential-looking
+// links are left out, a query or ;param never reaches it, and the session's
+// cookie value is nowhere in it. The crawl is signed in, so it sees the pages
+// behind the marker.
+func TestDiscoverDryRunWithAuthPrintsNoCredentials(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	const secret = "s3cr3tvalue"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marker := ""
+		if c, err := r.Cookie("sid"); err == nil && c.Value == secret {
+			marker = `<i id="in"></i>`
+		}
+		links := map[string][]string{
+			"/": {"/reports?token=" + secret, "/files;jsessionid=" + secret + "/x", "/cb#/home#access_token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain"},
+		}[r.URL.Path]
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`+marker)
+		for _, l := range links {
+			fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	state := fmt.Sprintf(`{"cookies":[{"name":"sid","value":%q,"domain":"127.0.0.1","path":"/","expires":-1}],"origins":[]}`, secret)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  timeout: 8s\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n  - id: home\n    path: /\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	code, stdout, stderr := runBoth(t, "--config", cfg, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) {
+		t.Errorf("the session value was printed: stdout = %q, stderr = %q", stdout, stderr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.ContainsAny(line, "?;=") || strings.Contains(line, "0123456789abcdef") {
+			t.Errorf("listed %q, which carries what the crawl removes", line)
+		}
+	}
+	if !strings.Contains(stdout, "/plain\n") || !strings.Contains(stdout, "/reports\n") {
+		t.Errorf("stdout = %q, want /plain and the cleaned /reports", stdout)
+	}
+}
