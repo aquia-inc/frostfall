@@ -61,6 +61,9 @@ type Config struct {
 	// authProfile names the profile whose auth block replaced the top-level
 	// one, so its errors can say where to look; "" when none did.
 	authProfile string
+	// unsetEmpty names the variables that were unset and took an empty
+	// ${VAR:-} default, in file order; see UnsetEmptyVars.
+	unsetEmpty []string
 }
 
 // Profile is a named overlay for environment differences (local vs CI). It
@@ -544,7 +547,7 @@ func Load(path, profile string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	interpolated, err := interpolate(string(raw))
+	interpolated, unsetEmpty, err := interpolate(string(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -562,6 +565,7 @@ func Load(path, profile string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	cfg.dir = filepath.Dir(path)
+	cfg.unsetEmpty = unsetEmpty
 	// Lint the raw text: interpolation has already replaced the ${VAR}
 	// references the lint looks for.
 	cfg.Warnings = lintSecrets(string(raw))
@@ -693,9 +697,10 @@ func (c *Config) applyProfile(profile string) error {
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}`)
 
 // interpolate expands ${VAR} and ${VAR:-default}; an unset var without a
-// default is an error.
-func interpolate(s string) (string, error) {
-	var missing []string
+// default is an error. It also returns the unset variables that fell back to
+// an empty default (${VAR:-}), each once, for UnsetEmptyVars.
+func interpolate(s string) (string, []string, error) {
+	var missing, unsetEmpty []string
 	out := envRe.ReplaceAllStringFunc(s, func(m string) string {
 		groups := envRe.FindStringSubmatch(m)
 		name, hasDefault, def := groups[1], groups[2] != "", groups[3]
@@ -703,15 +708,27 @@ func interpolate(s string) (string, error) {
 			return v
 		}
 		if hasDefault {
+			if def == "" && !slices.Contains(unsetEmpty, name) {
+				unsetEmpty = append(unsetEmpty, name)
+			}
 			return def
 		}
 		missing = append(missing, name)
 		return m
 	})
 	if len(missing) > 0 {
-		return "", fmt.Errorf("unset environment variables: %s", strings.Join(missing, ", "))
+		return "", nil, fmt.Errorf("unset environment variables: %s", strings.Join(missing, ", "))
 	}
-	return out, nil
+	return out, unsetEmpty, nil
+}
+
+// UnsetEmptyVars names the variables that were unset when the config loaded
+// and so took an empty ${VAR:-} default, in file order. That is deliberate
+// in CI, where a profile replaces the block that uses them, so it is no
+// warning; but a setup flow that then fails may well have typed empty
+// credentials, and the error can say so. Names only, never values.
+func (c *Config) UnsetEmptyVars() []string {
+	return slices.Clone(c.unsetEmpty)
 }
 
 func (c *Config) applyDefaults() {

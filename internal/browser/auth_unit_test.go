@@ -181,3 +181,13 @@ func TestSeedScriptGuardsEveryOrigin(t *testing.T) {
 		t.Errorf("want one guard per origin:\n%s", src)
 	}
 }
+
+// The hint a failed setup flow gets names the variables, never a value.
+func TestUnsetEmptyHint(t *testing.T) {
+	if got, want := unsetEmptyHint([]string{"A11Y_USER"}), "(A11Y_USER was unset and filled empty)"; got != want {
+		t.Errorf("one: %q, want %q", got, want)
+	}
+	if got, want := unsetEmptyHint([]string{"A11Y_USER", "A11Y_PASS"}), "(A11Y_USER, A11Y_PASS were unset and filled empty)"; got != want {
+		t.Errorf("two: %q, want %q", got, want)
+	}
+}

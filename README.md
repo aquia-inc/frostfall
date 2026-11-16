@@ -636,8 +636,11 @@ profiles:
 The `:-` empty defaults matter: `${VAR}` interpolation runs over the whole file
 before a profile is applied, so with plain `${A11Y_USER}` a CI job that holds
 only the state file would stop with exit 2 on variables for a setup flow it
-never runs. The cost is local: an unset variable now fills an empty value and
-shows up as a failed login rather than a config error.
+never runs. The cost is local: an unset variable now fills an empty value
+instead of failing the load. If the login flow then fails, its error ends by
+naming the variables that were unset and filled empty (names only, never
+values); a run that succeeds, or `--validate`, says nothing, since in CI they
+are unset on purpose.
 
 The selected profile's block gets every check a top-level one does, and its
 errors name the profile (`profile "ci": auth.signedIn: required`). A profile

@@ -95,6 +95,14 @@ func TestAuthFixtureExitCodes(t *testing.T) {
 // (exit 1), which a merged setup+storageState block could not (exit 2). A bad
 // profile auth block is exit 2 and names the profile. --profile is explicit
 // everywhere, so GITHUB_ACTIONS cannot change which block applies.
+//
+// The guard and redaction follow the resolved block: a ci profile whose
+// signedIn marker the page lacks is the guard's exit 3, naming the ci
+// marker; the unselected base block's values appear nowhere; and the
+// test URL's query (a stand-in for a token) is redacted from the output.
+//
+// The base setup path also carries ${FF_E2E_LOGIN_USER:-}, left unset: a
+// failed setup names it, and runs that never run the setup do not.
 func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
@@ -107,46 +115,73 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("FF_E2E_LOGIN_USER", "")
+	if err := os.Unsetenv("FF_E2E_LOGIN_USER"); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		secret     = "ff-e2e-query-secret"
+		hint       = "(FF_E2E_LOGIN_USER was unset and filled empty)"
+		baseLogin  = "/base-login-route.html"
+		baseMarker = "[data-testid=base-only-marker]"
+		ciMarker   = "[data-testid=ci-only-marker]"
+	)
 	dir := t.TempDir()
 	// Relative to the config file, as a top-level storageState is.
 	if err := os.WriteFile(filepath.Join(dir, "state.json"), state, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	write := func(name, ciAuth string) string {
+	write := func(name, baseLogin, baseMarker, ciAuth string) string {
 		cfg := filepath.Join(dir, name)
 		body := "version: 1\nserver:\n  serve: " + site + "\n" +
-			"auth:\n  setup:\n    path: /login.html\n    steps:\n      - waitFor: h1\n  loginPath: /login.html\n  signedIn: \"[data-testid=app-shell]\"\n" +
+			"auth:\n  setup:\n    path: /login.html?u=${FF_E2E_LOGIN_USER:-}\n    steps:\n      - waitFor: h1\n" +
+			"  loginPath: " + baseLogin + "\n  signedIn: \"" + baseMarker + "\"\n" +
 			"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
 			"profiles:\n  ci:\n    auth:\n" + ciAuth +
-			"tests:\n  - id: protected\n    path: /protected.html\n"
+			"tests:\n  - id: protected\n    path: /protected.html?token=" + secret + "\n"
 		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		return cfg
 	}
-	good := write("frostfall.yml", "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \"[data-testid=app-shell]\"\n")
-	bad := write("bad.yml", "      storageState: state.json\n")
+	good := write("frostfall.yml", "/login.html", "[data-testid=app-shell]", "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \"[data-testid=app-shell]\"\n")
+	bad := write("bad.yml", "/login.html", "[data-testid=app-shell]", "      storageState: state.json\n")
+	// The base block names a login route and a marker of its own; with the
+	// ci profile selected neither may show up anywhere.
+	noMarker := write("nomarker.yml", baseLogin, baseMarker, "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \""+ciMarker+"\"\n")
 
 	cases := []struct {
 		name      string
 		args      []string
 		want      int
-		stderrHas string
+		stderrHas []string
+		lacks     []string // in stdout and stderr
 	}{
-		{"base setup", []string{"--config", good, "--profile", "none"}, exitEnvironment, "auth setup: still on the login page"},
-		{"ci storageState", []string{"--config", good, "--profile", "ci"}, exitViolations, ""},
-		{"ci validate", []string{"--config", good, "--profile", "ci", "--validate"}, exitOK, ""},
-		{"bad ci block", []string{"--config", bad, "--profile", "ci", "--validate"}, exitBadConfig, `profile "ci": auth.signedIn: required`},
-		{"bad ci block, not selected", []string{"--config", bad, "--profile", "none", "--validate"}, exitOK, ""},
+		{"base setup", []string{"--config", good, "--profile", "none"}, exitEnvironment, []string{"auth setup: still on the login page", hint}, []string{secret}},
+		{"ci storageState", []string{"--config", good, "--profile", "ci"}, exitViolations, nil, []string{secret, hint}},
+		{"ci validate", []string{"--config", good, "--profile", "ci", "--validate"}, exitOK, nil, []string{hint}},
+		{"base validate", []string{"--config", good, "--profile", "none", "--validate"}, exitOK, nil, []string{hint}},
+		{"ci marker missing", []string{"--config", noMarker, "--profile", "ci"}, exitEnvironment,
+			[]string{`test "protected": landed on`, "without the signedIn selector \"" + ciMarker + "\""},
+			[]string{secret, hint, baseLogin, baseMarker}},
+		{"bad ci block", []string{"--config", bad, "--profile", "ci", "--validate"}, exitBadConfig, []string{`profile "ci": auth.signedIn: required`}, nil},
+		{"bad ci block, not selected", []string{"--config", bad, "--profile", "none", "--validate"}, exitOK, nil, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			code, stderr := runCaptured(t, append(tc.args, "--no-screenshots", "--baseline", "none")...)
+			code, stdout, stderr := runBoth(t, append(tc.args, "--no-screenshots", "--baseline", "none")...)
 			if code != tc.want {
 				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tc.want, stderr)
 			}
-			if !strings.Contains(stderr, tc.stderrHas) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr, tc.stderrHas)
+			for _, want := range tc.stderrHas {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr, want)
+				}
+			}
+			for _, lack := range tc.lacks {
+				if strings.Contains(stdout, lack) || strings.Contains(stderr, lack) {
+					t.Errorf("output contains %q:\nstdout: %s\nstderr: %s", lack, stdout, stderr)
+				}
 			}
 		})
 	}

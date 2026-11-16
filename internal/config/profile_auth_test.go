@@ -518,3 +518,32 @@ func TestProfileAuthMergeKeys(t *testing.T) {
 		})
 	}
 }
+
+// UnsetEmptyVars lists, once each and in file order, the variables that were
+// unset and took an empty ${VAR:-} default: not a set-but-empty variable, not
+// a non-empty default, not a set one. Load records them without a warning,
+// since a ci profile leaves them unset on purpose.
+func TestUnsetEmptyVars(t *testing.T) {
+	for _, k := range []string{"FF_UE_C", "FF_UE_B", "FF_UE_A", "FF_UE_NONEMPTY"} {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("FF_UE_EMPTY", "")
+	t.Setenv("FF_UE_SET", "v")
+	body := "version: 1\nserver:\n  baseUrl: http://x${FF_UE_C:-}\ntests:\n  - id: a\n    path: /\nauth:\n  signedIn: \"#in\"\n  setup:\n    path: /login\n    steps:\n" +
+		"      - fill: { \"#user\": \"${FF_UE_B:-}\" }\n" +
+		"      - fill: { \"#password\": \"${FF_UE_A:-}\" }\n" +
+		"      - fill: { \"#again\": \"${FF_UE_B:-}${FF_UE_EMPTY:-}${FF_UE_SET:-}${FF_UE_NONEMPTY:-x}\" }\n"
+	cfg, err := Load(writeConfigIn(t, t.TempDir(), body), ProfileNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.UnsetEmptyVars(), []string{"FF_UE_C", "FF_UE_B", "FF_UE_A"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("UnsetEmptyVars = %v, want %v", got, want)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none", cfg.Warnings)
+	}
+}
