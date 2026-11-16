@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.8.0](https://github.com/aquia-inc/frostfall/compare/v1.7.0...v1.8.0) (2026-11-16)
+
+### Features
+
+* **config:** let a profile replace the auth block ([#69](https://github.com/aquia-inc/frostfall/issues/69)) ([bdc9fd9](https://github.com/aquia-inc/frostfall/commit/bdc9fd976f280213037735c43d59a7035bf1aa96)), closes [#63](https://github.com/aquia-inc/frostfall/issues/63)
+
 ## [1.7.0](https://github.com/aquia-inc/frostfall/compare/v1.6.1...v1.7.0) (2026-11-16)
 
 ### Features
