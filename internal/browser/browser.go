@@ -241,6 +241,9 @@ func (s *Session) followNavigation(wait func(p *rod.Page) error) error {
 		}
 		select {
 		case <-ctx.Done():
+			if looped.Load() {
+				return fmt.Errorf("the page navigated more than %d times on its own while waiting; is it redirecting in a loop?", maxSelfNavigations)
+			}
 			return err
 		case <-time.After(50 * time.Millisecond):
 		}

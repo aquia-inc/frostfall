@@ -2,6 +2,7 @@ package keyboard_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -235,6 +236,32 @@ func TestKeyboardAudit(t *testing.T) {
 			want: map[string][]string{keyboard.RuleHidden: {"#c1"}},
 		},
 		{
+			// From review on #67: a trap undoes the blur, and the neighbour's
+			// mask covers nearly all of each tight button's region, so there is
+			// too little left to judge; a ring is there, and nothing is reported.
+			name: "trapped dialog, tight buttons, too little to judge",
+			body: `<style>#w { display: inline-flex; } button { width: 20px; height: 20px; padding: 0; border: 1px solid #888; }
+				button:focus { outline: 3px solid blue; }</style>
+				<div role="dialog" aria-modal="true" id="dlg"><div id="w"><button id="a"></button><button id="b"></button></div></div>
+				<script>
+				b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })
+				document.addEventListener('focusout', e => setTimeout(() => { if (document.activeElement === document.body) e.target.focus() }, 0))
+				a.focus()
+				</script>`,
+			want: map[string][]string{},
+		},
+		{
+			// From review on #67: the input's own mask must not swallow a small
+			// label's ring.
+			name: "small label rings, centred 1px checkbox",
+			body: `<style>label { display: inline-block; width: 10px; height: 10px; position: relative; }
+				label input { position: absolute; left: 4px; top: 4px; width: 1px; height: 1px; margin: 0; opacity: 0; }
+				label:has(input:focus) { outline: 2px solid blue; }</style>
+				<button id="ok">ok</button>
+				<label id="l"><input type="checkbox" id="c1"></label>`,
+			want: map[string][]string{},
+		},
+		{
 			name: "Tab swallowed",
 			body: `<button id="ok">ok</button><input id="eat"><button id="after">after</button>
 				<script>eat.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })</script>`,
@@ -378,25 +405,66 @@ func TestAuditReturnsFocusToPage(t *testing.T) {
 }
 
 // A suspect the confirming lap could not judge leaves only its own rule
-// unchecked: focus-hidden was fully evaluated on a page with no hidden stops.
-// A trapped dialog with one button can be judged neither way: the trap undoes
-// the blur, and Tab has no other stop to move to.
+// unchecked. A trapped dialog whose one stop is a labelled hidden radio can be
+// judged neither way: the trap undoes the blur, and Tab has no other stop to
+// move to. focus-hidden goes unchecked; focus-not-visible, with no visible
+// stop to judge, does not.
 func TestUnjudgedSuspectChecksOnlyItsRule(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}
-	res := auditResult(t, `<div role="dialog" aria-modal="true" id="dlg"><button id="a">a</button></div>
+	res := auditResult(t, `<style>.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }</style>
+		<div role="dialog" aria-modal="true" id="dlg"><label><input type="radio" id="r" class="sr-only"> only</label></div>
 		<script>
-		a.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })
+		r.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })
+		document.addEventListener('focusout', e => setTimeout(() => {
+			if (document.activeElement === document.body) e.target.focus()
+		}, 0))
+		r.focus()
+		</script>`, keyboard.Options{})
+	if !slices.Contains(res.Unchecked, keyboard.RuleHidden) {
+		t.Errorf("unchecked = %v, want focus-hidden: the lap could not judge the lone radio", res.Unchecked)
+	}
+	if slices.Contains(res.Unchecked, keyboard.RuleNotVisible) {
+		t.Errorf("unchecked = %v: no visible stop went unjudged, so focus-not-visible was checked", res.Unchecked)
+	}
+
+	// The negative case: in a trapped dialog whose ring arrives after a
+	// transition, the fallback comparison judges every stop, so nothing is
+	// reported and nothing is left unchecked.
+	late := auditResult(t, `<style>button { outline: 2px solid transparent; outline-offset: 2px; }
+		button:focus-visible { outline-color: blue; transition: outline-color 0s 200ms; }</style>
+		<div role="dialog" aria-modal="true" id="dlg"><button id="a">a</button><button id="b">b</button></div>
+		<script>
+		b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })
 		document.addEventListener('focusout', e => setTimeout(() => {
 			if (document.activeElement === document.body) e.target.focus()
 		}, 0))
 		a.focus()
 		</script>`, keyboard.Options{})
-	if !slices.Contains(res.Unchecked, keyboard.RuleNotVisible) {
-		t.Errorf("unchecked = %v, want focus-not-visible: the lap could not judge the lone button", res.Unchecked)
+	if len(late.Violations) != 0 || slices.Contains(late.Unchecked, keyboard.RuleNotVisible) {
+		t.Errorf("late ring in a trapped dialog: violations %v, unchecked %v; want neither", late.Violations, late.Unchecked)
 	}
-	if slices.Contains(res.Unchecked, keyboard.RuleHidden) {
-		t.Errorf("unchecked = %v: no hidden stop went unjudged, so focus-hidden was checked", res.Unchecked)
+}
+
+// From review on #67: a long page, where Chrome scrolls each stop out of view
+// for the next, must not send every visible stop to the confirming lap
+// (~0.9s each). On main this page audits in about 2.4s.
+func TestLongPageStaysFast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	var b strings.Builder
+	b.WriteString(`<style>a:focus { outline: 2px solid blue; }</style>`)
+	for i := range 40 {
+		fmt.Fprintf(&b, `<p style="margin:0;height:350px"><a href="#x%d">link %d</a></p>`, i, i)
+	}
+	start := time.Now()
+	res := auditResult(t, b.String(), keyboard.Options{})
+	if took := time.Since(start); took > 12*time.Second {
+		t.Errorf("audit took %v, want well under the session's 20s timeout", took)
+	}
+	if len(res.Violations) != 0 {
+		t.Errorf("violations = %v, want none: every link has a ring", res.Violations)
 	}
 }

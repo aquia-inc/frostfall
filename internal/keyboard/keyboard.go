@@ -121,9 +121,11 @@ func (a *audit) call(fn string, out any, args ...any) error {
 // captures of a stop must crop alike. Nothing outside the viewport is
 // captured, because captureBeyondViewport stretches the viewport to the
 // page, which moves position: fixed elements out of their own region.
-func region(box, view [4]float64) image.Rectangle {
-	r := image.Rect(int(math.Floor(box[0]-focusPad)), int(math.Floor(box[1]-focusPad)),
-		int(math.Ceil(box[0]+box[2]+focusPad)), int(math.Ceil(box[1]+box[3]+focusPad)))
+func region(box, view [4]float64) image.Rectangle { return padded(box, view, focusPad) }
+
+func padded(box, view [4]float64, pad float64) image.Rectangle {
+	r := image.Rect(int(math.Floor(box[0]-pad)), int(math.Floor(box[1]-pad)),
+		int(math.Ceil(box[0]+box[2]+pad)), int(math.Ceil(box[1]+box[3]+pad)))
 	return r.Intersect(viewport(view))
 }
 
@@ -186,8 +188,6 @@ const (
 	faint = 12
 )
 
-// sameOutside reports whether two captures of one region look the same
-// outside the masks (in region coordinates).
 func masked(p image.Point, masks []image.Rectangle) bool {
 	for _, m := range masks {
 		if p.In(m) {
@@ -198,7 +198,8 @@ func masked(p image.Point, masks []image.Rectangle) bool {
 }
 
 // ownMask is a labelled hidden stop's own box within its label's region (in
-// region coordinates), padded for the ring a browser draws around it. Judged
+// region coordinates), padded by ownPad for the ring a browser draws around
+// it, and no further, so a small label's own ring stays visible. Judged
 // through its label, the input's own default ring, a few pixels around a 1px
 // unclipped input, is not an indicator anyone can use, so it must not count
 // as the label showing focus. Empty for any other stop.
@@ -206,12 +207,24 @@ func ownMask(s stop, reg image.Rectangle) image.Rectangle {
 	if !s.Labelled {
 		return image.Rectangle{}
 	}
-	return region(s.Own, s.View).Sub(reg.Min)
+	return padded(s.Own, s.View, ownPad).Sub(reg.Min)
 }
 
-func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) bool {
+// ownPad covers a browser's default focus ring around a tiny input.
+const ownPad = 3
+
+// minCompared is how many pixels a "looks the same" verdict needs. When the
+// masks (a neighbour's region, a hidden input's own box) cover nearly all of
+// a stop's region, too little is left to say nothing changed. A difference is
+// evidence at any count.
+const minCompared = 40
+
+// sameOutside reports whether two captures of one region look the same
+// outside the masks (in region coordinates), and how many pixels it compared;
+// a same verdict from fewer than minCompared is no verdict.
+func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) (same bool, compared int) {
 	if a.Bounds() != b.Bounds() {
-		return false
+		return false, 0
 	}
 	changed := 0
 	for y := range a.Bounds().Dy() {
@@ -219,6 +232,7 @@ func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) bool {
 			if masked(image.Pt(x, y), masks) {
 				continue
 			}
+			compared++
 			i := a.PixOffset(x, y)
 			for c := range 3 {
 				if d := int(a.Pix[i+c]) - int(b.Pix[i+c]); d > faint || d < -faint {
@@ -227,11 +241,11 @@ func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) bool {
 				}
 			}
 			if changed > noise {
-				return false
+				return false, compared
 			}
 		}
 	}
-	return true
+	return true, compared
 }
 
 // Result is an audit's outcome.
@@ -339,14 +353,22 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 				return nil, err
 			}
 			mask := curRegion.Intersect(pendRegion).Sub(pendRegion.Min)
-			if sameOutside(pendShot, now, mask, ownMask(*pend, pendRegion)) {
+			same, n := sameOutside(pendShot, now, mask, ownMask(*pend, pendRegion))
+			switch {
+			case same && n < minCompared:
+				comparing = false
+			case same:
 				suspects[pend.ID] = *pend
 			}
 		}
-		// A pending stop the fast pass could not compare (Tab came straight back
-		// to it, or scrolled its region away) goes to the confirming lap, which
-		// blurs in place and needs neither a neighbour nor the next stop in view.
-		if pend != nil && !cur.Out && !comparing {
+		// A labelled hidden stop the fast pass could not compare (Tab came
+		// straight back to it, or scrolled its label away) goes to the
+		// confirming lap, which blurs in place: before it was judged by pixels,
+		// such a stop was always reported, and must not now go silently
+		// unjudged. A visible stop stays on the old path, which can only miss a
+		// finding: sending those too costs ~0.9s each on a long page, where
+		// Chrome scrolls nearly every stop out of view for the next.
+		if pend != nil && !cur.Out && !comparing && pend.Hidden != "" {
 			suspects[pend.ID] = *pend
 		}
 		if pend != nil && !cur.Out {
@@ -556,7 +578,12 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (u
 			return nil, err
 		}
 		judge := func(blurred *image.RGBA, mask image.Rectangle) {
-			if !sameOutside(focused, blurred, mask, own) {
+			same, n := sameOutside(focused, blurred, mask, own)
+			if same && n < minCompared {
+				skip(s)
+				return
+			}
+			if !same {
 				return
 			}
 			if s.Hidden != "" {
