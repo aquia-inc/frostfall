@@ -197,14 +197,16 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 	return s.WaitReady(waitFor, settle)
 }
 
-// waitLoad waits for the load event, following navigations the page starts
-// on its own. A script redirect mid-load (an auth guard's location.replace)
-// destroys the context rod's wait runs in, which CDP reports as an error
-// rather than as the new page loading; the wait then starts over on the new
-// page. The page's own timeout still bounds the whole wait.
-func (s *Session) waitLoad() error {
+// followNavigation runs a readiness wait (the load event, a selector),
+// starting it over when the page navigates itself mid-wait. A script redirect
+// (an auth guard's location.replace, a login form's submit) destroys the
+// context the wait runs in, which CDP reports as an error rather than as the
+// new page loading; whether the wait began before the navigation is a race
+// that slow CI runners lose. The page's own timeout still bounds the whole
+// wait, and a target that closed or crashed fails at once.
+func (s *Session) followNavigation(wait func() error) error {
 	for {
-		err := s.page.WaitLoad()
+		err := wait()
 		var cdpErr *cdp.Error
 		if err == nil || !errors.As(err, &cdpErr) || !navigatedAway(cdpErr.Message) {
 			return err
@@ -221,6 +223,8 @@ func (s *Session) waitLoad() error {
 		}
 	}
 }
+
+func (s *Session) waitLoad() error { return s.followNavigation(s.page.WaitLoad) }
 
 func navigatedAway(msg string) bool {
 	for _, m := range []string{"navigated or closed", "Execution context was destroyed", "Cannot find context"} {
@@ -247,7 +251,10 @@ func (s *Session) WaitReady(waitFor string, settle time.Duration) error {
 			return fmt.Errorf("waiting for load: %w", err)
 		}
 	default: // CSS selector
-		if _, err := s.page.Element(waitFor); err != nil {
+		if err := s.followNavigation(func() error {
+			_, err := s.page.Element(waitFor)
+			return err
+		}); err != nil {
 			return fmt.Errorf("waiting for selector %q: %w", waitFor, err)
 		}
 	}

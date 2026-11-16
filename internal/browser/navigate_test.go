@@ -1,11 +1,14 @@
 package browser
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-rod/rod/lib/cdp"
 
 	"github.com/aquia-inc/frostfall/internal/config"
 )
@@ -51,5 +54,47 @@ func TestLoadFollowsSelfRedirect(t *testing.T) {
 		if err != nil || !strings.Contains(string(raw), "/login") {
 			t.Errorf("%s: landed on %s (%v), want /login", waitFor, raw, err)
 		}
+	}
+}
+
+// The retry itself, deterministically: a selector wait is too brief to stage
+// inside the redirect race, so the navigation error is injected. A navigation
+// is waited through; any other error returns at once.
+func TestFollowNavigationRetriesOnlyNavigations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<!DOCTYPE html><html><body>ok</body></html>`))
+	}))
+	defer srv.Close()
+	b, err := Launch("")
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer b.Close()
+	s, err := b.NewSession(srv.URL, config.Viewport{Width: 800, Height: 600}, "load", 0, 20*time.Second)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer s.Close()
+
+	navigated := &cdp.Error{Code: -32000, Message: "Inspected target navigated or closed"}
+	calls := 0
+	err = s.followNavigation(func() error {
+		if calls++; calls == 1 {
+			return navigated
+		}
+		return nil
+	})
+	if err != nil || calls != 2 {
+		t.Errorf("after a navigation: err = %v after %d calls, want nil after 2", err, calls)
+	}
+
+	other := errors.New("selector never appeared")
+	calls = 0
+	err = s.followNavigation(func() error { calls++; return other })
+	if !errors.Is(err, other) || calls != 1 {
+		t.Errorf("another error: err = %v after %d calls, want it returned after 1", err, calls)
 	}
 }
