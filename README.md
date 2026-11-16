@@ -482,6 +482,7 @@ give equal files.
     "baseUrl": "http://127.0.0.1:41233",
     "standard": "wcag21aa",
     "mode": "enforcing (serious+)",
+    "enforcing": true,
     "startedAt": "2026-11-16T09:30:00Z",
     "durationMs": 3716,
     "exitStatus": 1,
@@ -524,10 +525,11 @@ give equal files.
 | `schemaVersion` | `1`. Bumped only when an existing field is renamed, removed, or changes meaning; new fields are additive, so ignore keys you do not know |
 | `run.toolVersion`, `run.axeVersion` | the frostfall build and the embedded axe-core |
 | `run.baseUrl`, `run.standard`, `run.mode`, `run.profile` | where the run pointed (redacted under auth), the conformance standard, the enforcement posture, and the profile when one applied |
+| `run.enforcing` | `true` when an `expect` block (the default or a test's) can fail the build, `false` for a report-only run. A report-only run always has `exitStatus` 0 or an environment or config error |
 | `run.startedAt`, `run.durationMs` | UTC start time (RFC 3339) and the run's length in milliseconds |
-| `run.exitStatus` | the exit code the process returns: 0, 1 (violations), or 3 (environment) |
-| `run.error` | `{ "testId", "message" }`, present only when an environment error stopped the run. Such a file has no `tests`: a run stops at the first test that cannot run, and what ran before it is not kept |
-| `run.testsRun`, `run.totals` | tests run, and violation counts: all, `new` (not baselined), `flagged` (would count against the `expect` contract), `baselined`, `stale` |
+| `run.exitStatus` | **the pass/fail signal for scripts**: the exit code the process returns. 0 passed, 1 the gate failed on violations, 2 config error, 3 environment error. Gate on this, not on `totals.flagged` |
+| `run.error` | `{ "testId", "message" }`, present only when the run stopped before it finished: an environment or config error, including one before any test ran (`testId` is then absent). Such a file has no `tests`: a run stops at the first test that cannot run, and what ran before it is not kept |
+| `run.testsRun`, `run.totals` | tests run, and violation counts: all, `new` (not baselined), `flagged` (informational, see below), `baselined`, `stale` |
 | `tests[].id` | the test id (tests have no separate name) |
 | `tests[].checks` | the checks that ran: `axe`, `keyboard`, `expectFocus` |
 | `tests[].uncheckedRules` | rules switched off, or not fully evaluated by a cut-short keyboard audit, every time their check ran. Their absence from `violations` is not a pass |
@@ -538,9 +540,15 @@ give equal files.
 | `violations[].tags` | the rule's axe tags (`wcag111`, `wcag2a`, `section508`, ...) |
 | `violations[].target`, `.summary`, `.help`, `.helpUrl` | the stable selector, what is wrong, axe's remediation text, and its docs link |
 | `violations[].fingerprint` | the identity the baseline matches on |
-| `violations[].baselined`, `.flagged` | accepted debt; and whether the violation breaks the contract (never true when baselined) |
+| `violations[].baselined`, `.flagged` | accepted debt; and the same informational serious-or-worse marker the text, HTML and SARIF reports use (never true when baselined). It is not the pass/fail signal: a report-only run, or one within `maxViolations`, has flagged violations and `exitStatus` 0 |
 | `violations[].screenshotPath` | the element screenshot, when one was captured |
-| `stale[]` | baseline entries that no longer occur: `fingerprint`, `testId`, `scanLabel`, `ruleId`, `stableTarget` |
+| `stale[]` | baseline entries that no longer occur: `fingerprint`, `testId`, `scanLabel`, `ruleId`, `stableTarget` (scrubbed like every other selector when auth is configured) |
+
+When a run fails before it scans (the config does not load, the browser will
+not start, the login fails), `json` and `junit` still write the report, over
+whatever file was there, so an older passing report never stands in for the
+failed run. The JSON then has `run.exitStatus` 2 or 3, `run.error`, and no
+`tests`. `text`, `html` and `sarif` leave their file alone in that case.
 
 ### JUnit
 
@@ -556,7 +564,7 @@ Standard JUnit XML for CI test dashboards: one `testsuite` per test, one
 <testsuites name="frostfall" tests="2" failures="1" errors="0" time="3.716">
   <testsuite name="home" tests="2" failures="1" errors="0" skipped="0" timestamp="2026-11-16T09:30:00">
     <testcase name="initial" classname="home">
-      <failure message="1 new violation(s), 1 flagged" type="accessibility">image-alt (critical, flagged)
+      <failure message="1 violation(s) counted against the gate" type="accessibility">image-alt (critical)
   target: #hero &gt; img
   summary: Ensure &lt;img&gt; elements have alternative text or a role of none or presentation
 </failure>
@@ -572,16 +580,21 @@ Standard JUnit XML for CI test dashboards: one `testsuite` per test, one
 </testsuites>
 ```
 
-- A testcase **fails** when its scan point has any violation that is not
-  baselined, whatever its impact. That is broader than the exit code, which
-  counts only violations that break the `expect` contract, so a report-only
-  run can show red in a dashboard while exiting 0. The failure body marks the
-  ones the contract counts with `flagged`.
-- **Baselined** violations never fail a testcase; they are counted in its
-  `system-out`, along with the page URL and any screen reader transcript.
+- The file contains a `<failure>` **if and only if** the run exits 1 because
+  of violations, so a dashboard is red exactly when the gate is. A testcase
+  fails for the violations the exit code counts: at or above the enforced
+  `severity` (or on an enforced rule), not baselined, under an enforcing
+  contract. `maxViolations` is a run-level threshold: while the run's counted
+  total is at or under it nothing fails, and once it is over, every testcase
+  holding a counted violation fails.
+- Everything else is information in the testcase's `system-out`: new
+  violations in a report-only run, ones below the enforced severity, ones the
+  `maxViolations` tolerance absorbs, a count of **baselined** violations, the
+  page URL, and any screen reader transcript.
 - An **environment error** (a test that cannot load, a login redirect) is an
-  `<error>` on a testcase named `run` in that test's suite. The run stops at
-  the first such test, so the file holds only the error.
+  `<error>` on a testcase named `run` in that test's suite. An error before
+  any test ran (browser, auth, config) goes in a suite named `run`. The run
+  stops at the first such test, so the file holds only the error.
 - Text is escaped by `encoding/xml`: selectors containing `<`, `&`, quotes,
   or `]]>` are safe.
 

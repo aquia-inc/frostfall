@@ -7,6 +7,7 @@ import (
 
 	"github.com/aquia-inc/frostfall/internal/baseline"
 	"github.com/aquia-inc/frostfall/internal/runner"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // JSONSchemaVersion is the version of the json format's schema. It changes
@@ -19,7 +20,12 @@ const JSONSchemaVersion = 1
 // baseline file and the SARIF property bags. Arrays are never null.
 //
 //	schemaVersion      int, JSONSchemaVersion
-//	run                run metadata and totals (jsonRun)
+//	run                run metadata and totals (jsonRun). Scripts gate on
+//	                   run.exitStatus (0 passed, 1 violations, 2 config error,
+//	                   3 environment error), the same code the process exits
+//	                   with. run.enforcing says whether the contract can fail
+//	                   the build at all; false is report-only. run.error is
+//	                   set when the run stopped before it could scan.
 //	tests[]            one per test, in run order
 //	  id               the test id (tests have no separate name)
 //	  checks[]         checks that ran: axe, keyboard, expectFocus
@@ -29,7 +35,8 @@ const JSONSchemaVersion = 1
 //	    label, pageUrl
 //	    violations[]   worst impact first, then rule, target, fingerprint
 //	    transcript[]   screen reader lines, when the point has one
-//	stale[]            baseline entries that no longer occur
+//	stale[]            baseline entries that no longer occur (targets are
+//	                   scrubbed when auth is configured)
 //
 // Everything that names a page or an element is the value the other formats
 // print: the page URL is redacted and the target scrubbed when auth is
@@ -49,6 +56,7 @@ type jsonRun struct {
 	Standard    string       `json:"standard"`
 	Profile     string       `json:"profile,omitempty"`
 	Mode        string       `json:"mode"`
+	Enforcing   bool         `json:"enforcing"`
 	StartedAt   string       `json:"startedAt"`
 	DurationMs  int64        `json:"durationMs"`
 	ExitStatus  int          `json:"exitStatus"`
@@ -58,7 +66,7 @@ type jsonRun struct {
 }
 
 type jsonFailure struct {
-	TestID  string `json:"testId"`
+	TestID  string `json:"testId,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -94,9 +102,12 @@ type jsonViolation struct {
 	HelpURL     string   `json:"helpUrl,omitempty"`
 	Fingerprint string   `json:"fingerprint"`
 	Baselined   bool     `json:"baselined"`
-	// Flagged is the enforcement predicate the exit code and the other
-	// formats use: severity floor plus enforced rules, never for a baselined
-	// violation.
+	// Flagged is the informational marker the text, html and sarif formats
+	// share: severity floor plus enforced rules, never for a baselined
+	// violation. A report-only run still marks its serious or worse
+	// violations, and a run can exit 0 with flagged violations (report-only,
+	// or within maxViolations). It is not the pass/fail signal: that is
+	// run.exitStatus.
 	Flagged        bool   `json:"flagged"`
 	ScreenshotPath string `json:"screenshotPath,omitempty"`
 }
@@ -110,7 +121,7 @@ type jsonStale struct {
 }
 
 // JSON writes the run as the structured json format. flagged is the shared
-// enforcement predicate.
+// informational marker; the pass/fail signal is meta.ExitStatus.
 func JSON(w io.Writer, run *runner.Run, meta ReportMeta, flagged func(runner.Result) bool) error {
 	rep := jsonReport{
 		SchemaVersion: JSONSchemaVersion,
@@ -121,6 +132,7 @@ func JSON(w io.Writer, run *runner.Run, meta ReportMeta, flagged func(runner.Res
 			Standard:    meta.Standard,
 			Profile:     meta.Profile,
 			Mode:        meta.Mode,
+			Enforcing:   meta.Enforcing,
 			StartedAt:   meta.Started.UTC().Format(time.RFC3339),
 			DurationMs:  meta.Duration.Milliseconds(),
 			ExitStatus:  meta.ExitStatus,
@@ -173,7 +185,7 @@ func JSON(w io.Writer, run *runner.Run, meta ReportMeta, flagged func(runner.Res
 		rep.Tests = append(rep.Tests, jt)
 	}
 	for _, s := range run.Stale {
-		rep.Stale = append(rep.Stale, staleEntry(s))
+		rep.Stale = append(rep.Stale, staleEntry(s, meta.Redact))
 	}
 	tot.Stale = len(rep.Stale)
 
@@ -182,12 +194,20 @@ func JSON(w io.Writer, run *runner.Run, meta ReportMeta, flagged func(runner.Res
 	return enc.Encode(rep)
 }
 
-func staleEntry(s baseline.Violation) jsonStale {
+// staleEntry is one baseline entry that no longer occurs. A baseline is read
+// from disk, not produced by this run's scan, so its target may predate auth
+// or have been written by hand: with auth configured it is scrubbed like the
+// selectors the scan reports.
+func staleEntry(s baseline.Violation, redact bool) jsonStale {
+	target := s.StableTarget
+	if redact {
+		target = secrets.ScrubSelector(target)
+	}
 	return jsonStale{
 		Fingerprint:  s.Fingerprint,
 		TestID:       s.TestID,
 		ScanLabel:    s.ScanLabel,
 		RuleID:       s.RuleID,
-		StableTarget: s.StableTarget,
+		StableTarget: target,
 	}
 }

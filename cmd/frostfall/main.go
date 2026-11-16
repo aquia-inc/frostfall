@@ -131,6 +131,27 @@ func run(args []string) int {
 	}
 
 	started := time.Now()
+	structured := *formatName == "json" || *formatName == "junit"
+	// What is known so far, for a failure report: config and tests are filled
+	// in as the run gets that far.
+	var (
+		cfg        *config.Config
+		tests      []config.Test
+		base       string
+		profileReq string
+	)
+	// abort stops the run before anything was scanned: it prints message the
+	// way every failure does and, for json and junit, writes a failure report
+	// over the output path. Otherwise an older report from a passing run would
+	// still sit there and read as this run's result. text, html and sarif
+	// leave their file alone, as they always have.
+	abort := func(code int, message string) int {
+		fmt.Fprintln(os.Stderr, message)
+		if structured {
+			reportFailure(*formatName, *outputPath, cfg, tests, base, profileReq, started, code, &format.RunFailure{Message: message})
+		}
+		return code
+	}
 	if *showVersion {
 		fmt.Printf("frostfall %s (axe-core %s)\n", version, axe.New().Version())
 		return exitOK
@@ -138,14 +159,13 @@ func run(args []string) int {
 
 	// No explicit --profile means auto: the "ci" profile applies when running
 	// under CI and defined; --profile none forces the base config.
-	profileReq := *profile
+	profileReq = *profile
 	if profileReq == "" && os.Getenv("GITHUB_ACTIONS") == "true" {
 		profileReq = config.ProfileAuto
 	}
 	cfg, err := loadConfig(*configPath, profileReq)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "config error:", err)
-		return exitBadConfig
+		return abort(exitBadConfig, "config error: "+err.Error())
 	}
 	for _, w := range cfg.Warnings {
 		fmt.Fprintln(os.Stderr, "warning:", w)
@@ -173,21 +193,20 @@ func run(args []string) int {
 		return exitOK
 	}
 
-	tests, err := filterTests(cfg.Tests, *idFilter, *pathFilter)
+	tests, err = filterTests(cfg.Tests, *idFilter, *pathFilter)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "config error:", err)
-		return exitBadConfig
+		return abort(exitBadConfig, "config error: "+err.Error())
 	}
 	if len(tests) == 0 && !*discoverFlag {
-		fmt.Fprintln(os.Stderr, "no tests match the given filters")
-		return exitBadConfig
+		return abort(exitBadConfig, "no tests match the given filters")
 	}
 
 	// Resolve the base URL from mode overrides or the config's server block.
-	base, cleanup, code := resolveServer(cfg, *baseURL, *serveDir)
+	resolved, cleanup, code, serverErr := resolveServer(cfg, *baseURL, *serveDir)
 	if code != exitOK {
-		return code
+		return abort(code, serverErr)
 	}
+	base = resolved
 	defer cleanup()
 	// The session reaches every host a test loads, so with auth a test must
 	// stay on the app's origin (or opt out). Known only now: --base-url and
@@ -195,8 +214,7 @@ func run(args []string) int {
 	// Only the tests this run selects: --id and --path must not be refused over
 	// tests they do not run.
 	if err := cfg.CheckTestOrigins(base, tests); err != nil {
-		fmt.Fprintln(os.Stderr, "config error:", err)
-		return exitBadConfig
+		return abort(exitBadConfig, "config error: "+err.Error())
 	}
 
 	bp := cfg.Baseline
@@ -219,8 +237,7 @@ func run(args []string) int {
 	// A dry run scans nothing, so a baseline file, however broken, is not read.
 	if bp != "" && !*dryRun {
 		if bl, err = baseline.Load(bp); err != nil {
-			fmt.Fprintln(os.Stderr, "baseline error:", err)
-			return exitBadConfig
+			return abort(exitBadConfig, "baseline error: "+err.Error())
 		}
 		if defaulted && len(bl.Violations) > 0 {
 			fmt.Fprintf(os.Stderr, "using baseline %s (default path; pass --baseline none to ignore it)\n", bp)
@@ -236,8 +253,7 @@ func run(args []string) int {
 
 	b, err := browser.Launch(*browserPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "browser error:", err)
-		return exitEnvironment
+		return abort(exitEnvironment, "browser error: "+err.Error())
 	}
 	defer b.Close()
 
@@ -276,8 +292,7 @@ func run(args []string) int {
 	if cfg.Auth != nil && !needAuth {
 		authn = browser.RedactingAuth()
 	} else if authn, err = browser.NewAuth(b, cfg, base, authOpts); err != nil {
-		fmt.Fprintln(os.Stderr, "auth error:", err)
-		return exitEnvironment
+		return abort(exitEnvironment, "auth error: "+err.Error())
 	}
 	if *dryRun {
 		if w := discoverAuthWarning(cfg); w != "" {
@@ -302,12 +317,15 @@ func run(args []string) int {
 		}
 		discovered, derr := discoverTests(b, authn, base, cfg, tests)
 		if derr != nil {
-			fmt.Fprintln(os.Stderr, "discover error:", derr)
-			return exitEnvironment
+			return abort(exitEnvironment, "discover error: "+derr.Error())
 		}
 		fmt.Fprintf(os.Stderr, "discovered %d page(s) beyond the configured tests\n", len(discovered))
 		tests = append(tests, discovered...)
 	}
+
+	// Execute may add discovered tests, so the contract is read from the final
+	// list. The abort path below and the exit code both use it.
+	exp, perTest, enforcing := expectContract(cfg, tests)
 
 	res, err := r.Execute(context.Background(), tests)
 	if err != nil {
@@ -315,18 +333,13 @@ func run(args []string) int {
 		// json and junit exist for CI to read, and an environment error is
 		// something CI must be able to read there too. The run has no results,
 		// only the error, in the same words stderr has just printed.
-		if *formatName == "json" || *formatName == "junit" {
+		if structured {
 			failure := &format.RunFailure{Message: err.Error()}
 			var terr *runner.TestError
 			if errors.As(err, &terr) {
 				failure.TestID = terr.TestID
 			}
-			meta := structuredMeta(version, eng.Version(), reportedBase(base, cfg), cfg.Defaults.Standard,
-				activeProfileName(profileReq, cfg), "report only", started, exitEnvironment)
-			meta.Failure = failure
-			if ferr := writeStructured(*formatName, *outputPath, &runner.Run{}, meta, func(runner.Result) bool { return false }); ferr != nil {
-				fmt.Fprintln(os.Stderr, "report error:", ferr)
-			}
+			reportFailure(*formatName, *outputPath, cfg, tests, base, profileReq, started, exitEnvironment, failure)
 		}
 		return exitEnvironment
 	}
@@ -345,15 +358,6 @@ func run(args []string) int {
 		return exitOK
 	}
 
-	exp := cfg.Defaults.Expect
-	perTest := map[string]config.Expect{}
-	enforcing := exp.Enforcing()
-	for _, t := range tests {
-		if t.Expect != nil {
-			perTest[t.ID] = *t.Expect
-			enforcing = enforcing || t.Expect.Enforcing()
-		}
-	}
 	// The report marks serious+ violations even when the default expect is
 	// report-only; an explicit default contract replaces that floor. Keyed on
 	// the DEFAULT expect (not per-test enforcement) so tests without an
@@ -378,6 +382,10 @@ func run(args []string) int {
 	format.Text(os.Stdout, res, flagged, label, enforcing)
 
 	// Decided before the report is written so json and junit can carry it.
+	// counted is what the gate counts: unlike flagged, it is empty under a
+	// report-only contract. junit fails a testcase only when the gate fails,
+	// so it reuses this decision instead of making its own.
+	counted := func(v runner.Result) bool { return enforcing && runner.Failing(v, exp, perTest) }
 	exitCode := exitOK
 	if enforcing {
 		limit := 0
@@ -438,6 +446,10 @@ func run(args []string) int {
 	case "json", "junit":
 		meta := structuredMeta(version, eng.Version(), reportedBase(base, cfg), cfg.Defaults.Standard,
 			activeProfileName(profileReq, cfg), modeLabel(exp, enforcing), started, exitCode)
+		meta.Enforcing = enforcing
+		meta.GateFailed = exitCode == exitViolations
+		meta.Counts = counted
+		meta.Redact = cfg.Auth != nil
 		if ferr := writeStructured(*formatName, *outputPath, res, meta, flagged); ferr != nil {
 			fmt.Fprintln(os.Stderr, "report error:", ferr)
 			return exitEnvironment
@@ -457,6 +469,47 @@ func run(args []string) int {
 	}
 
 	return exitCode
+}
+
+// expectContract reads the enforcement contract of a run: the default expect,
+// the per-test overrides, and whether anything in them can fail the build.
+func expectContract(cfg *config.Config, tests []config.Test) (exp config.Expect, perTest map[string]config.Expect, enforcing bool) {
+	exp = cfg.Defaults.Expect
+	perTest = map[string]config.Expect{}
+	enforcing = exp.Enforcing()
+	for _, t := range tests {
+		if t.Expect != nil {
+			perTest[t.ID] = *t.Expect
+			enforcing = enforcing || t.Expect.Enforcing()
+		}
+	}
+	return exp, perTest, enforcing
+}
+
+// reportFailure writes the json or junit report for a run that stopped before
+// it produced results: the exit status, the error, and whatever of the run's
+// context was known by then (cfg is nil when the config itself failed). The
+// existing file is overwritten, never deleted, so a stale passing report can
+// not outlive a failed run. A write error is reported and does not change the
+// exit code the run is already failing with.
+func reportFailure(formatName, out string, cfg *config.Config, tests []config.Test, base, profileReq string, started time.Time, code int, failure *format.RunFailure) {
+	meta := structuredMeta(version, axe.New().Version(), "", "", "", "unknown", started, code)
+	if cfg != nil {
+		if tests == nil {
+			tests = cfg.Tests
+		}
+		exp, _, enforcing := expectContract(cfg, tests)
+		meta.BaseURL = reportedBase(base, cfg)
+		meta.Standard = cfg.Defaults.Standard
+		meta.Profile = activeProfileName(profileReq, cfg)
+		meta.Mode = modeLabel(exp, enforcing)
+		meta.Enforcing = enforcing
+		meta.Redact = cfg.Auth != nil
+	}
+	meta.Failure = failure
+	if err := writeStructured(formatName, out, &runner.Run{}, meta, func(runner.Result) bool { return false }); err != nil {
+		fmt.Fprintln(os.Stderr, "report error:", err)
+	}
 }
 
 // reportFiles is the default file each report format writes to. text is not
@@ -495,7 +548,7 @@ func writeStructured(formatName, out string, res *runner.Run, meta format.Report
 		return err
 	}
 	if formatName == "junit" {
-		err = format.JUnit(f, res, meta, flagged)
+		err = format.JUnit(f, res, meta)
 	} else {
 		err = format.JSON(f, res, meta, flagged)
 	}
@@ -841,8 +894,9 @@ func runInit() int {
 	return exitOK
 }
 
-// resolveServer picks the server mode and returns the base URL plus teardown.
-func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, func(), int) {
+// resolveServer picks the server mode and returns the base URL, the teardown,
+// and on failure the exit code and the message to print for it.
+func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, func(), int, string) {
 	noop := func() {}
 	switch {
 	case baseURLFlag != "":
@@ -850,20 +904,18 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	case serveFlag != "":
 		return startStatic(serveFlag, true)
 	case cfg.Server == nil:
-		fmt.Fprintln(os.Stderr, "no server configured: set server: in config or pass --base-url / --serve")
-		return "", noop, exitBadConfig
+		return "", noop, exitBadConfig, "no server configured: set server: in config or pass --base-url / --serve"
 	case cfg.Server.BaseURL != "":
 		return probeAttach(cfg.Server.BaseURL, noop, cfg.Auth != nil)
 	case cfg.Server.Serve != "":
 		spa := cfg.Server.SPAFallback == nil || *cfg.Server.SPAFallback
 		return startStatic(cfg.Server.Serve, spa)
 	default:
-		fmt.Fprintln(os.Stderr, "server.command (spawn mode) is not implemented yet; use --base-url or --serve")
-		return "", noop, exitEnvironment
+		return "", noop, exitEnvironment, "server.command (spawn mode) is not implemented yet; use --base-url or --serve"
 	}
 }
 
-func probeAttach(url string, cleanup func(), redact bool) (string, func(), int) {
+func probeAttach(url string, cleanup func(), redact bool) (string, func(), int, string) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if resp != nil {
@@ -874,21 +926,19 @@ func probeAttach(url string, cleanup func(), redact bool) (string, func(), int) 
 		if redact {
 			shown = browser.RedactURL(url) // userinfo in the base URL is a credential
 		}
-		fmt.Fprintf(os.Stderr,
-			"cannot reach %s — is the server running? (or use --serve for a static build)\n", shown)
-		return "", cleanup, exitEnvironment
+		return "", cleanup, exitEnvironment,
+			fmt.Sprintf("cannot reach %s — is the server running? (or use --serve for a static build)", shown)
 	}
-	return url, cleanup, exitOK
+	return url, cleanup, exitOK, ""
 }
 
-func startStatic(dir string, spa bool) (string, func(), int) {
+func startStatic(dir string, spa bool) (string, func(), int, string) {
 	srv := &server.Static{Dir: dir, SPAFallback: spa}
 	url, err := srv.Start()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "serve error:", err)
-		return "", func() {}, exitEnvironment
+		return "", func() {}, exitEnvironment, "serve error: " + err.Error()
 	}
-	return url, func() { srv.Stop() }, exitOK
+	return url, func() { srv.Stop() }, exitOK, ""
 }
 
 func filterTests(tests []config.Test, idPat, pathPat string) ([]config.Test, error) {

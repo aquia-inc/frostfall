@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +24,10 @@ func structuredMeta() ReportMeta {
 		Mode:        "enforcing (serious+)",
 		Started:     time.Date(2026, 11, 16, 9, 30, 0, 0, time.UTC),
 		Duration:    2500 * time.Millisecond,
+		Enforcing:   true,
 		ExitStatus:  1,
+		GateFailed:  true,
+		Counts:      structuredFlagged,
 	}
 }
 
@@ -87,6 +91,7 @@ type jsonDoc struct {
 		BaseURL     string `json:"baseUrl"`
 		Standard    string `json:"standard"`
 		Mode        string `json:"mode"`
+		Enforcing   bool   `json:"enforcing"`
 		StartedAt   string `json:"startedAt"`
 		DurationMs  int64  `json:"durationMs"`
 		ExitStatus  int    `json:"exitStatus"`
@@ -141,7 +146,7 @@ func TestJSONRoundTrip(t *testing.T) {
 	}
 	r := doc.Run
 	if r.ToolVersion != "1.2.3" || r.AxeVersion != "4.10.3" || r.BaseURL != "http://localhost:5173" ||
-		r.Standard != "wcag21aa" || r.Mode != "enforcing (serious+)" || r.ExitStatus != 1 || r.TestsRun != 2 {
+		r.Standard != "wcag21aa" || r.Mode != "enforcing (serious+)" || !r.Enforcing || r.ExitStatus != 1 || r.TestsRun != 2 {
 		t.Errorf("run metadata wrong: %+v", r)
 	}
 	if r.StartedAt != "2026-11-16T09:30:00Z" || r.DurationMs != 2500 {
@@ -299,7 +304,7 @@ func wellFormed(t *testing.T, data []byte) {
 
 func TestJUnitStructure(t *testing.T) {
 	var buf bytes.Buffer
-	if err := JUnit(&buf, structuredRun(), structuredMeta(), structuredFlagged); err != nil {
+	if err := JUnit(&buf, structuredRun(), structuredMeta()); err != nil {
 		t.Fatal(err)
 	}
 	wellFormed(t, buf.Bytes())
@@ -326,16 +331,23 @@ func TestJUnitStructure(t *testing.T) {
 	if c.Name != "initial" || c.Classname != "home" || c.Failure == nil {
 		t.Fatalf("home/initial should fail: %+v", c)
 	}
-	if c.Failure.Message != "2 new violation(s), 1 flagged" {
+	if c.Failure.Message != "1 violation(s) counted against the gate" {
 		t.Errorf("failure message = %q", c.Failure.Message)
 	}
-	for _, want := range []string{"image-alt (critical, flagged)", "target: #hero > img", "summary: Images need alt text", "color-contrast (minor)", "target: .chip"} {
+	for _, want := range []string{"image-alt (critical)", "target: #hero > img", "summary: Images need alt text"} {
 		if !strings.Contains(c.Failure.Body, want) {
 			t.Errorf("failure body lacks %q:\n%s", want, c.Failure.Body)
 		}
 	}
-	if strings.Index(c.Failure.Body, "image-alt") > strings.Index(c.Failure.Body, "color-contrast") {
-		t.Error("failure body is not worst-first")
+	// The minor violation is under the enforced severity: information, not a
+	// failure.
+	if strings.Contains(c.Failure.Body, "color-contrast") {
+		t.Errorf("an uncounted violation is in the failure body:\n%s", c.Failure.Body)
+	}
+	for _, want := range []string{"1 new violation(s) not failing the run", "color-contrast (minor)", "target: .chip"} {
+		if !strings.Contains(c.SystemOut, want) {
+			t.Errorf("system-out lacks %q:\n%s", want, c.SystemOut)
+		}
 	}
 	modal := home.Cases[1]
 	if modal.Failure != nil || !strings.Contains(modal.SystemOut, "button, Close") {
@@ -367,7 +379,7 @@ func TestJUnitEscapesPageContent(t *testing.T) {
 		}},
 	}
 	var buf bytes.Buffer
-	if err := JUnit(&buf, run, structuredMeta(), structuredFlagged); err != nil {
+	if err := JUnit(&buf, run, structuredMeta()); err != nil {
 		t.Fatal(err)
 	}
 	wellFormed(t, buf.Bytes())
@@ -395,7 +407,7 @@ func TestJUnitEnvironmentErrorIsAnError(t *testing.T) {
 	meta.ExitStatus = 3
 	meta.Failure = &RunFailure{TestID: "home", Message: `test "home": scan "initial": browser crashed <boom>`}
 	var buf bytes.Buffer
-	if err := JUnit(&buf, &runner.Run{}, meta, func(runner.Result) bool { return false }); err != nil {
+	if err := JUnit(&buf, &runner.Run{}, meta); err != nil {
 		t.Fatal(err)
 	}
 	wellFormed(t, buf.Bytes())
@@ -435,7 +447,7 @@ func TestStructuredFormatsCarryRedactedValuesVerbatim(t *testing.T) {
 	if err := JSON(&j, run, meta, structuredFlagged); err != nil {
 		t.Fatal(err)
 	}
-	if err := JUnit(&x, run, meta, structuredFlagged); err != nil {
+	if err := JUnit(&x, run, meta); err != nil {
 		t.Fatal(err)
 	}
 	for name, out := range map[string]string{"json": j.String(), "junit": x.String()} {
@@ -444,6 +456,173 @@ func TestStructuredFormatsCarryRedactedValuesVerbatim(t *testing.T) {
 		}
 		if !strings.Contains(out, "http://localhost/account") {
 			t.Errorf("%s lost the page URL", name)
+		}
+	}
+}
+
+// gateRun has two scan points that each hold a counted (critical) violation
+// and one that holds only a moderate one, plus a baselined critical.
+func gateRun() *runner.Run {
+	viol := func(test, label, fp string, impact engine.Impact, baselined bool) runner.Result {
+		return runner.Result{
+			Violation:    engine.Violation{RuleID: "rule-" + fp, Impact: impact, Summary: "s " + fp},
+			TestID:       test,
+			ScanLabel:    label,
+			Fingerprint:  fp,
+			StableTarget: "#" + fp,
+			Baselined:    baselined,
+		}
+	}
+	return &runner.Run{
+		TestsRun: 1,
+		Tests:    []runner.TestRecord{{ID: "t", Points: []runner.ScanPoint{{Label: "a"}, {Label: "b"}, {Label: "c"}, {Label: "d"}}}},
+		Results: []runner.Result{
+			viol("t", "a", "a1", engine.Critical, false),
+			viol("t", "b", "b1", engine.Critical, false),
+			viol("t", "b", "b2", engine.Moderate, false),
+			viol("t", "c", "c1", engine.Moderate, false),
+			viol("t", "d", "d1", engine.Critical, true),
+		},
+	}
+}
+
+func junitFailures(t *testing.T, run *runner.Run, meta ReportMeta) (doc junitDoc, failedCases []string) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := JUnit(&buf, run, meta); err != nil {
+		t.Fatal(err)
+	}
+	wellFormed(t, buf.Bytes())
+	if err := xml.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range doc.Suites {
+		for _, c := range s.Cases {
+			if c.Failure != nil {
+				failedCases = append(failedCases, c.Name)
+			}
+		}
+	}
+	// The invariant: the file has a failure if and only if the run exits 1
+	// because of violations.
+	if got, want := doc.Failures > 0, meta.GateFailed && meta.ExitStatus == 1; got != want || (len(failedCases) > 0) != want {
+		t.Errorf("failures=%d (cases %v) but the gate failed = %v", doc.Failures, failedCases, want)
+	}
+	return doc, failedCases
+}
+
+// A testcase fails only for violations that count toward the gate, and only
+// when the gate fails. Everything else is information in system-out.
+func TestJUnitFailsOnlyWhenTheGateFails(t *testing.T) {
+	critical := func(r runner.Result) bool { return !r.Baselined && r.Impact >= engine.Critical }
+	cases := []struct {
+		name         string
+		meta         func(*ReportMeta)
+		moderateOnly bool     // the run has no new violation at the enforced severity
+		want         []string // testcases that fail
+	}{
+		{"report only exits 0", func(m *ReportMeta) { m.Enforcing, m.ExitStatus, m.GateFailed, m.Counts = false, 0, false, nil }, false, nil},
+		{"under maxViolations exits 0", func(m *ReportMeta) { m.ExitStatus, m.GateFailed, m.Counts = 0, false, critical }, false, nil},
+		{"only violations below the enforced severity exits 0", func(m *ReportMeta) { m.ExitStatus, m.GateFailed, m.Counts = 0, false, critical }, true, nil},
+		{"over maxViolations fails every point holding a counted violation", func(m *ReportMeta) { m.ExitStatus, m.GateFailed, m.Counts = 1, true, critical }, false, []string{"a", "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := structuredMeta()
+			tc.meta(&meta)
+			run := gateRun()
+			if tc.moderateOnly {
+				kept := run.Results[:0]
+				for _, r := range run.Results {
+					if r.Impact == engine.Moderate || r.Baselined {
+						kept = append(kept, r)
+					}
+				}
+				run.Results = kept
+			}
+			doc, failed := junitFailures(t, run, meta)
+			if !slices.Equal(failed, tc.want) {
+				t.Errorf("failing testcases = %v, want %v", failed, tc.want)
+			}
+			// Nothing is lost: a violation that does not fail its testcase is
+			// still listed in its system-out.
+			out := doc.Suites[0].Cases
+			if !strings.Contains(out[2].SystemOut, "rule-c1 (moderate)") {
+				t.Errorf("an uncounted violation is missing from system-out:\n%s", out[2].SystemOut)
+			}
+			if !strings.Contains(out[3].SystemOut, "1 baselined violation(s)") {
+				t.Errorf("baselined count missing from system-out:\n%s", out[3].SystemOut)
+			}
+			if !tc.moderateOnly && tc.want != nil && !strings.Contains(out[1].SystemOut, "rule-b2 (moderate)") {
+				t.Errorf("the moderate violation beside a counted one should be information:\n%s", out[1].SystemOut)
+			}
+		})
+	}
+}
+
+// A failure with no test id (the browser would not start) must not make a
+// suite with an empty name.
+func TestJUnitFailureWithNoTestIDUsesRun(t *testing.T) {
+	meta := structuredMeta()
+	meta.ExitStatus, meta.GateFailed = 3, false
+	meta.Failure = &RunFailure{Message: "browser error: no chrome"}
+	doc, _ := junitFailures(t, &runner.Run{}, meta)
+	if len(doc.Suites) != 1 || doc.Suites[0].Name != "run" {
+		t.Fatalf("suites = %+v", doc.Suites)
+	}
+	c := doc.Suites[0].Cases[0]
+	if c.Classname != "run" || c.Error == nil || !strings.Contains(c.Error.Message, "no chrome") || doc.Errors != 1 {
+		t.Errorf("errored testcase wrong: %+v (errors=%d)", c, doc.Errors)
+	}
+}
+
+// The stale list is read from a baseline file, not from this run's scan, so
+// with auth configured its targets are scrubbed like every other selector.
+func TestJSONStaleTargetsAreScrubbedUnderAuth(t *testing.T) {
+	run := &runner.Run{Stale: []baseline.Violation{{
+		Fingerprint: "dead", TestID: "home", ScanLabel: "initial", RuleID: "label",
+		StableTarget: `a[href="https://x.test/cb?token=SECRETTOK123"] > input[data-key='TOKENVAL']`,
+	}}}
+	for _, redact := range []bool{true, false} {
+		meta := structuredMeta()
+		meta.Redact = redact
+		var buf bytes.Buffer
+		if err := JSON(&buf, run, meta, structuredFlagged); err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Stale []struct {
+				StableTarget string `json:"stableTarget"`
+			} `json:"stale"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		leaked := strings.Contains(buf.String(), "SECRETTOK123") || strings.Contains(buf.String(), "TOKENVAL")
+		if redact {
+			if leaked || len(doc.Stale) != 1 || doc.Stale[0].StableTarget != "a[href] > input[data-key]" {
+				t.Errorf("redacted stale entry = %+v\n%s", doc.Stale, buf.String())
+			}
+		} else if !leaked {
+			t.Errorf("without auth the entry should be untouched:\n%s", buf.String())
+		}
+	}
+}
+
+func TestJSONEnforcingFlag(t *testing.T) {
+	for _, enforcing := range []bool{true, false} {
+		meta := structuredMeta()
+		meta.Enforcing = enforcing
+		var buf bytes.Buffer
+		if err := JSON(&buf, &runner.Run{}, meta, structuredFlagged); err != nil {
+			t.Fatal(err)
+		}
+		var doc jsonDoc
+		if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if doc.Run.Enforcing != enforcing || !strings.Contains(buf.String(), `"enforcing":`) {
+			t.Errorf("enforcing = %v, want %v:\n%s", doc.Run.Enforcing, enforcing, buf.String())
 		}
 	}
 }
