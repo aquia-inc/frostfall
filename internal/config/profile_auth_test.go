@@ -261,3 +261,73 @@ func TestEffectivePairsStopsOnACycle(t *testing.T) {
 		t.Errorf("effectivePairs = %+v, want just a", got)
 	}
 }
+
+// The README's "setup locally, storageState in CI" example, as written, must
+// load in CI with the login variables unset: interpolation runs over the
+// whole file before the profile applies, so the setup block the ci profile
+// replaces still has to interpolate, which the :- defaults allow. Locally,
+// with the variables set, the setup flow carries their values as before.
+func TestReadmeProfileAuthExampleLoads(t *testing.T) {
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	i := strings.Index(text, "#### Setup locally, storageState in CI")
+	if i < 0 {
+		t.Fatal("README has no setup-locally, storageState-in-CI section")
+	}
+	start := strings.Index(text[i:], "```yaml\n")
+	if start < 0 {
+		t.Fatal("the section has no yaml example")
+	}
+	end := strings.Index(text[i+start+8:], "```")
+	if end < 0 {
+		t.Fatal("the section's yaml example is not closed")
+	}
+	example := text[i+start+8 : i+start+8+end]
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".auth", "state.json"), []byte(goodState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigIn(t, dir, "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n"+example)
+
+	// Unset, not empty: interpolate tells the two apart.
+	for _, k := range []string{"A11Y_USER", "A11Y_PASS"} {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ci, err := Load(path, "ci")
+	if err != nil {
+		t.Fatalf("the README example does not load under the ci profile without the login variables: %v\n%s", err, example)
+	}
+	if a := ci.Auth; a == nil || a.Setup != nil || a.StorageState != ".auth/state.json" || a.State == nil {
+		t.Errorf("ci profile did not swap in the storageState block: %+v", a)
+	}
+
+	t.Setenv("A11Y_USER", "user@example.com")
+	t.Setenv("A11Y_PASS", "pw-from-env")
+	base, err := Load(path, ProfileNone)
+	if err != nil {
+		t.Fatalf("the README example does not load without a profile: %v\n%s", err, example)
+	}
+	a := base.Auth
+	if a == nil || a.Setup == nil || a.StorageState != "" || len(a.Setup.Steps) < 2 {
+		t.Fatalf("base config lost its setup flow: %+v", a)
+	}
+	if got := a.Setup.Steps[0].Fill; len(got) != 1 || got[0].Value != "user@example.com" {
+		t.Errorf("email fill = %+v, want the A11Y_USER value", got)
+	}
+	if got := a.Setup.Steps[1].Fill; len(got) != 1 || got[0].Value != "pw-from-env" {
+		t.Errorf("password fill = %+v, want the A11Y_PASS value", got)
+	}
+	if len(base.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none for env-referenced secrets", base.Warnings)
+	}
+}

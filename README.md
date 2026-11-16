@@ -484,9 +484,11 @@ then profile, then command-line flags.
 A profile's `auth` replaces the top-level block as a whole, the way `server`
 does; the two are never merged, so the profile restates `signedIn`, `loginPath`
 and `allowedOrigins`. A profile cannot remove auth: `auth:` with no block,
-`auth: null` or `auth: false` in any profile is a config error, so no
-environment can quietly lose the signed-in guard. Set `auth: false` on the tests
-that should run signed out instead. See
+`auth: null` or `auth: false` in any profile is a config error. The `ci` profile
+is selected automatically in GitHub Actions, so a profile that dropped auth
+would silently turn off the signed-in guard and the URL and selector
+redaction for every CI run. Set `auth: false` on the tests that should run
+signed out instead. See
 [setup locally, storageState in CI](#setup-locally-storagestate-in-ci).
 
 For values rather than structure, environment interpolation is often enough:
@@ -614,8 +616,8 @@ auth:                                # local: the login flow
   setup:
     path: /login
     steps:
-      - fill: { "#email": "${A11Y_USER}" }
-      - fill: { "#password": "${A11Y_PASS}" }
+      - fill: { "#email": "${A11Y_USER:-}" }
+      - fill: { "#password": "${A11Y_PASS:-}" }
       - click: "button[type=submit]"
       - waitFor: "[data-testid=account-menu]"
   signedIn: "[data-testid=account-menu]"
@@ -628,6 +630,12 @@ profiles:
       signedIn: "[data-testid=account-menu]"
       loginPath: /login
 ```
+
+The `:-` empty defaults matter: `${VAR}` interpolation runs over the whole file
+before a profile is applied, so with plain `${A11Y_USER}` a CI job that holds
+only the state file would stop with exit 2 on variables for a setup flow it
+never runs. The cost is local: an unset variable now fills an empty value and
+shows up as a failed login rather than a config error.
 
 The selected profile's block gets every check a top-level one does, and its
 errors name the profile (`profile "ci": auth.signedIn: required`). A profile
