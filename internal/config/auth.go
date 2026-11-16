@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -274,14 +276,31 @@ var (
 // password-looking field. It reads the text before interpolation, which is
 // the only place a literal and a ${VAR} reference differ. The findings name
 // the field, never the value. A file that does not parse yields nothing:
-// the real decode reports that.
+// the real decode reports that. Every profile's auth block is linted too,
+// selected or not: the literal is in the file either way.
 func lintSecrets(raw string) []string {
 	masked := envRe.ReplaceAllString(raw, envMarker)
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(masked), &doc); err != nil || len(doc.Content) == 0 {
 		return nil
 	}
-	steps := nodeAt(doc.Content[0], "auth", "setup", "steps")
+	root := doc.Content[0]
+	out := lintSetupSteps("", nodeAt(root, "auth", "setup", "steps"))
+	if profiles := nodeAt(root, "profiles"); profiles != nil && profiles.Kind == yaml.MappingNode {
+		byName := map[string]*yaml.Node{}
+		for i := 0; i+1 < len(profiles.Content); i += 2 {
+			byName[profiles.Content[i].Value] = profiles.Content[i+1]
+		}
+		for _, name := range slices.Sorted(maps.Keys(byName)) {
+			out = append(out, lintSetupSteps("profiles."+name+".", nodeAt(byName[name], "auth", "setup", "steps"))...)
+		}
+	}
+	return out
+}
+
+// lintSetupSteps is lintSecrets for one auth.setup.steps sequence; prefix
+// says whose auth block it is.
+func lintSetupSteps(prefix string, steps *yaml.Node) []string {
 	if steps == nil || steps.Kind != yaml.SequenceNode {
 		return nil
 	}
@@ -298,8 +317,8 @@ func lintSecrets(raw string) []string {
 				continue
 			}
 			if !strings.Contains(val.Value, envMarker) {
-				out = append(out, fmt.Sprintf("auth.setup.steps[%d].fill %q: a password field is filled with a literal value; "+
-					"write it as ${ENV_VAR} so the secret stays out of the config file", i, sel))
+				out = append(out, fmt.Sprintf("%sauth.setup.steps[%d].fill %q: a password field is filled with a literal value; "+
+					"write it as ${ENV_VAR} so the secret stays out of the config file", prefix, i, sel))
 			}
 		}
 	}

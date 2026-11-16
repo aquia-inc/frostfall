@@ -88,6 +88,70 @@ func TestAuthFixtureExitCodes(t *testing.T) {
 	}
 }
 
+// The issue #63 setup: a setup flow locally, a storageState file in CI, from
+// one config. Against the auth fixture the base setup cannot sign in (the
+// login page has no form), so it stops with exit 3, while the ci profile's
+// state file reaches the protected page and finds its planted violation
+// (exit 1), which a merged setup+storageState block could not (exit 2). A bad
+// profile auth block is exit 2 and names the profile. --profile is explicit
+// everywhere, so GITHUB_ACTIONS cannot change which block applies.
+func TestProfileSwitchesSetupToStorageState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	site, err := filepath.Abs("../../testdata/auth/site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile("../../testdata/auth/state-valid.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	// Relative to the config file, as a top-level storageState is.
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, ciAuth string) string {
+		cfg := filepath.Join(dir, name)
+		body := "version: 1\nserver:\n  serve: " + site + "\n" +
+			"auth:\n  setup:\n    path: /login.html\n    steps:\n      - waitFor: h1\n  loginPath: /login.html\n  signedIn: \"[data-testid=app-shell]\"\n" +
+			"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
+			"profiles:\n  ci:\n    auth:\n" + ciAuth +
+			"tests:\n  - id: protected\n    path: /protected.html\n"
+		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	good := write("frostfall.yml", "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \"[data-testid=app-shell]\"\n")
+	bad := write("bad.yml", "      storageState: state.json\n")
+
+	cases := []struct {
+		name      string
+		args      []string
+		want      int
+		stderrHas string
+	}{
+		{"base setup", []string{"--config", good, "--profile", "none"}, exitEnvironment, "auth setup: still on the login page"},
+		{"ci storageState", []string{"--config", good, "--profile", "ci"}, exitViolations, ""},
+		{"ci validate", []string{"--config", good, "--profile", "ci", "--validate"}, exitOK, ""},
+		{"bad ci block", []string{"--config", bad, "--profile", "ci", "--validate"}, exitBadConfig, `profile "ci": auth.signedIn: required`},
+		{"bad ci block, not selected", []string{"--config", bad, "--profile", "none", "--validate"}, exitOK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stderr := runCaptured(t, append(tc.args, "--no-screenshots", "--baseline", "none")...)
+			if code != tc.want {
+				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tc.want, stderr)
+			}
+			if !strings.Contains(stderr, tc.stderrHas) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr, tc.stderrHas)
+			}
+		})
+	}
+}
+
 // A trailing slash on --base-url must not put a double slash in every URL
 // built from it.
 func TestBaseURLTrailingSlashIsTrimmed(t *testing.T) {

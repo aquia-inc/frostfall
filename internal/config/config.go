@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +58,9 @@ type Config struct {
 	// dir is the config file's directory, which relative paths in the
 	// config (auth.storageState) resolve against.
 	dir string
+	// authProfile names the profile whose auth block replaced the top-level
+	// one, so its errors can say where to look; "" when none did.
+	authProfile string
 }
 
 // Profile is a named overlay for environment differences (local vs CI). It
@@ -68,6 +72,10 @@ type Profile struct {
 	Defaults *ProfileDefaults `yaml:"defaults"`
 	Baseline string           `yaml:"baseline"`
 	Discover *Discover        `yaml:"discover"`
+	// Auth replaces the top-level auth block wholesale when set (setup in
+	// one environment, storageState in another). It cannot remove auth;
+	// see profileRemovingAuth.
+	Auth *Auth `yaml:"auth"`
 }
 
 // ProfileDefaults mirrors Defaults with pointer fields so an overlay can
@@ -541,6 +549,13 @@ func Load(path, profile string) (*Config, error) {
 		return nil, err
 	}
 
+	// Checked for every profile, selected or not, like strict decoding, and
+	// before it, so auth: false gets this message rather than a type error.
+	if name := profileRemovingAuth(interpolated); name != "" {
+		return nil, fmt.Errorf("%s: profile %q: auth: a profile can replace the auth block but not remove it; "+
+			"set auth: false on the tests that should run signed out", path, name)
+	}
+
 	dec := yaml.NewDecoder(strings.NewReader(interpolated))
 	dec.KnownFields(true)
 	var cfg Config
@@ -561,8 +576,41 @@ func Load(path, profile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// profileRemovingAuth names the first profile, by name, whose auth: is null
+// or a scalar rather than a block. Decoded, `auth: null` would leave the
+// pointer nil and read as "inherit"; a profile that could turn auth off would
+// drop the signed-in guard for a whole environment. Text that does not parse
+// yields "": the real decode reports that.
+func profileRemovingAuth(text string) string {
+	var doc yaml.Node
+	if yaml.Unmarshal([]byte(text), &doc) != nil || len(doc.Content) == 0 {
+		return ""
+	}
+	profiles := nodeAt(doc.Content[0], "profiles")
+	if profiles == nil || profiles.Kind != yaml.MappingNode {
+		return ""
+	}
+	var names []string
+	for i := 0; i+1 < len(profiles.Content); i += 2 {
+		p, removes := profiles.Content[i+1], false
+		// An explicit key wins over a merged (<<) one, as in the decoder.
+		if a := nodeAt(p, "auth"); a != nil {
+			removes = a.Kind != yaml.MappingNode
+		} else {
+			defaultNulls(p, map[string]func(){"auth": func() { removes = true }})
+		}
+		if removes {
+			names = append(names, profiles.Content[i].Value)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return slices.Min(names)
+}
+
 // applyProfile merges the selected overlay onto the base config. Blocks
-// override as units (server, discover, rules, expect); scalar defaults
+// override as units (server, discover, auth, rules, expect); scalar defaults
 // override field-wise where the profile sets them. Precedence overall:
 // base config, then profile, then command-line flags.
 func (c *Config) applyProfile(profile string) error {
@@ -589,6 +637,12 @@ func (c *Config) applyProfile(profile string) error {
 	}
 	if p.Discover != nil {
 		c.Discover = p.Discover
+	}
+	// Wholesale, never merged: setup from the base and storageState from
+	// the profile would be both, and validate checks the result.
+	if p.Auth != nil {
+		c.Auth = p.Auth
+		c.authProfile = profile
 	}
 	if d := p.Defaults; d != nil {
 		if d.Standard != nil {
@@ -730,6 +784,9 @@ func (c *Config) validate() error {
 	}
 	if c.Auth != nil {
 		if err := c.validateAuth(); err != nil {
+			if c.authProfile != "" {
+				return fmt.Errorf("profile %q: %w", c.authProfile, err)
+			}
 			return err
 		}
 	}
