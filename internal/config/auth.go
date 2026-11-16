@@ -350,6 +350,80 @@ func nodeAt(n *yaml.Node, keys ...string) *yaml.Node {
 	return resolveAlias(n)
 }
 
+// yamlPair is one key/value of a mapping as the decoder sees it.
+type yamlPair struct {
+	key string
+	val *yaml.Node
+}
+
+// isMergeKey matches a merge key (<<) the way yaml.v3 does: a plain or
+// !!merge-tagged scalar, not a quoted "<<" string.
+func isMergeKey(k *yaml.Node) bool {
+	return k.Kind == yaml.ScalarNode && k.Value == "<<" && (k.Tag == "" || k.Tag == "!" || k.ShortTag() == "!!merge")
+}
+
+// effectivePairs returns the key/value pairs a mapping decodes to: aliases
+// followed, and merge keys (<<, given a mapping, an alias to one, or a
+// sequence of them) expanded in the decoder's order, so an explicit key
+// shadows a merged one wholesale and an earlier merged mapping shadows a
+// later one. Values are alias-resolved; nil unless n is a mapping. A
+// mapping that merges itself is expanded once; the real decode reports it.
+func effectivePairs(n *yaml.Node) []yamlPair {
+	var out []yamlPair
+	seen := map[string]bool{}
+	onPath := map[*yaml.Node]bool{}
+	var walk func(m *yaml.Node)
+	walk = func(m *yaml.Node) {
+		m = resolveAlias(m)
+		if m == nil || m.Kind != yaml.MappingNode || onPath[m] {
+			return
+		}
+		onPath[m] = true
+		defer delete(onPath, m)
+		var merge *yaml.Node
+		for i := 0; i+1 < len(m.Content); i += 2 {
+			k := m.Content[i]
+			if isMergeKey(k) {
+				merge = resolveAlias(m.Content[i+1]) // the last << wins, as in the decoder
+				continue
+			}
+			if !seen[k.Value] {
+				seen[k.Value] = true
+				out = append(out, yamlPair{k.Value, resolveAlias(m.Content[i+1])})
+			}
+		}
+		if merge != nil && merge.Kind == yaml.SequenceNode {
+			for _, item := range merge.Content {
+				walk(item)
+			}
+		} else if merge != nil {
+			walk(merge)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// effectiveAt is nodeAt over effectivePairs: it follows merge keys at every
+// level as well as aliases. nil when any key is absent.
+func effectiveAt(n *yaml.Node, keys ...string) *yaml.Node {
+	n = resolveAlias(n)
+	for _, k := range keys {
+		var next *yaml.Node
+		for _, p := range effectivePairs(n) {
+			if p.key == k {
+				next = p.val
+				break
+			}
+		}
+		if next == nil {
+			return nil
+		}
+		n = next
+	}
+	return n
+}
+
 // CheckTestOrigins rejects, for a config with auth, a test whose url: is not
 // on the base URL's origin unless it sets auth: false. The session's cookies
 // are injected into the whole browser context, so such a test would send them

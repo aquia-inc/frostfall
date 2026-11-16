@@ -358,8 +358,13 @@ downstream (the guard, redaction, `RedactingAuth`, `CheckTestOrigins`) reads onl
 `Config.Auth`. An unselected profile's auth gets strict decoding only, like its other fields, so a
 CI-only state file is not read locally. A profile cannot remove auth: a null or scalar `auth` in
 any profile is a config error, since `auth: null` decodes like an absent key and would otherwise
-be read as "inherit", and dropping auth would drop the guard for a whole environment. The
-password lint reads every profile's `auth.setup.steps` as well as the top-level ones.
+be read as "inherit". The reason for the rule is that the `ci` profile is selected automatically
+in GitHub Actions: a profile that dropped auth would silently turn off the signed-in guard and the
+URL and selector redaction for every CI run. A test that should run signed out sets `auth: false`
+on itself instead. The check walks the document, `profiles` and each profile through aliases and
+merge keys (`<<`) the way the decoder does, so a profile assembled by a merge cannot slip a null
+`auth` past it. The password lint reads every profile's `auth.setup.steps` as well as the
+top-level ones.
 
 **`signedIn` is the guard's main signal.** A URL comparison cannot tell a signed-out page from a
 signed-in one: a login can be rendered in place, an identity provider's page is on another origin, a

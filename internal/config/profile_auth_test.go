@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // profileAuthBase logs in with a setup flow; tests append a profiles block.
@@ -190,5 +192,72 @@ func TestProfileExplicitAuthWinsOverMergedNull(t *testing.T) {
 	path := writeConfigIn(t, stateDir(t), profileAuthBase+"profiles:\n  ci:\n    <<: { auth: null }\n    auth:\n      storageState: state.json\n      signedIn: \"#in\"\n")
 	if cfg, err := Load(path, "ci"); err != nil || cfg.Auth == nil || cfg.Auth.StorageState != "state.json" {
 		t.Fatalf("explicit profile auth lost to a merged null: %v", err)
+	}
+}
+
+// The removal check walks the document, profiles and each profile through
+// merge keys and aliases the way the decoder does, so a null or scalar auth
+// that arrives through << is an error like a written one, whichever profile
+// is selected. The root merge used to slip past it.
+func TestProfileRemovalFollowsMergeKeys(t *testing.T) {
+	for name, tail := range map[string]string{
+		"root merge":          "<<: { profiles: { ci: { auth: null } } }\n",
+		"root merge sequence": "<<: [ { tests: [] }, { profiles: { ci: { auth: null } } } ]\n",
+		"merged profile":      "profiles:\n  <<: { ci: { auth: null } }\n",
+		"tagged null":         "profiles:\n  ci:\n    auth: !!null\n",
+		"merge sequence":      "profiles:\n  ci:\n    <<: [ { defaults: { standard: wcag21aa } }, { auth: null } ]\n",
+		"nested merge":        "profiles:\n  ci:\n    <<: { <<: { auth: false } }\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfigIn(t, t.TempDir(), profileAuthBase+tail)
+			for _, req := range []string{"ci", ProfileNone} {
+				_, err := Load(path, req)
+				if err == nil || !strings.Contains(err.Error(), `profile "ci": auth: a profile can replace the auth block but not remove it`) {
+					t.Errorf("profile %q: err = %v", req, err)
+				}
+			}
+		})
+	}
+}
+
+// The walk itself, for shapes whose anchor needs a place the decoder would
+// reject (so Load would report the unknown key instead), and for the cases it
+// must leave alone because the decoder never sees a null auth in them.
+func TestProfileRemovingAuthWalk(t *testing.T) {
+	cases := []struct {
+		name, text, want string
+	}{
+		{"profiles alias", "x: &p\n  ci:\n    auth: null\nprofiles: *p\n", "ci"},
+		{"profile alias", "x: &c\n  auth: ~\nprofiles:\n  ci: *c\n", "ci"},
+		{"merge alias", "x: &m\n  auth: false\nprofiles:\n  ci:\n    <<: *m\n", "ci"},
+		{"alias to null", "x: &n null\nprofiles:\n  ci:\n    auth: *n\n", "ci"},
+		{"lowest name wins", "profiles:\n  zz: { auth: null }\n  <<: { ab: { auth: null } }\n", "ab"},
+		{"explicit profiles shadow a root merge", "profiles:\n  ci: {}\n<<: { profiles: { ci: { auth: null } } }\n", ""},
+		{"explicit auth shadows a merged null", "profiles:\n  ci:\n    <<: { auth: null }\n    auth: { signedIn: x }\n", ""},
+		{"first merged auth wins", "profiles:\n  ci:\n    <<: [ { auth: { signedIn: x } }, { auth: null } ]\n", ""},
+		{"quoted << is not a merge", "profiles:\n  ci:\n    \"<<\": { auth: null }\n", ""},
+		{"no profiles", "auth: { signedIn: x }\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := profileRemovingAuth(tc.text); got != tc.want {
+				t.Errorf("profileRemovingAuth = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A mapping that merges itself cannot come from yaml.v3's parser (it reports
+// the anchor), but the walk must still end if one is built.
+func TestEffectivePairsStopsOnACycle(t *testing.T) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte("a: 1\n<<: { b: 2 }\n"), &doc); err != nil {
+		t.Fatal(err)
+	}
+	m := doc.Content[0]
+	m.Content[3] = &yaml.Node{Kind: yaml.AliasNode, Alias: m}
+	got := effectivePairs(m)
+	if len(got) != 1 || got[0].key != "a" {
+		t.Errorf("effectivePairs = %+v, want just a", got)
 	}
 }

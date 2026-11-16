@@ -579,28 +579,19 @@ func Load(path, profile string) (*Config, error) {
 // profileRemovingAuth names the first profile, by name, whose auth: is null
 // or a scalar rather than a block. Decoded, `auth: null` would leave the
 // pointer nil and read as "inherit"; a profile that could turn auth off would
-// drop the signed-in guard for a whole environment. Text that does not parse
-// yields "": the real decode reports that.
+// drop the signed-in guard for a whole environment. Every level of the walk
+// (the document, profiles, each profile) follows merge keys and aliases the
+// way the decoder does, so a profile that arrives through << is checked too.
+// Text that does not parse yields "": the real decode reports that.
 func profileRemovingAuth(text string) string {
 	var doc yaml.Node
 	if yaml.Unmarshal([]byte(text), &doc) != nil || len(doc.Content) == 0 {
 		return ""
 	}
-	profiles := nodeAt(doc.Content[0], "profiles")
-	if profiles == nil || profiles.Kind != yaml.MappingNode {
-		return ""
-	}
 	var names []string
-	for i := 0; i+1 < len(profiles.Content); i += 2 {
-		p, removes := profiles.Content[i+1], false
-		// An explicit key wins over a merged (<<) one, as in the decoder.
-		if a := nodeAt(p, "auth"); a != nil {
-			removes = a.Kind != yaml.MappingNode
-		} else {
-			defaultNulls(p, map[string]func(){"auth": func() { removes = true }})
-		}
-		if removes {
-			names = append(names, profiles.Content[i].Value)
+	for _, p := range effectivePairs(effectiveAt(doc.Content[0], "profiles")) {
+		if a := effectiveAt(p.val, "auth"); a != nil && a.Kind != yaml.MappingNode {
+			names = append(names, p.key)
 		}
 	}
 	if len(names) == 0 {
