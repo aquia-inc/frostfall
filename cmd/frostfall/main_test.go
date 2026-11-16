@@ -1540,40 +1540,17 @@ func TestJSONStaleEntriesAreScrubbedUnderAuth(t *testing.T) {
 	}
 }
 
-// A render that fails midway leaves the previous file exactly as it was and
-// no temp file behind; a good render replaces it.
-func TestWriteFileAtomicKeepsThePreviousFileOnFailure(t *testing.T) {
-	dir := t.TempDir()
-	out := filepath.Join(dir, "frostfall.json")
-	if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	err := writeFileAtomic(out, func(w io.Writer) error {
-		io.WriteString(w, "partial")
-		return fmt.Errorf("disk full")
-	})
-	if err == nil {
-		t.Fatal("the failure was swallowed")
-	}
-	if b, _ := os.ReadFile(out); string(b) != "previous" {
-		t.Errorf("file after a failed write = %q, want the previous one", b)
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-		t.Errorf("temp files left behind: %v", entries)
-	}
-	if err := writeFileAtomic(out, func(w io.Writer) error { _, e := io.WriteString(w, "new"); return e }); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(out); string(b) != "new" {
-		t.Errorf("file after a good write = %q", b)
-	}
-}
-
 // writeNew is a render that writes "new".
 func writeNew(w io.Writer) error { _, err := io.WriteString(w, "new"); return err }
 
-// noTempFiles fails if dir holds anything but the named entries.
-func noTempFiles(t *testing.T, dir string, want ...string) {
+// failMidway is a render that writes part of a report and then fails.
+func failMidway(w io.Writer) error {
+	io.WriteString(w, "partial")
+	return fmt.Errorf("disk full")
+}
+
+// onlyEntries fails if dir holds anything but the named entries.
+func onlyEntries(t *testing.T, dir string, want ...string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1590,9 +1567,39 @@ func noTempFiles(t *testing.T, dir string, want ...string) {
 	}
 }
 
+// A render that fails midway leaves no partial report, whether the file
+// existed before or not, so a half-written report can never contradict the
+// exit code. A good render then writes the file as usual.
+func TestWriteReportFileLeavesNoPartialFileOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "frostfall.json")
+	if err := os.WriteFile(out, []byte("previous"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReportFile(out, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if _, err := os.Lstat(out); !os.IsNotExist(err) {
+		t.Errorf("a partial report was left over an existing file: %v", err)
+	}
+	if err := writeReportFile(out, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if _, err := os.Lstat(out); !os.IsNotExist(err) {
+		t.Errorf("a partial report was left as a new file: %v", err)
+	}
+	onlyEntries(t, dir)
+	if err := writeReportFile(out, writeNew); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "new" {
+		t.Errorf("file after a good write = %q", b)
+	}
+}
+
 // An existing report keeps its mode: a 0600 file is not made world-readable
 // by being rewritten.
-func TestWriteFileAtomicKeepsAnExistingMode(t *testing.T) {
+func TestWriteReportFileKeepsAnExistingMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix permission bits")
 	}
@@ -1604,7 +1611,7 @@ func TestWriteFileAtomicKeepsAnExistingMode(t *testing.T) {
 	if err := os.Chmod(out, 0o600); err != nil { // independent of the umask
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(out, writeNew); err != nil {
+	if err := writeReportFile(out, writeNew); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(out)
@@ -1617,13 +1624,13 @@ func TestWriteFileAtomicKeepsAnExistingMode(t *testing.T) {
 	if b, _ := os.ReadFile(out); string(b) != "new" {
 		t.Errorf("content = %q", b)
 	}
-	noTempFiles(t, dir, "frostfall.json")
+	onlyEntries(t, dir, "frostfall.json")
 }
 
-// A new report gets the mode os.Create would give it under this process's
-// umask, compared against a file os.Create makes so the test does not depend
-// on, or change, the umask.
-func TestWriteFileAtomicNewFileFollowsTheUmask(t *testing.T) {
+// A new report gets the mode os.Create gives under this process's umask,
+// compared against a file os.Create makes so the test does not depend on, or
+// change, the umask.
+func TestWriteReportFileNewFileFollowsTheUmask(t *testing.T) {
 	dir := t.TempDir()
 	ref := filepath.Join(dir, "reference")
 	f, err := os.Create(ref)
@@ -1632,7 +1639,7 @@ func TestWriteFileAtomicNewFileFollowsTheUmask(t *testing.T) {
 	}
 	f.Close()
 	out := filepath.Join(dir, "frostfall.json")
-	if err := writeFileAtomic(out, writeNew); err != nil {
+	if err := writeReportFile(out, writeNew); err != nil {
 		t.Fatal(err)
 	}
 	want, _ := os.Stat(ref)
@@ -1643,12 +1650,13 @@ func TestWriteFileAtomicNewFileFollowsTheUmask(t *testing.T) {
 	if got.Mode().Perm() != want.Mode().Perm() {
 		t.Errorf("mode = %v, want %v (what os.Create gives)", got.Mode().Perm(), want.Mode().Perm())
 	}
-	noTempFiles(t, dir, "frostfall.json", "reference")
+	onlyEntries(t, dir, "frostfall.json", "reference")
 }
 
 // --output naming a symlink writes through it: the target gets the report and
-// the link stays a link, as with the direct write.
-func TestWriteFileAtomicWritesThroughASymlink(t *testing.T) {
+// the link stays a link. A failed render empties the target rather than
+// removing the link or leaving a partial report in it.
+func TestWriteReportFileWritesThroughASymlink(t *testing.T) {
 	linkDir, targetDir := t.TempDir(), t.TempDir()
 	target := filepath.Join(targetDir, "real.json")
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
@@ -1658,22 +1666,35 @@ func TestWriteFileAtomicWritesThroughASymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if err := writeFileAtomic(link, writeNew); err != nil {
+	isLink := func() bool {
+		fi, err := os.Lstat(link)
+		return err == nil && fi.Mode()&os.ModeSymlink != 0
+	}
+	if err := writeReportFile(link, writeNew); err != nil {
 		t.Fatal(err)
 	}
-	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("the link was replaced: %v %v", fi, err)
+	if !isLink() {
+		t.Error("the link was replaced")
 	}
 	if b, _ := os.ReadFile(target); string(b) != "new" {
 		t.Errorf("target content = %q, want the report", b)
 	}
-	noTempFiles(t, linkDir, "frostfall.json")
-	noTempFiles(t, targetDir, "real.json")
+	if err := writeReportFile(link, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
+	}
+	if !isLink() {
+		t.Error("a failed write removed or replaced the link")
+	}
+	if b, err := os.ReadFile(target); err != nil || len(b) != 0 {
+		t.Errorf("target after a failed write = %q (%v), want it empty", b, err)
+	}
+	onlyEntries(t, linkDir, "frostfall.json")
+	onlyEntries(t, targetDir, "real.json")
 }
 
-// A destination that is not a regular file is written directly, as before:
-// /dev/null cannot hold a temp file beside it, and must not be replaced.
-func TestWriteFileAtomicWritesToADevice(t *testing.T) {
+// A destination that is not a regular file is written in place and never
+// removed, even when the render fails.
+func TestWriteReportFileWritesToADevice(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no /dev/null")
 	}
@@ -1681,8 +1702,11 @@ func TestWriteFileAtomicWritesToADevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(os.DevNull, writeNew); err != nil {
+	if err := writeReportFile(os.DevNull, writeNew); err != nil {
 		t.Fatalf("writing to %s: %v", os.DevNull, err)
+	}
+	if err := writeReportFile(os.DevNull, failMidway); err == nil {
+		t.Fatal("the failure was swallowed")
 	}
 	after, err := os.Stat(os.DevNull)
 	if err != nil || after.Mode() != before.Mode() || !os.SameFile(before, after) {
@@ -1690,33 +1714,29 @@ func TestWriteFileAtomicWritesToADevice(t *testing.T) {
 	}
 }
 
-// A missing output directory is reported against the path the user gave,
-// not the temp file, and leaves nothing behind.
-func TestWriteFileAtomicErrorNamesTheOutputPath(t *testing.T) {
+// Errors name the path the user gave: a missing output directory, and a
+// write that fails partway (/dev/full answers every write with ENOSPC).
+func TestWriteReportFileErrorNamesTheOutputPath(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "missing", "frostfall.json")
-	err := writeFileAtomic(out, writeNew)
+	err := writeReportFile(out, writeNew)
 	if err == nil {
 		t.Fatal("writing into a missing directory succeeded")
 	}
-	if !strings.Contains(err.Error(), out) || strings.Contains(err.Error(), ".tmp-") {
-		t.Errorf("error = %q, want it to name %s and no temp file", err, out)
+	if !strings.Contains(err.Error(), out) {
+		t.Errorf("error = %q, want it to name %s", err, out)
 	}
-	noTempFiles(t, dir)
+	onlyEntries(t, dir)
 
-	// A write that fails inside the render names out too.
-	ok := filepath.Join(dir, "frostfall.json")
-	err = writeFileAtomic(ok, func(w io.Writer) error {
-		ow, isOut := w.(outWriter)
-		if !isOut {
-			return fmt.Errorf("render got %T, want outWriter", w)
-		}
-		ow.f.Close() // the next write fails with a *PathError on the temp file
-		_, werr := w.Write([]byte("x"))
-		return werr
-	})
-	if err == nil || !strings.Contains(err.Error(), ok) || strings.Contains(err.Error(), ".tmp-") {
-		t.Errorf("render write error = %v, want it to name %s and no temp file", err, ok)
+	const full = "/dev/full"
+	if _, serr := os.Stat(full); serr != nil {
+		t.Skipf("no %s: %v", full, serr)
 	}
-	noTempFiles(t, dir)
+	err = writeReportFile(full, writeNew)
+	if err == nil || !strings.Contains(err.Error(), full) {
+		t.Errorf("write error = %v, want it to name %s", err, full)
+	}
+	if fi, serr := os.Stat(full); serr != nil || fi.Mode().IsRegular() {
+		t.Errorf("%s was replaced or removed: %v %v", full, fi, serr)
+	}
 }

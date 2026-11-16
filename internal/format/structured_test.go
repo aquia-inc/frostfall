@@ -721,8 +721,8 @@ var runErrorCases = []struct {
 		want:   "landed on app.example.com/cb instead",
 	},
 	{
-		// The cut is at the first '#', so a hash route goes too: fail-closed
-		// does not try to tell a route from a token.
+		// The cut is at the first '#' after a token's start, so a hash route
+		// goes too: fail-closed does not try to tell a route from a token.
 		name:   "fragment token",
 		msg:    "landed on https://h/#/home#access_token=f4g",
 		secret: "f4g",
@@ -752,6 +752,13 @@ var runErrorCases = []struct {
 		secret: "k=v",
 		want:   "a\tb  c\n[redacted]",
 	},
+	{
+		name:   "an id selector's leading # is not a fragment, but its value still goes",
+		msg:    "found #access_token=abc on the page",
+		secret: "abc",
+		want:   "found [redacted] on the page",
+	},
+	{name: "unchanged id selector", msg: "wait for #login timed out"},
 	{name: "unchanged browser error", msg: "browser error: chrome failed to start: exit status 1"},
 	{name: "unchanged config error", msg: "config error: tests[0].path is required"},
 	{name: "unchanged landing error", msg: `run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired`},

@@ -552,17 +552,18 @@ failed run. The JSON then has `run.exitStatus` 2 or 3, `run.error`, and no
 describe: `run.mode` is `"unknown"` and `run.enforcing` is `false`, so scripts
 should read `run.exitStatus`, not `enforcing`, to decide pass or fail. The
 message in `run.error` is the one printed on stderr, except that with auth
-configured the report's copy is redacted word by word: anything from a `?` or
-`#` on is cut, a word that still holds `=` or `@` or an unclosed bracket
+configured the report's copy is redacted word by word: anything from a `?`,
+or from a `#` that does not start the word, on is cut (so an id selector like
+`#login` is kept), a word that still holds `=` or `@` or an unclosed bracket
 becomes `[redacted]`, and selector values and URL paths are then cleaned the
-way the rest of the report is. These runs still
-print `report written to <path>` on stdout. The file is written to a temp file
-and renamed, so a write that fails leaves the previous file untouched rather
-than a partial one. The file keeps its mode (a new one gets the usual
-umask-derived mode), a symlinked `--output` is written through to its
-target, and a non-file destination such as `/dev/stdout` is written
-directly. `text`, `html` and `sarif` leave their file alone in that
-case, and so does `--validate`. The one gap: a mistake in the flags themselves
+way the rest of the report is. These runs still print `report written to
+<path>` on stdout. The report is written in place, like the other formats: the
+file keeps its mode, owner and links, a symlinked `--output` is written
+through to its target, and `/dev/stdout` works. If the write fails partway,
+no partial report is left to contradict the exit code: a regular file is
+removed (or, behind a symlink, emptied), and a device or pipe is left alone.
+In a run that fails before it scans, `text`, `html` and `sarif` leave their
+file alone, and so does `--validate`. The one gap: a mistake in the flags themselves
 (an unparsable flag, or an unknown `--format`) is rejected before the format
 is known, so no report is written and an older file stays.
 

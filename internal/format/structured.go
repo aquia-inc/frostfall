@@ -191,14 +191,15 @@ func (m ReportMeta) failureText() string {
 
 // redactRunError cleans a run error in two passes over its tokens. The first
 // fails closed without trying to recognize anything: every token is cut at its
-// first '?' or '#' (a query or fragment, which is where tokens and codes
-// travel), and a token that still holds '=' or '@' (an attribute value, a
-// key=value pair, userinfo) or whose brackets do not nest is replaced whole by
-// [redacted]. Only then are attribute values scrubbed from what looks like a
-// selector and URLs reduced to where they point. That order means the later,
-// pattern-based pass only ever sees what the first one let through, so a URL
-// or selector it fails to parse cannot carry a secret past it. Text without
-// those characters comes through unchanged.
+// first '?' or at its first '#' after the start (a query or fragment, which is
+// where tokens and codes travel; see queryCut), and a token that still holds
+// '=' or '@' (an attribute value, a key=value pair, userinfo) or whose
+// brackets do not nest is replaced whole by [redacted]. Only then are
+// attribute values scrubbed from what looks like a selector and URLs reduced
+// to where they point. That order means the later, pattern-based pass only
+// ever sees what the first one let through, so a URL or selector it fails to
+// parse cannot carry a secret past it. Text without those characters comes
+// through unchanged.
 func redactRunError(msg string) string {
 	return scrubTokens(failClosedTokens(msg))
 }
@@ -206,14 +207,30 @@ func redactRunError(msg string) string {
 // failClosedTokens is the first pass of redactRunError.
 func failClosedTokens(msg string) string {
 	return tokenRe.ReplaceAllStringFunc(msg, func(tok string) string {
-		if i := strings.IndexAny(tok, "?#"); i >= 0 {
-			tok = tok[:i]
-		}
+		tok = tok[:queryCut(tok)]
 		if strings.ContainsAny(tok, "=@") || !bracketsNest(tok) {
 			return "[redacted]"
 		}
 		return tok
 	})
+}
+
+// queryCut is where failClosedTokens cuts a token: at the first '?', or at
+// the first '#' after the token's first byte. A token that starts with '#' is
+// a CSS id selector (#login), not a fragment, so that '#' is kept; the token
+// still goes through the '=', '@' and bracket rules, so #access_token=abc is
+// redacted whole. A URL's fragment always follows something, so it is cut.
+func queryCut(tok string) int {
+	cut := len(tok)
+	if i := strings.IndexByte(tok, '?'); i >= 0 {
+		cut = i
+	}
+	if len(tok) > 1 {
+		if i := strings.IndexByte(tok[1:], '#'); i >= 0 && i+1 < cut {
+			cut = i + 1
+		}
+	}
+	return cut
 }
 
 // scrubTokens is the second pass of redactRunError: the selector scrub and URL
