@@ -220,9 +220,25 @@ func TestProfileRemovalFollowsMergeKeys(t *testing.T) {
 	}
 }
 
-// The walk itself, for shapes whose anchor needs a place the decoder would
-// reject (so Load would report the unknown key instead), and for the cases it
-// must leave alone because the decoder never sees a null auth in them.
+// A merge sequence decodes its first auth: a block first means the profile
+// sets that block (it loads), a null first means it removes auth (rejected).
+func TestProfileMergeSequenceAuthOrder(t *testing.T) {
+	dir := stateDir(t)
+	block := "{ auth: { storageState: state.json, signedIn: \"#in\" } }"
+	cfg, err := Load(writeConfigIn(t, dir, profileAuthBase+"profiles:\n  ci:\n    <<: [ "+block+", { auth: null } ]\n"), "ci")
+	if err != nil || cfg.Auth == nil || cfg.Auth.StorageState != "state.json" || cfg.Auth.Setup != nil {
+		t.Fatalf("block-first merge sequence: err = %v, auth = %+v", err, cfg)
+	}
+	_, err = Load(writeConfigIn(t, dir, profileAuthBase+"profiles:\n  ci:\n    <<: [ { auth: null }, "+block+" ]\n"), "ci")
+	if err == nil || !strings.Contains(err.Error(), `profile "ci": auth: a profile can replace the auth block but not remove it`) {
+		t.Errorf("null-first merge sequence: err = %v", err)
+	}
+}
+
+// The walk itself, for shapes whose anchor sits under a top-level key the
+// decoder rejects (Load runs this check first, so it would still give the
+// removal error, but the config could not load either way), and for the
+// cases it must leave alone because the decoder never sees a null auth.
 func TestProfileRemovingAuthWalk(t *testing.T) {
 	cases := []struct {
 		name, text, want string
