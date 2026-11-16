@@ -4,10 +4,13 @@ package browser
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/cdp"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
@@ -159,7 +162,7 @@ func (s *Session) newIdleWaiter() func() {
 // finishIdle waits for the load event, then for the already-subscribed idle
 // monitor, then settles.
 func (s *Session) finishIdle(idle func(), settle time.Duration) error {
-	if err := s.page.WaitLoad(); err != nil {
+	if err := s.waitLoad(); err != nil {
 		return fmt.Errorf("waiting for load: %w", err)
 	}
 	idle()
@@ -194,6 +197,34 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 	return s.WaitReady(waitFor, settle)
 }
 
+// waitLoad waits for the load event, following navigations the page starts
+// on its own. A script redirect mid-load (an auth guard's location.replace)
+// destroys the context rod's wait runs in, which CDP reports as an error
+// rather than as the new page loading; the wait then starts over on the new
+// page. The page's own timeout still bounds the whole wait.
+func (s *Session) waitLoad() error {
+	for {
+		err := s.page.WaitLoad()
+		var cdpErr *cdp.Error
+		if err == nil || !errors.As(err, &cdpErr) || !navigatedAway(cdpErr.Message) {
+			return err
+		}
+		if ctxErr := s.page.GetContext().Err(); ctxErr != nil {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func navigatedAway(msg string) bool {
+	for _, m := range []string{"navigated or closed", "Execution context was destroyed", "Cannot find context"} {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitReady applies the readiness strategy: networkIdle (no in-flight
 // requests for 500ms), load, or a CSS selector. When called after an action
 // (a waitFor step), the idle monitor can only observe requests still open or
@@ -206,7 +237,7 @@ func (s *Session) WaitReady(waitFor string, settle time.Duration) error {
 			return err
 		}
 	case "load":
-		if err := s.page.WaitLoad(); err != nil {
+		if err := s.waitLoad(); err != nil {
 			return fmt.Errorf("waiting for load: %w", err)
 		}
 	default: // CSS selector
