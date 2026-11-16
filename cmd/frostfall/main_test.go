@@ -8,9 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aquia-inc/frostfall/internal/config"
 )
@@ -424,5 +427,508 @@ func TestTrailingSlashBaseURLEndToEnd(t *testing.T) {
 	// Under a path prefix the slash is visible on the wire: /sub/?a=1 is not /sub?a=1.
 	if !slices.Contains(uris, "/sub/?a=1") || !slices.Contains(uris, "/sub/x") || slices.Contains(uris, "/sub?a=1") {
 		t.Errorf("requests = %q, want /sub/?a=1 and /sub/x", uris)
+	}
+}
+
+// --dry-run belongs to discovery and says so when it is used alone or with a
+// flag that would write something. All of these are config errors (exit 2)
+// found before a config is read or a browser starts.
+func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--dry-run"}, "--discover --dry-run"},
+		{[]string{"--discover", "--dry-run", "--update-baseline"}, "--update-baseline"},
+		// The flag named is the one that was passed.
+		{[]string{"--discover", "--dry-run", "--gh-issues"}, "drop --gh-issues\n"},
+		{[]string{"--discover", "--dry-run", "--gh-issues-dry-run"}, "drop --gh-issues-dry-run\n"},
+		{[]string{"--discover", "--dry-run", "--gh-issues", "--gh-issues-dry-run"}, "drop --gh-issues and --gh-issues-dry-run\n"},
+		// Flags a path listing cannot use are refused, not ignored. --format
+		// has a default, so passing the default value counts as passing it.
+		{[]string{"--discover", "--dry-run", "--validate"}, "--validate"},
+		{[]string{"--discover", "--dry-run", "--format", "html"}, "--format"},
+		{[]string{"--discover", "--dry-run", "--format", "text"}, "--format"},
+		{[]string{"--discover", "--dry-run", "--output", "report.html"}, "--output"},
+	}
+	for _, tc := range cases {
+		code, stdout, stderr := runBoth(t, tc.args...)
+		if code != exitBadConfig || !strings.Contains(stderr, tc.want) || stdout != "" {
+			t.Errorf("%v: exit code = %d, stdout = %q, stderr = %q, want exit %d and %q", tc.args, code, stdout, stderr, exitBadConfig, tc.want)
+		}
+	}
+}
+
+// A dry run prints the discovered paths, sorted, one per line, and nothing
+// else on stdout. It runs no scan (the page here has a violation that would
+// make a real run exit 1) and reads no baseline (the file named is not JSON).
+// The crawl follows the config's excludes, and the summary is on stderr.
+func TestDiscoverDryRunListsPaths(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		links := map[string][]string{
+			"/":      {"/zeta", "/alpha", "/admin/users", "/alpha/"},
+			"/alpha": {"/#/routes/one", "/zeta"},
+		}[r.URL.Path]
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><img src="x.png">`)
+		for _, l := range links {
+			fmt.Fprintf(w, `<a href=%q>%s</a>`, l, l)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	yml := "version: 1\ndefaults:\n  waitFor: load\ndiscover:\n  maxDepth: 2\n  maxPages: 20\n  exclude: [\"^/admin\"]\ntests:\n  - id: home\n    path: /\n"
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(dir, "baseline.json")
+	if err := os.WriteFile(broken, []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	args := []string{"--config", cfg, "--base-url", srv.URL, "--discover", "--dry-run", "--baseline", broken, "--no-screenshots"}
+	code, stdout, stderr := runBoth(t, args...)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if want := "/\n/#/routes/one\n/alpha\n/zeta\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if !strings.Contains(stderr, "discovered 4 page(s), 3 not covered by an explicit test") {
+		t.Errorf("stderr = %q, want the summary", stderr)
+	}
+	// The same crawl again lists the same thing in the same order.
+	if _, again, _ := runBoth(t, args...); again != stdout {
+		t.Errorf("second run listed %q, first listed %q", again, stdout)
+	}
+	// The exit codes are a real run's: an unreachable server is an environment
+	// error, and nothing is listed.
+	srv.Close()
+	if code, stdout, _ := runBoth(t, args...); code != exitEnvironment || stdout != "" {
+		t.Errorf("unreachable server: exit code = %d, stdout = %q, want %d and nothing", code, stdout, exitEnvironment)
+	}
+}
+
+// A bad config is exit 2 under --dry-run as it is anywhere else.
+func TestDiscoverDryRunBadConfigIsExit2(t *testing.T) {
+	code, stdout, stderr := runBoth(t, "--config", filepath.Join(t.TempDir(), "missing.yml"), "--discover", "--dry-run")
+	if code != exitBadConfig || stdout != "" || !strings.Contains(stderr, "config error") {
+		t.Errorf("exit code = %d, stdout = %q, stderr = %q, want %d", code, stdout, stderr, exitBadConfig)
+	}
+}
+
+// Signed in, the listing is what discovery's own output is: credential-looking
+// links are left out, a query or ;param never reaches it, and the session's
+// cookie value is nowhere in it. The crawl is signed in, so it sees the pages
+// behind the marker.
+func TestDiscoverDryRunWithAuthPrintsNoCredentials(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	const secret = "s3cr3tvalue"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marker := ""
+		if c, err := r.Cookie("sid"); err == nil && c.Value == secret {
+			marker = `<i id="in"></i>`
+		}
+		links := map[string][]string{
+			"/": {"/reports?token=" + secret, "/files;jsessionid=" + secret + "/x", "/cb#/home#access_token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain"},
+		}[r.URL.Path]
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`+marker)
+		for _, l := range links {
+			fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	state := fmt.Sprintf(`{"cookies":[{"name":"sid","value":%q,"domain":"127.0.0.1","path":"/","expires":-1}],"origins":[]}`, secret)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  timeout: 8s\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n  - id: home\n    path: /\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	code, stdout, stderr := runBoth(t, "--config", cfg, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) {
+		t.Errorf("the session value was printed: stdout = %q, stderr = %q", stdout, stderr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.ContainsAny(line, "?;=") || strings.Contains(line, "0123456789abcdef") {
+			t.Errorf("listed %q, which carries what the crawl removes", line)
+		}
+	}
+	if !strings.Contains(stdout, "/plain\n") || !strings.Contains(stdout, "/reports\n") {
+		t.Errorf("stdout = %q, want /plain and the cleaned /reports", stdout)
+	}
+}
+
+// The listing is what the crawl found, deduped, and the uncovered count is of
+// those lines against every test in the config: never more than were listed,
+// and not narrowed by anything else. A test with an absolute url: has no path
+// and covers nothing.
+func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
+	tests := []config.Test{
+		{ID: "home", Path: "/"},
+		{ID: "a", Path: "/a"},
+		{ID: "abs", URL: "http://example.test/c"},
+	}
+	lines, uncovered, _ := dryRunListing([]string{"/", "/a", "/b", "/b", "/c"}, false, tests)
+	if want := []string{"/", "/a", "/b", "/c"}; !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 2 {
+		t.Errorf("uncovered = %d, want 2 (/b and /c; the url: test covers nothing)", uncovered)
+	}
+	// Duplicates that are not covered are counted once, so the count cannot
+	// exceed the pages listed.
+	lines, uncovered, _ = dryRunListing([]string{"/x", "/x", "/x"}, false, nil)
+	if len(lines) != 1 || uncovered != 1 {
+		t.Errorf("lines = %q, uncovered = %d, want one line and 1", lines, uncovered)
+	}
+}
+
+// unprintableInputs are paths that would not print as the one line they are:
+// control characters (C0, DEL and C1), a raw 8-bit CSI byte that is not valid
+// UTF-8, bidi controls and other format characters, and the Unicode line and
+// paragraph separators.
+var unprintableInputs = []string{
+	"/alpha\n/beta", "/tab\there", "/cr\r", "/nul\x00", "/del\x7f", "/c1\u009b",
+	"/csi\x9b[2J", "/bad\xff",
+	"/rlo\u202e", "/alm\u061c", "/lri\u2066", "/zw\u200b", "/bom\ufeff",
+	"/ls\u2028x", "/ps\u2029x",
+}
+
+// A path with an unprintable character in it is skipped, not listed, not
+// counted as a page, and counted as skipped, signed in and out.
+func TestDryRunListingSkipsUnprintableCharacters(t *testing.T) {
+	paths := append([]string{"/ok", "/ok2", "/caf\u00e9"}, unprintableInputs...)
+	for _, auth := range []bool{false, true} {
+		lines, uncovered, skipped := dryRunListing(paths, auth, nil)
+		if want := []string{"/caf\u00e9", "/ok", "/ok2"}; !slices.Equal(lines, want) {
+			t.Errorf("auth=%v: lines = %q, want %q", auth, lines, want)
+		}
+		if uncovered != 3 || skipped != len(unprintableInputs) {
+			t.Errorf("auth=%v: uncovered = %d, skipped = %d, want 3 and %d", auth, uncovered, skipped, len(unprintableInputs))
+		}
+	}
+}
+
+// The skipped line names no path, and signed out it gives the only reason
+// there is.
+func TestDryRunSkippedLine(t *testing.T) {
+	if got, want := dryRunSkippedLine(2, false), "skipped 2 path(s) with unprintable characters (a newline would split the listing)"; got != want {
+		t.Errorf("signed out: %q, want %q", got, want)
+	}
+	if got, want := dryRunSkippedLine(3, true), "skipped 3 path(s) that can't be listed safely (encoded characters, query-like characters, or unprintable characters)"; got != want {
+		t.Errorf("signed in: %q, want %q", got, want)
+	}
+}
+
+// Signed in, a printed line has its token-shaped segments masked, and a test's
+// path is masked the same way before it is compared, so a test of that page
+// still covers it. Signed out nothing is masked on either side.
+func TestDryRunListingAuthCoverageMatchesMaskedLines(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	tests := []config.Test{{ID: "reset", Path: "/reset/" + token}}
+	for _, auth := range []bool{false, true} {
+		lines, uncovered, _ := dryRunListing([]string{"/reset/" + token, "/other"}, auth, tests)
+		if len(lines) != 2 || uncovered != 1 {
+			t.Errorf("auth=%v: lines = %q, uncovered = %d, want 2 lines and 1 (only /other)", auth, lines, uncovered)
+		}
+	}
+}
+
+// With auth the paths are the crawler's decoded ones, and printing them must
+// not parse them as URLs again: a leading // comes out as it is, and nothing
+// collapses into a placeholder line. A literal % is skipped and counted, as
+// any % is when signed in. A path that is a secret by shape is still masked,
+// so a token cannot be printed.
+func TestDryRunListingAuthSkipsPercentKeepsSlashesAndMasksTokens(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	lines, uncovered, skipped := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
+	want := []string{"//x", "/reset/[redacted]"}
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 2 || skipped != 2 {
+		t.Errorf("uncovered = %d, skipped = %d, want 2 and 2", uncovered, skipped)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, token) || strings.Contains(l, "<unparsable url>") {
+			t.Errorf("listed %q", l)
+		}
+	}
+}
+
+// printableLine is the rule every listed line obeys, signed in or out,
+// written out here on its own so the tests do not check the code against
+// itself: valid UTF-8, no C0 or C1 control or DEL, no format character, and no
+// line or paragraph separator.
+func printableLine(l string) bool {
+	if !utf8.ValidString(l) {
+		return false
+	}
+	for _, r := range l {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// listableLine is the signed-in listing's rule: printable, no % ? ; & =, and
+// no '#' but a single one directly followed by '/'.
+func listableLine(l string) bool {
+	if !printableLine(l) || strings.ContainsAny(l, "%?;&=") {
+		return false
+	}
+	switch strings.Count(l, "#") {
+	case 0:
+		return true
+	case 1:
+		return strings.Contains(l, "#/")
+	default:
+		return false
+	}
+}
+
+// encodeN percent-encodes c n times: n=0 is c itself, 1 is %3F, 2 is %253F,
+// and so on, each layer encoding the % of the one below.
+func encodeN(c byte, n int) string {
+	if n == 0 {
+		return string(c)
+	}
+	return "%" + strings.Repeat("25", n-1) + fmt.Sprintf("%02X", c)
+}
+
+// dryRunLeakProbes are paths as they reach dryRunListing after RouteKey has
+// decoded a link once, each with secret planted behind a character that can
+// carry or hide it. They cover every carrier at every encoding depth from 0 to
+// 6, behind a clean prefix, a stray %, a literal % segment, a hash route and a
+// stray % in front of a hash route, unprintable characters in front of the
+// secret, and the exact probes reviewers sent.
+func dryRunLeakProbes(secret string) []string {
+	probes := []string{
+		"/%zz%253Ftoken%253Ds3cr3t",
+		"/100%/x%253Ftoken%253Dabc",
+		"/#/100%/x%3Ftoken%3Dx",
+		"/x%zz#/y%3Ftoken%3Dx",
+		"/a%3Bfoo=secret",
+		"/a%253Bfoo%253Dsecret",
+		"/r&pw=secretvalue",
+		"/%25zz%25253Ftoken%25253Ds3cr3t",
+	}
+	prefixes := []string{"/x", "/%zz", "/100%/x", "/#/x", "/x%zz#/y", "/%/#/x"}
+	// An unprintable character in front of the secret: a raw CSI byte, a bidi
+	// override or mark, and a line or paragraph separator.
+	for _, u := range []string{"\x9b", "\u202e", "\u061c", "\u2028", "\u2029"} {
+		for _, pre := range []string{"/x", "/#/x"} {
+			probes = append(probes, pre+u+secret, pre+"/"+u+"/"+secret)
+		}
+	}
+	for _, c := range []byte("?#;&=") {
+		for depth := 0; depth <= 6; depth++ {
+			carrier := encodeN(c, depth)
+			eq := encodeN('=', depth)
+			for _, pre := range prefixes {
+				probes = append(probes, pre+carrier+secret, pre+carrier+"pw"+eq+secret)
+				// A literal # followed by / is a hash route, which prints, and
+				// a plain secret in a route segment is the documented residual
+				// no character rule can see, so it is not a probe here.
+				if c != '#' || depth > 0 {
+					probes = append(probes, pre+"/a"+carrier+"/"+secret)
+				}
+			}
+		}
+	}
+	return probes
+}
+
+// Signed in, no path that carries or encodes a carrier character is printed,
+// at any encoding depth: each probe, run on its own, is skipped and counted,
+// never listed or counted as uncovered, and whatever is printed from the whole
+// set obeys the character rule and holds no secret. Without the filter the
+// secrets print, so this fails.
+func TestDryRunListingAuthSkipsCarriersAtAnyDepth(t *testing.T) {
+	const secret = "s3cr3tvalue"
+	probes := dryRunLeakProbes(secret)
+	for _, p := range probes {
+		lines, uncovered, skipped := dryRunListing([]string{p}, true, nil)
+		if len(lines) != 0 || uncovered != 0 || skipped != 1 {
+			t.Errorf("%q: lines = %q, uncovered = %d, skipped = %d, want nothing listed and 1 skipped", p, lines, uncovered, skipped)
+		}
+	}
+	safe := []string{"/", "/plain", "//x", "/#/app/page", "/a/b-c_d.e~f", "/docs/release-notes-2024"}
+	lines, uncovered, skipped := dryRunListing(append(slices.Clone(probes), safe...), true, nil)
+	for _, l := range lines {
+		if !listableLine(l) || strings.Contains(l, secret) || strings.Contains(l, "s3cr3t") || strings.Contains(l, "secret") {
+			t.Errorf("listed %q", l)
+		}
+	}
+	// The rule is not "print nothing": ordinary paths, a leading // and a hash
+	// route still print.
+	want := slices.Clone(safe)
+	sort.Strings(want)
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if skipped != len(probes) || uncovered != len(safe) {
+		t.Errorf("skipped = %d, uncovered = %d, want %d and %d", skipped, uncovered, len(probes), len(safe))
+	}
+}
+
+// Signed out the listing is unchanged from a plain --discover run: the same
+// probes print as they are, and only an unprintable character is skipped.
+func TestDryRunListingSignedOutKeepsEncodedPaths(t *testing.T) {
+	paths := []string{"/100%", "/a%3Bfoo=x", "/r&pw=x", "/x%253Fk", "/a#b", "/alpha\n/beta"}
+	lines, uncovered, skipped := dryRunListing(paths, false, nil)
+	want := []string{"/100%", "/a#b", "/a%3Bfoo=x", "/r&pw=x", "/x%253Fk"}
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 5 || skipped != 1 {
+		t.Errorf("uncovered = %d, skipped = %d, want 5 and 1", uncovered, skipped)
+	}
+}
+
+// Whatever path reaches the listing, every printed line is printable, signed
+// in every line also obeys the character rule, and the listed and skipped
+// paths add up to what came in.
+func FuzzDryRunListing(f *testing.F) {
+	for _, p := range dryRunLeakProbes("s3cr3tvalue") {
+		f.Add(p)
+	}
+	for _, p := range unprintableInputs {
+		f.Add(p)
+	}
+	for _, p := range []string{"/", "//x", "/#/app/page", "/#/a#/b", "/#x", "/a#", "/100%", "/caf\u00e9", "/x\uff1f\uff1d", "/x\u037e"} {
+		f.Add(p)
+	}
+	f.Fuzz(func(t *testing.T, p string) {
+		for _, auth := range []bool{false, true} {
+			lines, uncovered, skipped := dryRunListing([]string{p}, auth, nil)
+			if len(lines)+skipped != 1 || uncovered != len(lines) {
+				t.Fatalf("auth=%v %q: lines = %q, uncovered = %d, skipped = %d", auth, p, lines, uncovered, skipped)
+			}
+			for _, l := range lines {
+				if !printableLine(l) || (auth && !listableLine(l)) {
+					t.Errorf("auth=%v %q: listed %q, which breaks the rule", auth, p, l)
+				}
+			}
+		}
+	})
+}
+
+// --id and --path narrow what a run scans, not what a dry run counts as
+// covered: the same crawl reports the same uncovered count with or without
+// them, and a test with an absolute url: still covers nothing.
+func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`)
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>`)
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "frostfall.yml")
+	yml := "version: 1\ndefaults:\n  waitFor: load\ntests:\n  - id: home\n    path: /\n  - id: a\n    path: /a\n  - id: b\n    path: /b\n  - id: abs\n    url: " + srv.URL + "/c\n"
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	base := []string{"--config", cfg, "--base-url", srv.URL, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none"}
+	for _, extra := range [][]string{nil, {"--id", "^home$"}, {"--path", "^/$"}} {
+		code, stdout, stderr := runBoth(t, append(slices.Clone(base), extra...)...)
+		if code != exitOK {
+			t.Fatalf("%v: exit code = %d (stderr: %s)", extra, code, stderr)
+		}
+		if want := "/\n/a\n/b\n/c\n"; stdout != want {
+			t.Errorf("%v: stdout = %q, want %q", extra, stdout, want)
+		}
+		if !strings.Contains(stderr, "discovered 4 page(s), 1 not covered by an explicit test") {
+			t.Errorf("%v: stderr = %q, want 4 discovered and 1 not covered", extra, stderr)
+		}
+	}
+}
+
+// Signed in, a link whose decoded path starts with // is listed as it is (not
+// as <unparsable url>, not with a slash lost), a hash route is listed, and a
+// token in a query or a path never reaches stdout or stderr. Any path left
+// holding a %, ?, ;, &, = or a stray # after the crawl's cleaning (a literal
+// /100% included) is skipped and counted on stderr, as is one that decodes to
+// a newline; none of them is printed.
+func TestDiscoverDryRunWithAuthSkipsUnsafePathsAndLeaksNoTokens(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	const secret = "s3cr3tvalue"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marker := ""
+		if c, err := r.Cookie("sid"); err == nil && c.Value == secret {
+			marker = `<i id="in"></i>`
+		}
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`+marker)
+		if r.URL.Path == "/" {
+			for _, l := range []string{"/100%25", "/%2Fx", "/reports?token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain",
+				// The same secret smuggled past the query and path checks: a
+				// %23 that decodes to a #, a %3F and %3D double-encoded, and a
+				// %0A that would split a printed line. A real hash route stays.
+				"/a%23" + secret, "/reports%253Ftoken%253D" + secret, "/alpha%0A/beta", "/#/app/page",
+				// A ;param and an &pw= double-encoded, and a literal & carrier.
+				"/a%253Bfoo%253D" + secret, "/r&pw=" + secret} {
+				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
+			}
+		}
+		fmt.Fprint(w, `</main></body></html>`)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	state := fmt.Sprintf(`{"cookies":[{"name":"sid","value":%q,"domain":"127.0.0.1","path":"/","expires":-1}],"origins":[]}`, secret)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	yml := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  waitFor: load\n  timeout: 8s\nauth:\n  storageState: state.json\n  signedIn: \"#in\"\ntests:\n  - id: home\n    path: /\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	code, stdout, stderr := runBoth(t, "--config", cfg, "--discover", "--dry-run", "--no-screenshots", "--baseline", "none")
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) || strings.Contains(stdout, "0123456789abcdef") {
+		t.Errorf("a token was printed: stdout = %q, stderr = %q", stdout, stderr)
+	}
+	t.Logf("stdout = %q", stdout)
+	t.Logf("stderr = %q", stderr)
+	if want := "/\n/#/app/page\n//x\n/plain\n/reports\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	// Skipped: /100%, /a#<secret>, /reports%3Ftoken%3D<secret>,
+	// /alpha<newline>/beta, /a%3Bfoo%3D<secret> and /r&pw=<secret>. The reset
+	// token never gets this far: the crawl drops it as credential-looking.
+	if !strings.Contains(stderr, "skipped 6 path(s) that can't be listed safely") || strings.Contains(stderr, "alpha") {
+		t.Errorf("stderr = %q, want a count of the skipped paths and not the paths", stderr)
+	}
+	if !strings.Contains(stderr, "discovered 5 page(s), 4 not covered by an explicit test") {
+		t.Errorf("stderr = %q, want 5 discovered and 4 not covered", stderr)
 	}
 }

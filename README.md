@@ -419,6 +419,7 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--id REGEX` | - | run only tests whose id matches (Go regex) |
 | `--path REGEX` | - | run only tests whose path matches (combines with `--id`) |
 | `--discover` | off | crawl same-origin links from `/` and scan discovered pages in addition to configured tests |
+| `--dry-run` | off | with `--discover`: print the discovered paths, one per line, and scan nothing |
 | `--screenshots` | off locally, **on in GitHub Actions** | capture an element-cropped PNG of each new violation |
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
@@ -848,6 +849,72 @@ data - if a route slug changes when your database is reseeded, baseline entries
 for it go stale. Treat discovery as a scout: run it periodically, then promote
 interesting pages into explicit tests with stable ids. Gate CI on explicit
 tests against seeded, deterministic data.
+
+### Dry run: list pages without scanning
+
+```bash
+frostfall --discover --dry-run
+```
+
+Crawls exactly as `--discover` does (same `discover:` options, excludes,
+`maxPages`, and signed-in handling) but runs no axe scan, keyboard audit,
+screenshot, baseline check or issue sync. It prints one discovered path per
+line on stdout, sorted, and nothing else there; the crawl's log lines and a
+summary (`discovered N page(s), M not covered by an explicit test`) go to
+stderr. Exit 0 on success, 2 for a config error (including `--dry-run` without
+`--discover`, or with `--update-baseline`, `--gh-issues`, `--validate`, `--format`
+or `--output`, none of which a path listing can use), 3 when the server or login
+is unreachable. No baseline file is read.
+
+The "not covered" count is against every test in the config, whatever `--id` or
+`--path` select. Only a test with a `path:` covers a page: a test that uses an
+absolute `url:` instead never counts as covering a discovered one, the same as in
+a normal `--discover` run.
+
+The lines are `path:` values, as a discovered test uses them, so promoting a
+page into an explicit test is a paste:
+
+```yaml
+tests:
+  - id: pricing
+    path: /pricing   # from the listing
+```
+
+To flag routes your config does not list, diff the listing against the paths
+in the config in CI. This needs [mikefarah/yq](https://github.com/mikefarah/yq)
+(v4 syntax; the Python `yq` wrapper uses a different one), and tests that use an
+absolute `url:` instead of `path:` are not compared, so a page one of them loads
+shows up as found by the crawl:
+
+```bash
+frostfall --discover --dry-run 2>/dev/null | sort > discovered.txt
+yq '.tests[].path | select(. != null)' .frostfall.yml | sort > listed.txt
+comm -23 discovered.txt listed.txt   # found by the crawl, not in the config
+```
+
+With `auth` configured the crawl cuts queries, `;params` and hash payloads and
+leaves out credential-looking links, and the listing then fails closed: a path
+is printed only if it contains none of `%`, `?`, `;`, `&` or `=`, and no `#`
+other than a single `#/` that starts a hash route. Any other path is skipped,
+not printed and not counted as uncovered, and stderr says how many
+(`skipped N path(s) that can't be listed safely ...`). An encoded credential
+(`%253Ftoken%253D...`, any number of layers deep) is skipped that way, and so
+is an ordinary page whose path has a literal `%`: signed in, `/100%` is skipped,
+while `//x` and `/#/app/page` still print. A segment shaped like a token is
+masked as `[redacted]`, and a test's `path:` is masked the same way before
+coverage is counted, so a test of that page still covers its line. A plain
+secret in an ordinary segment (`/a/s3cr3t`, or after `#/`) looks like any other
+path to a character rule, so it is not caught, and neither is a lookalike of
+`?` or `=` (fullwidth `？` or `＝`, or the Greek question mark U+037E), which is
+plain text to the rule and falls under the same residual.
+
+A path with an unprintable character in it would not print as the one line it
+is: a newline splits it, a raw 8-bit byte (a link's `%9B` decodes to a terminal
+CSI byte) or invalid UTF-8 can act on the terminal, and a bidi override (U+202E,
+U+061C), another format character or a line separator (U+2028, U+2029)
+reorders or breaks what is shown. Such a path is skipped signed in or out.
+Signed out it is the only path the listing skips, and stderr says
+`skipped N path(s) with unprintable characters (a newline would split the listing)`.
 
 ## Screenshots
 

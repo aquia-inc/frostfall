@@ -10,7 +10,11 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
 	"github.com/aquia-inc/frostfall/internal/baseline"
@@ -23,6 +27,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/github"
 	"github.com/aquia-inc/frostfall/internal/runner"
 	"github.com/aquia-inc/frostfall/internal/scaffold"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 	"github.com/aquia-inc/frostfall/internal/server"
 )
 
@@ -70,6 +75,7 @@ func run(args []string) int {
 	outputPath := fs.String("output", "", "write the formatted report here (default for html: frostfall-report.html)")
 	fs.Bool("watch", false, "rescan on change, print only new violations")
 	discoverFlag := fs.Bool("discover", false, "crawl same-origin paths from the root and scan discovered pages")
+	dryRun := fs.Bool("dry-run", false, "with --discover: print the discovered paths, one per line, and scan nothing")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -87,6 +93,37 @@ func run(args []string) int {
 	if fs.Lookup("watch").Value.String() == "true" {
 		fmt.Fprintln(os.Stderr, "--watch is not implemented yet")
 		return exitBadConfig
+	}
+	if *dryRun {
+		// A dry run only lists what the crawl finds: it has no scan to dry-run
+		// on its own, and nothing it could write. --format has a default, so
+		// whether it was passed is asked of the flag set, not read off its value.
+		set := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		switch {
+		case !*discoverFlag:
+			fmt.Fprintln(os.Stderr, "--dry-run only applies to discovery: pass --discover --dry-run to list the pages a crawl finds")
+			return exitBadConfig
+		case *updateBaseline:
+			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there is no baseline to update: drop --update-baseline")
+			return exitBadConfig
+		case *ghIssues || *ghIssuesDry:
+			var given []string
+			if *ghIssues {
+				given = append(given, "--gh-issues")
+			}
+			if *ghIssuesDry {
+				given = append(given, "--gh-issues-dry-run")
+			}
+			fmt.Fprintln(os.Stderr, "--dry-run scans nothing, so there are no issues to file: drop "+strings.Join(given, " and "))
+			return exitBadConfig
+		case *validateOnly:
+			fmt.Fprintln(os.Stderr, "--dry-run lists the pages a crawl finds and does not validate the config: drop --validate")
+			return exitBadConfig
+		case set["format"] || set["output"]:
+			fmt.Fprintln(os.Stderr, "--dry-run prints a path list, not a report, so --format and --output have no effect: drop them")
+			return exitBadConfig
+		}
 	}
 	if *updateBaseline && (*idFilter != "" || *pathFilter != "") {
 		fmt.Fprintln(os.Stderr, "--update-baseline cannot be combined with --id/--path: a filtered update would drop baseline entries for the excluded tests")
@@ -178,7 +215,8 @@ func run(args []string) int {
 		bp = ""
 	}
 	var bl *baseline.File
-	if bp != "" {
+	// A dry run scans nothing, so a baseline file, however broken, is not read.
+	if bp != "" && !*dryRun {
 		if bl, err = baseline.Load(bp); err != nil {
 			fmt.Fprintln(os.Stderr, "baseline error:", err)
 			return exitBadConfig
@@ -239,6 +277,12 @@ func run(args []string) int {
 	} else if authn, err = browser.NewAuth(b, cfg, base, authOpts); err != nil {
 		fmt.Fprintln(os.Stderr, "auth error:", err)
 		return exitEnvironment
+	}
+	if *dryRun {
+		if w := discoverAuthWarning(cfg); w != "" {
+			fmt.Fprintln(os.Stderr, "warning:", w)
+		}
+		return runDryRun(b, authn, base, cfg)
 	}
 	r := &runner.Runner{
 		Browser:       b,
@@ -541,15 +585,14 @@ func discoverAuthWarning(cfg *config.Config) string {
 		"and each discovered test logs in again when it runs", max)
 }
 
-// discoverTests crawls from the root and synthesizes fresh-load tests for
-// pages no explicit test covers. Explicit tests always win on a path
-// collision — discovery adds breadth, never overrides depth.
-func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+// newCrawler builds the crawler a --discover run uses, so a dry run crawls
+// by exactly the same rules.
+func newCrawler(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config) *discover.Crawler {
 	opts := config.Discover{MaxDepth: 3, MaxPages: 100}
 	if cfg.Discover != nil {
 		opts = *cfg.Discover
 	}
-	crawler := &discover.Crawler{
+	return &discover.Crawler{
 		Browser:  b,
 		Auth:     authn,
 		BaseURL:  base,
@@ -557,7 +600,13 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 		Defaults: cfg.Defaults,
 		Log:      func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
-	paths, err := crawler.Run()
+}
+
+// discoverTests crawls from the root and synthesizes fresh-load tests for
+// pages no explicit test covers. Explicit tests always win on a path
+// collision - discovery adds breadth, never overrides depth.
+func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config, explicit []config.Test) ([]config.Test, error) {
+	paths, err := newCrawler(b, authn, base, cfg).Run()
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +621,125 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 		}
 	}
 	return out, nil
+}
+
+// runDryRun crawls and prints what it found, one path per line on stdout,
+// sorted, and runs nothing else. The paths are what a test's path: takes, so a
+// line can be pasted into the config as it is. Diagnostics, and how many of the
+// pages no configured test covers, go to stderr, which keeps stdout clean to
+// diff or pipe. Coverage is judged against every test in the config, not the
+// ones --id or --path select: those narrow what a run scans, and this scans
+// nothing. A test with an absolute url: instead of a path: covers no page, as
+// in a normal discovery run.
+func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config) int {
+	paths, err := newCrawler(b, authn, base, cfg).Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "discover error:", err)
+		return exitEnvironment
+	}
+	out, uncovered, skipped := dryRunListing(paths, cfg.Auth != nil, cfg.Tests)
+	for _, p := range out {
+		fmt.Println(p)
+	}
+	if skipped > 0 {
+		fmt.Fprintln(os.Stderr, dryRunSkippedLine(skipped, cfg.Auth != nil))
+	}
+	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
+	return exitOK
+}
+
+// dryRunSkippedLine says how many paths a dry run left out, and why, without
+// naming any of them. Signed out the only reason is an unprintable character;
+// signed in the character rule of signedInListable applies too.
+func dryRunSkippedLine(n int, auth bool) string {
+	if auth {
+		return fmt.Sprintf("skipped %d path(s) that can't be listed safely (encoded characters, query-like characters, or unprintable characters)", n)
+	}
+	return fmt.Sprintf("skipped %d path(s) with unprintable characters (a newline would split the listing)", n)
+}
+
+// dryRunListing turns the crawl's paths into the sorted, deduped lines to
+// print, and counts how many of those lines no test in tests covers.
+//
+// A path with an unprintable character in it would not print as the one line
+// it is, signed in or out: a %0A in a link decodes to a real newline, a raw
+// %9B to an 8-bit CSI byte a terminal acts on, and a bidi override (U+202E)
+// or a line separator (U+2028) reorders or splits what is shown. Such a path
+// is skipped, not listed or counted, and skipped says how many so the caller
+// can report it.
+//
+// Signed in, the crawler cuts queries, ;params and hash payloads, but a link
+// can hide a credential behind any number of encoding layers (%253F is a ?
+// two decodes down), and no decoder can know when to stop. So the listing
+// fails closed instead: a path is printed only if signedInListable accepts
+// it, and every other path is skipped and counted the same way. The paths are
+// not parsed as URLs again (that misreads a literal % as a bad escape and a
+// leading // as a host); MaskSegments, which works on the text, still masks a
+// segment that is a secret by shape, and a test's path is masked the same way
+// before it is compared, so a test of a token-shaped page still covers its
+// line. The count is of printed lines, after the dedupe, so it cannot exceed
+// the number listed.
+func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered, skipped int) {
+	covered := map[string]bool{}
+	for _, t := range tests {
+		if auth {
+			covered[secrets.MaskSegments(t.Path)] = true
+		} else {
+			covered[t.Path] = true
+		}
+	}
+	listed := map[string]bool{}
+	for _, p := range paths {
+		if unprintable(p) || (auth && !signedInListable(p)) {
+			skipped++
+			continue
+		}
+		if auth {
+			p = secrets.MaskSegments(p)
+		}
+		if listed[p] {
+			continue
+		}
+		listed[p] = true
+		if !covered[p] {
+			uncovered++
+		}
+		lines = append(lines, p)
+	}
+	sort.Strings(lines)
+	return lines, uncovered, skipped
+}
+
+// unprintable reports whether p would not print as the single line it is:
+// invalid UTF-8 (a raw 8-bit byte such as CSI), a control character, a format
+// character (bidi overrides and marks, zero-width characters) or a line or
+// paragraph separator.
+func unprintable(p string) bool {
+	if !utf8.ValidString(p) {
+		return true
+	}
+	return strings.ContainsFunc(p, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.In(r, unicode.Zl, unicode.Zp)
+	})
+}
+
+// signedInListable reports whether a signed-in dry run may print p: it holds
+// none of the characters a credential is carried or encoded with (% ? ; & =),
+// and no '#' unless it is a single '#' directly followed by '/', a hash
+// route. This is a character rule, not a decoder, so it has no layer it can
+// be talked past. It cannot see a plain secret in an ordinary segment
+// (/a/s3cr3t); MaskSegments catches one shaped like a token.
+func signedInListable(p string) bool {
+	if strings.ContainsAny(p, "%?;&=") {
+		return false
+	}
+	if i := strings.IndexByte(p, '#'); i >= 0 {
+		rest := p[i+1:]
+		if !strings.HasPrefix(rest, "/") || strings.Contains(rest, "#") {
+			return false
+		}
+	}
+	return true
 }
 
 // runInit detects the project in the working directory and writes a tailored
