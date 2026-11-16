@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.6.1](https://github.com/aquia-inc/frostfall/compare/v1.6.0...v1.6.1) (2026-11-16)
+
+### Bug Fixes
+
+* keyboard focus-visibility false positives and load waits broken by self-redirects ([#67](https://github.com/aquia-inc/frostfall/issues/67)) ([b13d34b](https://github.com/aquia-inc/frostfall/commit/b13d34bbcc26ae8003162d16571ec37a79cbde5b))
+
 ## [1.6.0](https://github.com/aquia-inc/frostfall/compare/v1.5.0...v1.6.0) (2026-11-13)
 
 ### Features
