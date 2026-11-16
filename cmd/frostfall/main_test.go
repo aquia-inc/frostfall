@@ -392,7 +392,7 @@ func TestScanChecksOnlySelectedTestsForOrigins(t *testing.T) {
 
 // Every output of a run whose config has auth, even one where nothing signs in,
 // is free of what the paths and the base URL carry: stdout, stderr (verbose),
-// the SARIF file and the HTML report.
+// the SARIF file, the HTML report, and the json and junit files.
 func TestSkippedAuthStillRedactsEveryOutput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
@@ -402,7 +402,7 @@ func TestSkippedAuthStillRedactsEveryOutput(t *testing.T) {
 	cfg := writeAuthConfig(t, srv.URL, "  - id: pub\n    path: /p?token=SECRETTOK123\n    auth: false\n")
 	base := strings.Replace(srv.URL, "http://", "http://ciuser:S3cretBasicPW@", 1)
 	secrets := []string{"SECRETTOK123", "S3cretBasicPW"}
-	for _, format := range []string{"sarif", "html"} {
+	for _, format := range []string{"sarif", "html", "json", "junit"} {
 		out := filepath.Join(t.TempDir(), "report."+format)
 		code, stdout, stderr := runBoth(t, "--config", cfg, "--base-url", base, "--verbose", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
 		if code != exitOK {
@@ -994,6 +994,84 @@ func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
 	}
 }
 
+// A signed-in run through the real entry point: json and junit carry the same
+// redacted page URL and scrubbed target the other formats do. The page is
+// reached with a token in its query string, and its image-alt violation is
+// found, so there is both a URL and a selector for a secret to ride in.
+func TestStructuredOutputsRedactUnderAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	body := "version: 1\nserver:\n  serve: " + filepath.Join(root, "testdata/auth/site") + "\n" +
+		"auth:\n  storageState: " + filepath.Join(root, "testdata/auth/state-valid.json") + "\n" +
+		"  loginPath: /login.html\n  signedIn: \"[data-testid=app-shell]\"\n" +
+		"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
+		"tests:\n  - id: protected\n    path: /protected.html?token=SECRETTOK123#access_token=FRAGSECRET\n"
+	cfg := filepath.Join(dir, "frostfall.yml")
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, format := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+format)
+		code, stdout, stderr := runBoth(t, "--config", cfg, "--verbose", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitViolations {
+			t.Fatalf("%s: exit code = %d, want %d (stderr: %s)", format, code, exitViolations, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(report)
+		for _, secret := range []string{"SECRETTOK123", "FRAGSECRET"} {
+			for name, haystack := range map[string]string{"stdout": stdout, "stderr": stderr, format + " report": text} {
+				if strings.Contains(haystack, secret) {
+					t.Errorf("%s: %q reached the %s", format, secret, name)
+				}
+			}
+		}
+		if !strings.Contains(text, "/protected.html") || !strings.Contains(text, "image-alt") {
+			t.Errorf("%s report lost the page or its violation:\n%s", format, text)
+		}
+	}
+}
+
+// A run that stops on an environment error still writes the json and junit
+// report CI reads, with the error and exit status 3 in it.
+func TestStructuredOutputsReportAnEnvironmentError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	t.Chdir("../..")
+	dir := t.TempDir()
+	for _, format := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+format)
+		code, stderr := runCaptured(t, "--config", "testdata/auth/frostfall-nosession.yml", "--format", format, "--output", out, "--no-screenshots", "--baseline", "none")
+		if code != exitEnvironment {
+			t.Fatalf("%s: exit code = %d (stderr: %s)", format, code, stderr)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("%s: no report written on an environment error: %v", format, err)
+		}
+		text := string(report)
+		if !strings.Contains(text, "landed on the login page") {
+			t.Errorf("%s report lacks the error:\n%s", format, text)
+		}
+		if format == "json" && !strings.Contains(text, `"exitStatus": 3`) {
+			t.Errorf("json report lacks exit status 3:\n%s", text)
+		}
+		if format == "junit" && !strings.Contains(text, "<error ") {
+			t.Errorf("junit report lacks an <error>:\n%s", text)
+		}
+	}
+}
+
 // Signed in, a link whose decoded path starts with // is listed as it is (not
 // as <unparsable url>, not with a slash lost), a hash route is listed, and a
 // token in a query or a path never reaches stdout or stderr. Any path left
@@ -1056,5 +1134,12 @@ func TestDiscoverDryRunWithAuthSkipsUnsafePathsAndLeaksNoTokens(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "discovered 5 page(s), 4 not covered by an explicit test") {
 		t.Errorf("stderr = %q, want 5 discovered and 4 not covered", stderr)
+	}
+}
+
+func TestUnknownFormatListsJSONAndJUnit(t *testing.T) {
+	code, stderr := runCaptured(t, "--format", "yaml")
+	if code != exitBadConfig || !strings.Contains(stderr, "text, html, sarif, json, junit") {
+		t.Errorf("exit = %d, stderr = %q", code, stderr)
 	}
 }

@@ -23,7 +23,7 @@ inputs:
     description: Path to the baseline file.
     default: ""
   format:
-    description: Report format (text, html, sarif).
+    description: Report format (text, html, sarif, json, junit).
     default: html
   output:
     description: Path to write the formatted report.
@@ -46,7 +46,7 @@ outputs:
     description: Number of tests executed.
     value: ${{ steps.run.outputs.tests-run }}
   report-file:
-    description: Path of the written report (html format).
+    description: Path of the written report (html, sarif, json and junit formats).
     value: ${{ steps.run.outputs.report-file }}
 
 runs:

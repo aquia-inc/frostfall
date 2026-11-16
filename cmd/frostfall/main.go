@@ -71,8 +71,8 @@ func run(args []string) int {
 		ghIssues       = fs.Bool("gh-issues", false, "file/maintain GitHub issues for failing violations (needs GITHUB_TOKEN and GITHUB_REPOSITORY)")
 		ghIssuesDry    = fs.Bool("gh-issues-dry-run", false, "print the issue actions a --gh-issues run would take, without calling GitHub")
 	)
-	formatName := fs.String("format", "text", "output format: text|html|sarif (json, junit planned)")
-	outputPath := fs.String("output", "", "write the formatted report here (default for html: frostfall-report.html)")
+	formatName := fs.String("format", "text", "output format: text|html|sarif|json|junit (text is always printed; the others are also written to --output)")
+	outputPath := fs.String("output", "", "write the formatted report here (default: frostfall-report.html, frostfall.sarif, frostfall.json or frostfall-junit.xml by format)")
 	fs.Bool("watch", false, "rescan on change, print only new violations")
 	discoverFlag := fs.Bool("discover", false, "crawl same-origin paths from the root and scan discovered pages")
 	dryRun := fs.Bool("dry-run", false, "with --discover: print the discovered paths, one per line, and scan nothing")
@@ -86,8 +86,8 @@ func run(args []string) int {
 	// Fail fast on flag mistakes: a bad --format must not burn a full scan
 	// before erroring, and a filtered --update-baseline would silently wipe
 	// baseline entries for every test the filter excluded.
-	if *formatName != "text" && *formatName != "html" && *formatName != "sarif" {
-		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html, sarif)\n", *formatName)
+	if _, known := reportFiles[*formatName]; !known && *formatName != "text" {
+		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html, sarif, json, junit)\n", *formatName)
 		return exitBadConfig
 	}
 	if fs.Lookup("watch").Value.String() == "true" {
@@ -130,6 +130,7 @@ func run(args []string) int {
 		return exitBadConfig
 	}
 
+	started := time.Now()
 	if *showVersion {
 		fmt.Printf("frostfall %s (axe-core %s)\n", version, axe.New().Version())
 		return exitOK
@@ -311,6 +312,22 @@ func run(args []string) int {
 	res, err := r.Execute(context.Background(), tests)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "run error:", err)
+		// json and junit exist for CI to read, and an environment error is
+		// something CI must be able to read there too. The run has no results,
+		// only the error, in the same words stderr has just printed.
+		if *formatName == "json" || *formatName == "junit" {
+			failure := &format.RunFailure{Message: err.Error()}
+			var terr *runner.TestError
+			if errors.As(err, &terr) {
+				failure.TestID = terr.TestID
+			}
+			meta := structuredMeta(version, eng.Version(), reportedBase(base, cfg), cfg.Defaults.Standard,
+				activeProfileName(profileReq, cfg), "report only", started, exitEnvironment)
+			meta.Failure = failure
+			if ferr := writeStructured(*formatName, *outputPath, &runner.Run{}, meta, func(runner.Result) bool { return false }); ferr != nil {
+				fmt.Fprintln(os.Stderr, "report error:", ferr)
+			}
+		}
 		return exitEnvironment
 	}
 
@@ -360,6 +377,18 @@ func run(args []string) int {
 	}
 	format.Text(os.Stdout, res, flagged, label, enforcing)
 
+	// Decided before the report is written so json and junit can carry it.
+	exitCode := exitOK
+	if enforcing {
+		limit := 0
+		if exp.MaxViolations != nil {
+			limit = *exp.MaxViolations
+		}
+		if res.EnforcedFailures(exp, perTest) > limit {
+			exitCode = exitViolations
+		}
+	}
+
 	switch *formatName {
 	case "text": // already written above
 	case "sarif":
@@ -406,8 +435,15 @@ func run(args []string) int {
 			return exitEnvironment
 		}
 		fmt.Printf("report written to %s\n", out)
+	case "json", "junit":
+		meta := structuredMeta(version, eng.Version(), reportedBase(base, cfg), cfg.Defaults.Standard,
+			activeProfileName(profileReq, cfg), modeLabel(exp, enforcing), started, exitCode)
+		if ferr := writeStructured(*formatName, *outputPath, res, meta, flagged); ferr != nil {
+			fmt.Fprintln(os.Stderr, "report error:", ferr)
+			return exitEnvironment
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html)\n", *formatName)
+		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html, sarif, json, junit)\n", *formatName)
 		return exitBadConfig
 	}
 
@@ -420,16 +456,57 @@ func run(args []string) int {
 		}
 	}
 
-	if enforcing {
-		limit := 0
-		if exp.MaxViolations != nil {
-			limit = *exp.MaxViolations
-		}
-		if res.EnforcedFailures(exp, perTest) > limit {
-			return exitViolations
-		}
+	return exitCode
+}
+
+// reportFiles is the default file each report format writes to. text is not
+// here: it is always printed to stdout.
+var reportFiles = map[string]string{
+	"html":  "frostfall-report.html",
+	"sarif": "frostfall.sarif",
+	"json":  "frostfall.json",
+	"junit": "frostfall-junit.xml",
+}
+
+// structuredMeta is the run context for the json and junit formats. baseURL
+// must already be redacted (reportedBase).
+func structuredMeta(toolVersion, axeVersion, baseURL, standard, profile, mode string, started time.Time, exitStatus int) format.ReportMeta {
+	return format.ReportMeta{
+		ToolVersion: toolVersion,
+		AxeVersion:  axeVersion,
+		BaseURL:     baseURL,
+		Standard:    standard,
+		Profile:     profile,
+		Mode:        mode,
+		Started:     started,
+		Duration:    time.Since(started),
+		ExitStatus:  exitStatus,
 	}
-	return exitOK
+}
+
+// writeStructured writes the json or junit report to out (or its default
+// file) and says where.
+func writeStructured(formatName, out string, res *runner.Run, meta format.ReportMeta, flagged func(runner.Result) bool) error {
+	if out == "" {
+		out = reportFiles[formatName]
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		return err
+	}
+	if formatName == "junit" {
+		err = format.JUnit(f, res, meta, flagged)
+	} else {
+		err = format.JSON(f, res, meta, flagged)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("report written to %s\n", out)
+	return nil
 }
 
 // writeGitHubOutputs exposes run counts as job outputs when running in
@@ -456,9 +533,9 @@ func writeGitHubOutputs(res *runner.Run, flagged func(runner.Result) bool, forma
 	fmt.Fprintf(f, "baselined-violations=%d\n", baselined)
 	fmt.Fprintf(f, "stale-baseline-entries=%d\n", len(res.Stale))
 	fmt.Fprintf(f, "tests-run=%d\n", res.TestsRun)
-	if formatName == "html" || formatName == "sarif" {
+	if _, isReport := reportFiles[formatName]; isReport {
 		if outputPath == "" {
-			outputPath = map[string]string{"html": "frostfall-report.html", "sarif": "frostfall.sarif"}[formatName]
+			outputPath = reportFiles[formatName]
 		}
 		fmt.Fprintf(f, "report-file=%s\n", outputPath)
 	}
