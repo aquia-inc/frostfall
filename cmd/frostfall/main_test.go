@@ -98,8 +98,10 @@ func TestAuthFixtureExitCodes(t *testing.T) {
 //
 // The guard and redaction follow the resolved block: a ci profile whose
 // signedIn marker the page lacks is the guard's exit 3, naming the ci
-// marker; the unselected base block's values appear nowhere; and the
-// test URL's query (a stand-in for a token) is redacted from the output.
+// marker (the guard prints the resolved selector on purpose); the
+// unselected base block's login path and marker appear nowhere, and neither
+// does the ci block's login path, since the run never lands on that route;
+// and the test URL's query (a stand-in for a token) is redacted.
 //
 // The base setup path also carries ${FF_E2E_LOGIN_USER:-}, left unset: a
 // failed setup names it, and runs that never run the setup do not.
@@ -125,6 +127,7 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 		baseLogin  = "/base-login-route.html"
 		baseMarker = "[data-testid=base-only-marker]"
 		ciMarker   = "[data-testid=ci-only-marker]"
+		ciLogin    = "/ci-login-route.html"
 	)
 	dir := t.TempDir()
 	// Relative to the config file, as a top-level storageState is.
@@ -148,7 +151,7 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 	bad := write("bad.yml", "/login.html", "[data-testid=app-shell]", "      storageState: state.json\n")
 	// The base block names a login route and a marker of its own; with the
 	// ci profile selected neither may show up anywhere.
-	noMarker := write("nomarker.yml", baseLogin, baseMarker, "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \""+ciMarker+"\"\n")
+	noMarker := write("nomarker.yml", baseLogin, baseMarker, "      storageState: state.json\n      loginPath: "+ciLogin+"\n      signedIn: \""+ciMarker+"\"\n")
 
 	cases := []struct {
 		name      string
@@ -163,7 +166,7 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 		{"base validate", []string{"--config", good, "--profile", "none", "--validate"}, exitOK, nil, []string{hint}},
 		{"ci marker missing", []string{"--config", noMarker, "--profile", "ci"}, exitEnvironment,
 			[]string{`test "protected": landed on`, "without the signedIn selector \"" + ciMarker + "\""},
-			[]string{secret, hint, baseLogin, baseMarker}},
+			[]string{secret, hint, baseLogin, baseMarker, ciLogin}},
 		{"bad ci block", []string{"--config", bad, "--profile", "ci", "--validate"}, exitBadConfig, []string{`profile "ci": auth.signedIn: required`}, nil},
 		{"bad ci block, not selected", []string{"--config", bad, "--profile", "none", "--validate"}, exitOK, nil, nil},
 	}

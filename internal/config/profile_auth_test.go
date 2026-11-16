@@ -254,6 +254,7 @@ func TestCheckProfilesWalk(t *testing.T) {
 		{"explicit auth shadows a merged null", "profiles:\n  ci:\n    <<: { auth: null }\n    auth: { signedIn: x }\n", ""},
 		{"first merged auth wins", "profiles:\n  ci:\n    <<: [ { auth: { signedIn: x } }, { auth: null } ]\n", ""},
 		{"quoted << is not a merge", "profiles:\n  ci:\n    \"<<\": { auth: null }\n", ""},
+		{"binary key whose text is auth", "profiles:\n  ci:\n    !!binary auth: null\n", ""},
 		{"alias to << is not a merge", "x: &m <<\nprofiles:\n  ci:\n    *m : { auth: null }\n", ""},
 		{"no profiles", "auth: { signedIn: x }\n", ""},
 	}
