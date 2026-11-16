@@ -76,10 +76,12 @@ type stop struct {
 	HTML   string     `json:"html"`
 	Hidden string     `json:"hidden"`
 	// Labelled: a hidden stop whose label is visible, so Box is the label's.
-	Labelled bool       `json:"labelled"`
-	InModal  bool       `json:"inModal"`
-	InScope  bool       `json:"inScope"`
-	Box      [4]float64 `json:"box"`
+	Labelled bool `json:"labelled"`
+	// Own is a labelled stop's own box, Box being its label's.
+	Own     [4]float64 `json:"own"`
+	InModal bool       `json:"inModal"`
+	InScope bool       `json:"inScope"`
+	Box     [4]float64 `json:"box"`
 }
 
 type audit struct {
@@ -185,15 +187,36 @@ const (
 )
 
 // sameOutside reports whether two captures of one region look the same
-// outside mask (in region coordinates).
-func sameOutside(a, b *image.RGBA, mask image.Rectangle) bool {
+// outside the masks (in region coordinates).
+func masked(p image.Point, masks []image.Rectangle) bool {
+	for _, m := range masks {
+		if p.In(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// ownMask is a labelled hidden stop's own box within its label's region (in
+// region coordinates), padded for the ring a browser draws around it. Judged
+// through its label, the input's own default ring, a few pixels around a 1px
+// unclipped input, is not an indicator anyone can use, so it must not count
+// as the label showing focus. Empty for any other stop.
+func ownMask(s stop, reg image.Rectangle) image.Rectangle {
+	if !s.Labelled {
+		return image.Rectangle{}
+	}
+	return region(s.Own, s.View).Sub(reg.Min)
+}
+
+func sameOutside(a, b *image.RGBA, masks ...image.Rectangle) bool {
 	if a.Bounds() != b.Bounds() {
 		return false
 	}
 	changed := 0
 	for y := range a.Bounds().Dy() {
 		for x := range a.Bounds().Dx() {
-			if image.Pt(x, y).In(mask) {
+			if masked(image.Pt(x, y), masks) {
 				continue
 			}
 			i := a.PixOffset(x, y)
@@ -316,14 +339,14 @@ func Audit(ctx context.Context, page Page, opts Options) (*Result, error) {
 				return nil, err
 			}
 			mask := curRegion.Intersect(pendRegion).Sub(pendRegion.Min)
-			if sameOutside(pendShot, now, mask) {
+			if sameOutside(pendShot, now, mask, ownMask(*pend, pendRegion)) {
 				suspects[pend.ID] = *pend
 			}
 		}
-		// Tab came straight back to the pending stop (a page or modal with one
-		// tab stop): there was never a moment to compare against, so the
-		// confirming lap, which blurs instead, judges it.
-		if pend != nil && !cur.Out && cur.ID == pend.ID {
+		// A pending stop the fast pass could not compare (Tab came straight back
+		// to it, or scrolled its region away) goes to the confirming lap, which
+		// blurs in place and needs neither a neighbour nor the next stop in view.
+		if pend != nil && !cur.Out && !comparing {
 			suspects[pend.ID] = *pend
 		}
 		if pend != nil && !cur.Out {
@@ -514,6 +537,7 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (u
 			continue
 		}
 		before := region(cur.Box, cur.View)
+		own := ownMask(cur, before)
 		focused, err := newFrame(a.page, cur.View, before).pixels(before)
 		if err != nil {
 			return nil, err
@@ -531,27 +555,55 @@ func (a *audit) confirm(ctx context.Context, cur stop, suspects map[int]stop) (u
 		if err := a.call("state", &after); err != nil {
 			return nil, err
 		}
-		// Focus is on an element again: a focus trap (MUI's, focus-trap's)
-		// pulled it back, so the capture would show a ring either way.
-		if !after.Out || !before.In(viewport(after.View)) {
-			skip(s)
-		} else {
-			blurred, err := newFrame(a.page, after.View, before).pixels(before)
-			if err != nil {
-				return nil, err
+		judge := func(blurred *image.RGBA, mask image.Rectangle) {
+			if !sameOutside(focused, blurred, mask, own) {
+				return
 			}
-			if sameOutside(focused, blurred, image.Rectangle{}) {
-				if s.Hidden != "" {
-					a.report(RuleHidden, s.Sel, s.HTML,
-						"Focus landed on this element, but "+s.Hidden+", and its label does not show focus either")
-				} else {
-					a.report(RuleNotVisible, s.Sel, s.HTML, "")
-				}
+			if s.Hidden != "" {
+				a.report(RuleHidden, s.Sel, s.HTML,
+					"Focus landed on this element, but "+s.Hidden+", and its label does not show focus either")
+			} else {
+				a.report(RuleNotVisible, s.Sel, s.HTML, "")
 			}
 		}
-		// Tab from where the blurred stop was continues the lap.
-		if cur, err = next(); err != nil {
-			return nil, err
+		if after.Out {
+			if !before.In(viewport(after.View)) {
+				skip(s)
+			} else {
+				blurred, err := newFrame(a.page, after.View, before).pixels(before)
+				if err != nil {
+					return nil, err
+				}
+				judge(blurred, image.Rectangle{})
+			}
+			// Tab from where the blurred stop was continues the lap.
+			if cur, err = next(); err != nil {
+				return nil, err
+			}
+		} else {
+			// Focus is on an element again: a focus trap (MUI's, focus-trap's)
+			// pulled it back. Compare against the next stop instead, masking its
+			// region, as the fast pass does; only when that cannot be made either
+			// is the suspect left unjudged.
+			if cur, err = next(); err != nil {
+				return nil, err
+			}
+			if err := a.call("settle", nil, confirmDelay); err != nil {
+				return nil, err
+			}
+			if err := a.call("state", &cur); err != nil {
+				return nil, err
+			}
+			if cur.Out || cur.ID == s.ID || !before.In(viewport(cur.View)) {
+				skip(s)
+			} else {
+				neighbour := region(cur.Box, cur.View)
+				blurred, err := newFrame(a.page, cur.View, before, neighbour).pixels(before)
+				if err != nil {
+					return nil, err
+				}
+				judge(blurred, neighbour.Intersect(before).Sub(before.Min))
+			}
 		}
 		if len(suspects) == 0 || (!cur.Out && cur.ID == first) {
 			return done(), nil

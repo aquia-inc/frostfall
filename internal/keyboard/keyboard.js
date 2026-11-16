@@ -91,7 +91,8 @@
   // merely sits inside a checkbox's label is not drawn by it.
   function labelOf(el) {
     const label = el.labels && el.labels[0];
-    return label && hasSize(label) ? label : null;
+    // A label that is itself out of sight cannot show focus either.
+    return label && shown(label) && !hiddenReason(label) ? label : null;
   }
 
   function hiddenReason(el) {
@@ -246,6 +247,7 @@
         inModal: !modal || containsDeep(modal, a),
         inScope: inScope(a),
         box: focusBox(label || a),
+        own: label ? (() => { const r = a.getBoundingClientRect(); return [r.left + scrollX, r.top + scrollY, r.width, r.height]; })() : [0, 0, 0, 0],
       };
     },
 

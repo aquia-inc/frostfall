@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/cdp"
 
 	"github.com/aquia-inc/frostfall/internal/config"
@@ -30,7 +31,10 @@ func TestLoadFollowsSelfRedirect(t *testing.T) {
 			<body><img src="/slow.png"></body></html>`))
 	})
 	mux.HandleFunc("/slow.png", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(2 * time.Second)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
 	})
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -81,7 +85,7 @@ func TestFollowNavigationRetriesOnlyNavigations(t *testing.T) {
 
 	navigated := &cdp.Error{Code: -32000, Message: "Inspected target navigated or closed"}
 	calls := 0
-	err = s.followNavigation(func() error {
+	err = s.followNavigation(func(*rod.Page) error {
 		if calls++; calls == 1 {
 			return navigated
 		}
@@ -93,8 +97,34 @@ func TestFollowNavigationRetriesOnlyNavigations(t *testing.T) {
 
 	other := errors.New("selector never appeared")
 	calls = 0
-	err = s.followNavigation(func() error { calls++; return other })
+	err = s.followNavigation(func(*rod.Page) error { calls++; return other })
 	if !errors.Is(err, other) || calls != 1 {
 		t.Errorf("another error: err = %v after %d calls, want it returned after 1", err, calls)
+	}
+}
+
+// A page that redirects itself forever fails fast and says so, rather than
+// running out the page's whole timeout.
+func TestSelfRedirectLoopFailsFast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html><html><head><script>location.replace('/again?' + Date.now())</script></head><body><img src="/slow"></body></html>`))
+	}))
+	defer srv.Close()
+	b, err := Launch("")
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer b.Close()
+	start := time.Now()
+	_, err = b.NewSession(srv.URL, config.Viewport{Width: 800, Height: 600}, "load", 0, 30*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "redirecting in a loop") {
+		t.Fatalf("err = %v, want the redirect loop named", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("took %v, want well under the 30s timeout", took)
 	}
 }

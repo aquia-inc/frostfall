@@ -3,10 +3,12 @@
 package browser
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -203,10 +205,31 @@ func (s *Session) navigate(url, waitFor string, settle time.Duration) error {
 // context the wait runs in, which CDP reports as an error rather than as the
 // new page loading; whether the wait began before the navigation is a race
 // that slow CI runners lose. The page's own timeout still bounds the whole
-// wait, and a target that closed or crashed fails at once.
-func (s *Session) followNavigation(wait func() error) error {
+// wait, a target that closed or crashed fails at once, and a page that keeps
+// navigating itself (a redirect loop, where a wait hangs rather than errors)
+// fails once it passes maxSelfNavigations.
+func (s *Session) followNavigation(wait func(p *rod.Page) error) error {
+	ctx, cancel := context.WithCancel(s.page.GetContext())
+	defer cancel()
+	p := s.page.Context(ctx)
+	var looped atomic.Bool
+	hops := 0
+	go p.EachEvent(func(e *proto.PageFrameNavigated) bool {
+		if e.Frame.ParentID != "" {
+			return false
+		}
+		if hops++; hops > maxSelfNavigations {
+			looped.Store(true)
+			cancel()
+			return true
+		}
+		return false
+	})()
 	for {
-		err := wait()
+		err := wait(p)
+		if looped.Load() {
+			return fmt.Errorf("the page navigated more than %d times on its own while waiting; is it redirecting in a loop?", maxSelfNavigations)
+		}
 		var cdpErr *cdp.Error
 		if err == nil || !errors.As(err, &cdpErr) || !navigatedAway(cdpErr.Message) {
 			return err
@@ -217,14 +240,19 @@ func (s *Session) followNavigation(wait func() error) error {
 			return err
 		}
 		select {
-		case <-s.page.GetContext().Done():
+		case <-ctx.Done():
 			return err
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }
 
-func (s *Session) waitLoad() error { return s.followNavigation(s.page.WaitLoad) }
+// maxSelfNavigations bounds followNavigation: well above an SSO flow's hops.
+const maxSelfNavigations = 20
+
+func (s *Session) waitLoad() error {
+	return s.followNavigation(func(p *rod.Page) error { return p.WaitLoad() })
+}
 
 func navigatedAway(msg string) bool {
 	for _, m := range []string{"navigated or closed", "Execution context was destroyed", "Cannot find context"} {
@@ -251,8 +279,8 @@ func (s *Session) WaitReady(waitFor string, settle time.Duration) error {
 			return fmt.Errorf("waiting for load: %w", err)
 		}
 	default: // CSS selector
-		if err := s.followNavigation(func() error {
-			_, err := s.page.Element(waitFor)
+		if err := s.followNavigation(func(p *rod.Page) error {
+			_, err := p.Element(waitFor)
 			return err
 		}); err != nil {
 			return fmt.Errorf("waiting for selector %q: %w", waitFor, err)
