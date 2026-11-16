@@ -142,7 +142,7 @@ func JSON(w io.Writer, run *runner.Run, meta ReportMeta, flagged func(runner.Res
 		Stale: []jsonStale{},
 	}
 	if meta.Failure != nil {
-		rep.Run.Error = &jsonFailure{TestID: meta.Failure.TestID, Message: meta.Failure.Message}
+		rep.Run.Error = &jsonFailure{TestID: meta.Failure.TestID, Message: meta.failureText()}
 	}
 	tot := &rep.Run.Totals
 

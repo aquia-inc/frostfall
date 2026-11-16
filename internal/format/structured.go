@@ -1,10 +1,13 @@
 package format
 
 import (
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aquia-inc/frostfall/internal/runner"
+	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
 // ReportMeta is the run context the json and junit formats carry. The time
@@ -37,6 +40,9 @@ type ReportMeta struct {
 	// contract. It is not the informational "flagged" marker, which also
 	// covers report-only runs. Nil means nothing counts.
 	Counts func(runner.Result) bool
+	// Limit is the maxViolations the gate tolerated (0 when the contract sets
+	// none). Only the run-level junit failure reports it.
+	Limit int
 	// Redact is set when the run has auth configured, so anything the report
 	// repeats from outside this run's own scan (a baseline's stale entries) is
 	// scrubbed the way the scan's own selectors are.
@@ -160,4 +166,24 @@ func (p *scanPoint) split(meta ReportMeta) (failing, info []runner.Result, basel
 		}
 	}
 	return failing, info, baselined
+}
+
+var urlInText = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>)\]]+`)
+
+// failureText is the failure message as a report may show it. A run error is
+// free text from the browser, the auth flow or the server probe, and it can
+// quote a URL or a selector. With auth configured the report's copy is cleaned
+// the way the rest of the report is: attribute values in selectors are
+// dropped and every URL is reduced to where it points. stderr keeps the
+// original.
+func (m ReportMeta) failureText() string {
+	msg := m.Failure.Message
+	if !m.Redact {
+		return msg
+	}
+	msg = secrets.ScrubSelector(msg)
+	return urlInText.ReplaceAllStringFunc(msg, func(u string) string {
+		trimmed := strings.TrimRight(u, ".,;:!?")
+		return secrets.RedactURL(trimmed) + u[len(trimmed):]
+	})
 }

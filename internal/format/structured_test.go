@@ -626,3 +626,129 @@ func TestJSONEnforcingFlag(t *testing.T) {
 		}
 	}
 }
+
+// maxViolations: -1 is accepted by the config, and makes even a clean run
+// "over the limit": the run exits 1, so the file must hold a failure even
+// though no testcase has a violation to carry it.
+func TestJUnitRunLevelFailureWhenNoTestcaseCarriesTheGate(t *testing.T) {
+	run := &runner.Run{
+		TestsRun: 1,
+		Tests:    []runner.TestRecord{{ID: "home", Points: []runner.ScanPoint{{Label: "initial"}}}},
+	}
+	meta := structuredMeta()
+	meta.GateFailed, meta.ExitStatus, meta.Limit = true, 1, -1
+	doc, failed := junitFailures(t, run, meta)
+	if !slices.Equal(failed, []string{"gate"}) || doc.Failures != 1 || doc.Tests != 2 {
+		t.Fatalf("failed = %v, totals = %+v", failed, doc)
+	}
+	last := doc.Suites[len(doc.Suites)-1]
+	f := last.Cases[0].Failure
+	if last.Name != "run" || f == nil || f.Message != "gate failed: 0 counted violation(s) over a limit of -1" {
+		t.Errorf("run-level failure wrong: suite %q, %+v", last.Name, last.Cases)
+	}
+
+	// When a testcase already carries the failure there is no extra one.
+	meta = structuredMeta()
+	doc, failed = junitFailures(t, gateRun(), meta)
+	if len(failed) == 0 || doc.Suites[len(doc.Suites)-1].Name == "run" {
+		t.Errorf("a run-level failure was added beside real ones: %v", failed)
+	}
+}
+
+// A run error is free text and can quote a URL or a selector. With auth its
+// report copy is cleaned in json and junit; without auth it is verbatim.
+func TestRunErrorTextIsRedactedUnderAuth(t *testing.T) {
+	msg := `run error: test "home": goto https://h/cb?token=s3cr3t#access_token=f4g failed, a[href="https://h/x?k=s3cr3t"] > input missing`
+	for _, redact := range []bool{true, false} {
+		meta := structuredMeta()
+		meta.ExitStatus, meta.GateFailed, meta.Redact = 3, false, redact
+		meta.Failure = &RunFailure{TestID: "home", Message: msg}
+		var j, x bytes.Buffer
+		if err := JSON(&j, &runner.Run{}, meta, structuredFlagged); err != nil {
+			t.Fatal(err)
+		}
+		if err := JUnit(&x, &runner.Run{}, meta); err != nil {
+			t.Fatal(err)
+		}
+		for name, out := range map[string]string{"json": j.String(), "junit": x.String()} {
+			leaked := strings.Contains(out, "s3cr3t") || strings.Contains(out, "f4g")
+			switch {
+			case redact && (leaked || !strings.Contains(out, "https://h/cb")):
+				t.Errorf("%s: redacted error text is wrong (leaked=%v):\n%s", name, leaked, out)
+			case !redact && !strings.Contains(out, "s3cr3t"):
+				t.Errorf("%s: without auth the text should be verbatim:\n%s", name, out)
+			}
+		}
+	}
+}
+
+func keysOf(t *testing.T, raw json.RawMessage) []string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("not an object: %v\n%s", err, raw)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// json.Unmarshal matches keys case-insensitively, so the round-trip tests
+// cannot notice a key changing case. This pins the exact key set at every
+// level, as the schema's contract.
+func TestJSONKeyNamesArePinned(t *testing.T) {
+	meta := structuredMeta()
+	meta.Profile = "ci"
+	var buf bytes.Buffer
+	if err := JSON(&buf, structuredRun(), meta, structuredFlagged); err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(buf.Bytes(), &top); err != nil {
+		t.Fatal(err)
+	}
+	check := func(where string, raw json.RawMessage, want ...string) {
+		t.Helper()
+		if got := keysOf(t, raw); !slices.Equal(got, want) {
+			t.Errorf("%s keys = %v, want %v", where, got, want)
+		}
+	}
+	check("top level", buf.Bytes(), "run", "schemaVersion", "stale", "tests")
+	check("run", top["run"], "axeVersion", "baseUrl", "durationMs", "enforcing", "exitStatus", "mode", "profile", "standard", "startedAt", "testsRun", "toolVersion", "totals")
+	var run map[string]json.RawMessage
+	_ = json.Unmarshal(top["run"], &run)
+	check("run.totals", run["totals"], "baselined", "flagged", "new", "stale", "violations")
+
+	var tests []map[string]json.RawMessage
+	if err := json.Unmarshal(top["tests"], &tests); err != nil {
+		t.Fatal(err)
+	}
+	raw0, _ := json.Marshal(tests[0])
+	check("tests[0]", raw0, "checks", "id", "scanPoints", "uncheckedRules")
+	var points []map[string]json.RawMessage
+	_ = json.Unmarshal(tests[0]["scanPoints"], &points)
+	raw, _ := json.Marshal(points[1]) // home/modal: has a transcript
+	check("scanPoints[1]", raw, "label", "pageUrl", "transcript", "violations")
+	var viols []json.RawMessage
+	_ = json.Unmarshal(points[0]["violations"], &viols)
+	// help, helpUrl and screenshotPath are omitted when empty; the two
+	// violations here carry one each.
+	check("violations[0]", viols[0], "baselined", "fingerprint", "flagged", "help", "impact", "ruleId", "summary", "tags", "target")
+	check("violations[1]", viols[1], "baselined", "fingerprint", "flagged", "helpUrl", "impact", "ruleId", "summary", "tags", "target")
+	var stale []json.RawMessage
+	_ = json.Unmarshal(top["stale"], &stale)
+	check("stale[0]", stale[0], "fingerprint", "ruleId", "scanLabel", "stableTarget", "testId")
+
+	meta = structuredMeta()
+	meta.Failure = &RunFailure{TestID: "home", Message: "m"}
+	buf.Reset()
+	if err := JSON(&buf, &runner.Run{}, meta, structuredFlagged); err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(buf.Bytes(), &top)
+	_ = json.Unmarshal(top["run"], &run)
+	check("run.error", run["error"], "message", "testId")
+}

@@ -548,7 +548,17 @@ When a run fails before it scans (the config does not load, the browser will
 not start, the login fails), `json` and `junit` still write the report, over
 whatever file was there, so an older passing report never stands in for the
 failed run. The JSON then has `run.exitStatus` 2 or 3, `run.error`, and no
-`tests`. `text`, `html` and `sarif` leave their file alone in that case.
+`tests`. If the config itself failed to load, the run has no contract to
+describe: `run.mode` is `"unknown"` and `run.enforcing` is `false`, so scripts
+should read `run.exitStatus`, not `enforcing`, to decide pass or fail. The
+message in `run.error` is the one printed on stderr, except that with auth
+configured URLs and selector values in it are redacted. These runs still
+print `report written to <path>` on stdout. The file is written to a temp file
+and renamed, so a write that fails leaves the previous file untouched rather
+than a partial one. `text`, `html` and `sarif` leave their file alone in that
+case, and so does `--validate`. The one gap: a mistake in the flags themselves
+(an unparsable flag, or an unknown `--format`) is rejected before the format
+is known, so no report is written and an older file stays.
 
 ### JUnit
 
@@ -594,7 +604,12 @@ Standard JUnit XML for CI test dashboards: one `testsuite` per test, one
 - An **environment error** (a test that cannot load, a login redirect) is an
   `<error>` on a testcase named `run` in that test's suite. An error before
   any test ran (browser, auth, config) goes in a suite named `run`. The run
-  stops at the first such test, so the file holds only the error.
+  stops at the first such test, so the file holds only the error. (A test
+  whose id is `run` shares that suite with such an error.)
+- If the gate fails but no testcase can carry the failure (a negative
+  `maxViolations` fails the gate even with zero violations), a `run` suite
+  holds one failed testcase, `gate`, saying how many counted violations went
+  over which limit.
 - Text is escaped by `encoding/xml`: selectors containing `<`, `&`, quotes,
   or `]]>` are safe.
 

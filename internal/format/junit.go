@@ -18,7 +18,9 @@ import (
 // total is over maxViolations; once the run is over, every testcase holding a
 // counted violation fails. Everything else (report-only runs, violations under
 // the enforced severity, a tolerated total, baselined ones) goes in system-out
-// as information. An environment error that stops the run is an <error>.
+// as information. If the gate fails with no testcase to carry it (a negative
+// maxViolations), a run-level failure in a suite named "run" stands in. An
+// environment error that stops the run is an <error>.
 // Screen reader transcripts are evidence, not results: they go in system-out.
 // All text goes through encoding/xml, so selectors with <, & or quotes are
 // escaped.
@@ -90,30 +92,51 @@ func JUnit(w io.Writer, run *runner.Run, meta ReportMeta) error {
 		out.Suites = append(out.Suites, s)
 	}
 
+	// The gate failed but no testcase carries the failure (maxViolations: -1
+	// makes even zero violations "over the limit"): the file must still say
+	// so, or it would be green on a run that exits 1.
+	if meta.GateFailed && meta.Failure == nil {
+		failed := 0
+		for _, s := range out.Suites {
+			failed += s.Failures
+		}
+		if failed == 0 {
+			n := 0
+			if meta.Counts != nil {
+				for _, r := range run.Results {
+					if !r.Baselined && meta.Counts(r) {
+						n++
+					}
+				}
+			}
+			msg := fmt.Sprintf("gate failed: %d counted violation(s) over a limit of %d", n, meta.Limit)
+			s := runSuite(&out, "run", stamp)
+			s.Cases = append(s.Cases, junitCase{
+				Name:      "gate",
+				Classname: "run",
+				Failure:   &junitProblem{Message: msg, Type: "accessibility", Body: msg},
+			})
+			s.Tests++
+			s.Failures++
+		}
+	}
+
 	if f := meta.Failure; f != nil {
 		// The run stopped at this test, so nothing after it ran and what ran
 		// before it was not kept. The error stands in for the scan points the
-		// test never reached.
-		// A failure before any test ran (browser, auth, config) names no test:
-		// it goes in a suite called "run", never a suite with an empty name.
+		// test never reached. A failure before any test ran (browser, auth,
+		// config) names no test: it goes in a suite called "run", never a suite
+		// with an empty name.
 		id := f.TestID
 		if id == "" {
 			id = "run"
 		}
-		var s *junitSuite
-		for i := range out.Suites {
-			if out.Suites[i].Name == id {
-				s = &out.Suites[i]
-			}
-		}
-		if s == nil {
-			out.Suites = append(out.Suites, junitSuite{Name: id, Timestamp: stamp})
-			s = &out.Suites[len(out.Suites)-1]
-		}
+		s := runSuite(&out, id, stamp)
+		text := meta.failureText()
 		s.Cases = append(s.Cases, junitCase{
 			Name:      "run",
 			Classname: id,
-			Error:     &junitProblem{Message: f.Message, Type: "environment", Body: f.Message},
+			Error:     &junitProblem{Message: text, Type: "environment", Body: text},
 		})
 		s.Tests++
 		s.Errors++
@@ -161,4 +184,15 @@ func junitOutput(p *scanPoint, info []runner.Result, baselined int) string {
 		}
 	}
 	return b.String()
+}
+
+// runSuite returns the suite named id, adding it when there is none yet.
+func runSuite(out *junitSuites, id, stamp string) *junitSuite {
+	for i := range out.Suites {
+		if out.Suites[i].Name == id {
+			return &out.Suites[i]
+		}
+	}
+	out.Suites = append(out.Suites, junitSuite{Name: id, Timestamp: stamp})
+	return &out.Suites[len(out.Suites)-1]
 }

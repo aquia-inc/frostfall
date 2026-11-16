@@ -7,8 +7,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -90,10 +92,6 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "unknown format %q (available: text, html, sarif, json, junit)\n", *formatName)
 		return exitBadConfig
 	}
-	if fs.Lookup("watch").Value.String() == "true" {
-		fmt.Fprintln(os.Stderr, "--watch is not implemented yet")
-		return exitBadConfig
-	}
 	if *dryRun {
 		// A dry run only lists what the crawl finds: it has no scan to dry-run
 		// on its own, and nothing it could write. --format has a default, so
@@ -125,10 +123,6 @@ func run(args []string) int {
 			return exitBadConfig
 		}
 	}
-	if *updateBaseline && (*idFilter != "" || *pathFilter != "") {
-		fmt.Fprintln(os.Stderr, "--update-baseline cannot be combined with --id/--path: a filtered update would drop baseline entries for the excluded tests")
-		return exitBadConfig
-	}
 
 	started := time.Now()
 	structured := *formatName == "json" || *formatName == "junit"
@@ -144,14 +138,24 @@ func run(args []string) int {
 	// way every failure does and, for json and junit, writes a failure report
 	// over the output path. Otherwise an older report from a passing run would
 	// still sit there and read as this run's result. text, html and sarif
-	// leave their file alone, as they always have.
+	// leave their file alone, as they always have, and so does --validate,
+	// which never writes a report.
 	abort := func(code int, message string) int {
 		fmt.Fprintln(os.Stderr, message)
-		if structured {
+		if structured && !*validateOnly {
 			reportFailure(*formatName, *outputPath, cfg, tests, base, profileReq, started, code, &format.RunFailure{Message: message})
 		}
 		return code
 	}
+	// From here the format and output path are known, so these flag mistakes
+	// go through abort: a json or junit report must not keep an older result.
+	if fs.Lookup("watch").Value.String() == "true" {
+		return abort(exitBadConfig, "--watch is not implemented yet")
+	}
+	if *updateBaseline && (*idFilter != "" || *pathFilter != "") {
+		return abort(exitBadConfig, "--update-baseline cannot be combined with --id/--path: a filtered update would drop baseline entries for the excluded tests")
+	}
+
 	if *showVersion {
 		fmt.Printf("frostfall %s (axe-core %s)\n", version, axe.New().Version())
 		return exitOK
@@ -323,18 +327,21 @@ func run(args []string) int {
 		tests = append(tests, discovered...)
 	}
 
-	// Execute may add discovered tests, so the contract is read from the final
-	// list. The abort path below and the exit code both use it.
+	// The contract is read from the final test list (discovered tests are
+	// already in it). The run-error report below and the exit code both use
+	// it; the aborts above, which happen before discovery finishes, work it
+	// out from the tests known by then.
 	exp, perTest, enforcing := expectContract(cfg, tests)
 
 	res, err := r.Execute(context.Background(), tests)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "run error:", err)
+		runErr := "run error: " + err.Error()
+		fmt.Fprintln(os.Stderr, runErr)
 		// json and junit exist for CI to read, and an environment error is
 		// something CI must be able to read there too. The run has no results,
 		// only the error, in the same words stderr has just printed.
 		if structured {
-			failure := &format.RunFailure{Message: err.Error()}
+			failure := &format.RunFailure{Message: runErr}
 			var terr *runner.TestError
 			if errors.As(err, &terr) {
 				failure.TestID = terr.TestID
@@ -351,8 +358,7 @@ func run(args []string) int {
 		f := r.ToBaseline(res)
 		f.Created = time.Now().UTC()
 		if err := f.Save(bp); err != nil {
-			fmt.Fprintln(os.Stderr, "baseline error:", err)
-			return exitEnvironment
+			return abort(exitEnvironment, "baseline error: "+err.Error())
 		}
 		fmt.Printf("baseline written to %s (%d violations accepted)\n", bp, len(f.Violations))
 		return exitOK
@@ -387,8 +393,8 @@ func run(args []string) int {
 	// so it reuses this decision instead of making its own.
 	counted := func(v runner.Result) bool { return enforcing && runner.Failing(v, exp, perTest) }
 	exitCode := exitOK
+	limit := 0
 	if enforcing {
-		limit := 0
 		if exp.MaxViolations != nil {
 			limit = *exp.MaxViolations
 		}
@@ -449,6 +455,7 @@ func run(args []string) int {
 		meta.Enforcing = enforcing
 		meta.GateFailed = exitCode == exitViolations
 		meta.Counts = counted
+		meta.Limit = limit
 		meta.Redact = cfg.Auth != nil
 		if ferr := writeStructured(*formatName, *outputPath, res, meta, flagged); ferr != nil {
 			fmt.Fprintln(os.Stderr, "report error:", ferr)
@@ -543,23 +550,42 @@ func writeStructured(formatName, out string, res *runner.Run, meta format.Report
 	if out == "" {
 		out = reportFiles[formatName]
 	}
-	f, err := os.Create(out)
-	if err != nil {
-		return err
-	}
-	if formatName == "junit" {
-		err = format.JUnit(f, res, meta)
-	} else {
-		err = format.JSON(f, res, meta, flagged)
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
+	err := writeFileAtomic(out, func(w io.Writer) error {
+		if formatName == "junit" {
+			return format.JUnit(w, res, meta)
+		}
+		return format.JSON(w, res, meta, flagged)
+	})
 	if err != nil {
 		return err
 	}
 	fmt.Printf("report written to %s\n", out)
 	return nil
+}
+
+// writeFileAtomic renders into a temp file in out's directory and renames it
+// into place, so a render or write that fails midway leaves the previous file
+// as it was, never a partial one, and no temp file behind.
+func writeFileAtomic(out string, render func(io.Writer) error) error {
+	f, err := os.CreateTemp(filepath.Dir(out), "."+filepath.Base(out)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	err = render(f)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, out)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 // writeGitHubOutputs exposes run counts as job outputs when running in
