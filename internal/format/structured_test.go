@@ -759,6 +759,7 @@ var runErrorCases = []struct {
 		want:   "found [redacted] on the page",
 	},
 	{name: "unchanged id selector", msg: "wait for #login timed out"},
+	{name: "unchanged unset-variable hint", msg: "run error: auth setup: still on the login page /login.html after 2 step(s) (A11Y_USER, A11Y_PASS were unset and filled empty)"},
 	{name: "unchanged browser error", msg: "browser error: chrome failed to start: exit status 1"},
 	{name: "unchanged config error", msg: "config error: tests[0].path is required"},
 	{name: "unchanged landing error", msg: `run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired`},

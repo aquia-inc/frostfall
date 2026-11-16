@@ -124,7 +124,10 @@ func run(args []string) int {
 	}
 
 	started := time.Now()
-	structured := *formatName == "json" || *formatName == "junit"
+	// The dry-run checks above return before abort exists, so a refused dry
+	// run writes nothing. An accepted one cannot name json or junit either;
+	// !*dryRun says outright that a dry run never writes a report.
+	structured := (*formatName == "json" || *formatName == "junit") && !*dryRun
 	// What is known so far, for a failure report: config and tests are filled
 	// in as the run gets that far.
 	var (

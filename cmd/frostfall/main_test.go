@@ -191,6 +191,49 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 			}
 		})
 	}
+
+	// The hint reaches the json and junit failure reports too: it carries no
+	// '=', '@', '?' or '#', so the report copy's redaction (auth is on) keeps
+	// it word for word.
+	for _, formatName := range []string{"json", "junit"} {
+		out := filepath.Join(dir, "report."+formatName)
+		code, _, stderr := runBoth(t, "--config", good, "--profile", "none", "--no-screenshots", "--baseline", "none", "--format", formatName, "--output", out)
+		if code != exitEnvironment || !strings.Contains(stderr, hint) {
+			t.Fatalf("%s: exit = %d, stderr = %q, want %d and the hint", formatName, code, stderr, exitEnvironment)
+		}
+		report, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(report), hint) || strings.Contains(string(report), secret) {
+			t.Errorf("%s report lacks the hint or carries the secret:\n%s", formatName, report)
+		}
+		if formatName != "json" {
+			continue
+		}
+		// The whole line, not only the hint, is the one stderr printed.
+		var line string
+		for _, l := range strings.Split(stderr, "\n") {
+			if strings.Contains(l, hint) {
+				line = l
+			}
+		}
+		var doc struct {
+			Run struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(report, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if strings.ContainsAny(line, "=@?#") {
+			t.Logf("stderr line has a character the redaction cuts, skipping the exact match: %q", line)
+		} else if doc.Run.Error.Message != line {
+			t.Errorf("json run.error.message = %q, want the stderr line %q", doc.Run.Error.Message, line)
+		}
+	}
 }
 
 // A literal password in a profile that is not selected still reaches stderr
@@ -585,6 +628,48 @@ func TestDryRunNeedsDiscoverAndNothingThatWrites(t *testing.T) {
 		if code != exitBadConfig || !strings.Contains(stderr, tc.want) || stdout != "" {
 			t.Errorf("%v: exit code = %d, stdout = %q, stderr = %q, want exit %d and %q", tc.args, code, stdout, stderr, exitBadConfig, tc.want)
 		}
+	}
+}
+
+// A dry run never writes a report. Refusing --format json or junit, or
+// --output, is exit 2 with the dry-run message, found before the config is
+// read, and existing json and junit reports (and an --output file) are left
+// byte for byte as they were, with nothing new beside them.
+func TestDiscoverDryRunWritesNoReport(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	files := map[string]string{
+		"frostfall.json":      `{"previous":"json"}`,
+		"frostfall-junit.xml": "<previous/>",
+		"x.json":              `{"previous":"x"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(name, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	missing := filepath.Join(dir, "missing.yml") // never read: the flags are refused first
+	for _, extra := range [][]string{
+		{"--format", "json"},
+		{"--format", "junit"},
+		{"--output", "x.json"},
+		{"--format", "json", "--output", "x.json"},
+		{"--format", "junit", "--output", "new.xml"},
+	} {
+		args := append([]string{"--config", missing, "--discover", "--dry-run"}, extra...)
+		code, stdout, stderr := runBoth(t, args...)
+		if code != exitBadConfig || stdout != "" || !strings.Contains(stderr, "--format and --output have no effect") {
+			t.Errorf("%v: exit = %d, stdout = %q, stderr = %q, want exit %d and the dry-run message", extra, code, stdout, stderr, exitBadConfig)
+		}
+		if strings.Contains(stderr, "config error") {
+			t.Errorf("%v: the config was read: %q", extra, stderr)
+		}
+		for name, body := range files {
+			if b, err := os.ReadFile(name); err != nil || string(b) != body {
+				t.Errorf("%v: %s = %q (%v), want it untouched", extra, name, b, err)
+			}
+		}
+		onlyEntries(t, dir, "frostfall.json", "frostfall-junit.xml", "x.json")
 	}
 }
 
