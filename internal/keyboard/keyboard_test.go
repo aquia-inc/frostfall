@@ -149,6 +149,51 @@ func TestKeyboardAudit(t *testing.T) {
 			want: map[string][]string{keyboard.RuleHidden: {"#r1"}},
 		},
 		{
+			// The only tab stop is a labelled hidden radio with no indicator:
+			// Tab comes straight back to it, so only the blurring lap can judge.
+			name: "lone hidden radio, nothing shows focus",
+			body: `<style>.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }</style>
+				<label id="l1"><input type="radio" name="t" id="r1" class="sr-only" checked> Light</label>`,
+			want: map[string][]string{keyboard.RuleHidden: {"#r1"}},
+		},
+		{
+			// A label off screen cannot show focus, and has no pixels to judge.
+			name: "hidden radio, label off screen",
+			body: `<style>.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }</style>
+				<button id="ok">ok</button>
+				<label id="l1" style="position: absolute; left: -9999px"><input type="radio" name="t" id="r1" class="sr-only"> Light</label>`,
+			want: map[string][]string{keyboard.RuleHidden: {"#r1"}},
+		},
+		{
+			// The label lights up for its checkbox (:focus-within), not for a
+			// hidden link that sits inside it.
+			name: "hidden link inside a checkbox's label",
+			body: `<style>.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+				label:focus-within { outline: 2px solid blue; outline-offset: 2px; }</style>
+				<button id="ok">ok</button>
+				<label><input type="checkbox" id="cb"> I agree to the <a href="#t" id="terms" class="sr-only">terms</a></label>`,
+			want: map[string][]string{keyboard.RuleHidden: {"#terms"}},
+		},
+		{
+			// A focus trap pulls focus back as soon as it leaves, as MUI's does:
+			// the blurred capture still shows the ring, so it cannot judge, and
+			// a ring that appears late must not be reported as missing.
+			name: "trap pulls focus back after blur",
+			body: `<style>button { outline: 2px solid transparent; outline-offset: 2px; }
+				button:focus-visible { outline-color: blue; transition: outline-color 0s 200ms; }</style>
+				<div role="dialog" aria-modal="true" id="dlg"><button id="a">a</button><button id="b">b</button></div>
+				<script>
+				// Wraps Tab from the last button to the first, and puts focus back
+				// when it falls to the body.
+				b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })
+				document.addEventListener('focusout', e => setTimeout(() => {
+					if (document.activeElement === document.body) e.target.focus()
+				}, 0))
+				a.focus()
+				</script>`,
+			want: map[string][]string{},
+		},
+		{
 			name: "Tab swallowed",
 			body: `<button id="ok">ok</button><input id="eat"><button id="after">after</button>
 				<script>eat.addEventListener('keydown', e => { if (e.key === 'Tab') e.preventDefault() })</script>`,
@@ -288,5 +333,29 @@ func TestAuditReturnsFocusToPage(t *testing.T) {
 	}
 	if string(raw) != "true" {
 		t.Error("after audit, the page does not have focus")
+	}
+}
+
+// A suspect the confirming lap could not judge leaves only its own rule
+// unchecked: focus-hidden was fully evaluated on a page with no hidden stops.
+func TestUnjudgedSuspectChecksOnlyItsRule(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	res := auditResult(t, `<style>button { outline: 2px solid transparent; outline-offset: 2px; }
+		button:focus-visible { outline-color: blue; transition: outline-color 0s 200ms; }</style>
+		<div role="dialog" aria-modal="true" id="dlg"><button id="a">a</button><button id="b">b</button></div>
+		<script>
+		b.addEventListener('keydown', e => { if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); a.focus() } })
+		document.addEventListener('focusout', e => setTimeout(() => {
+			if (document.activeElement === document.body) e.target.focus()
+		}, 0))
+		a.focus()
+		</script>`, keyboard.Options{})
+	if !slices.Contains(res.Unchecked, keyboard.RuleNotVisible) {
+		t.Errorf("unchecked = %v, want focus-not-visible: the trap kept the lap from judging", res.Unchecked)
+	}
+	if slices.Contains(res.Unchecked, keyboard.RuleHidden) {
+		t.Errorf("unchecked = %v: no hidden stop went unjudged, so focus-hidden was checked", res.Unchecked)
 	}
 }

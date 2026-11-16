@@ -86,9 +86,11 @@
   }
 
   // A visually hidden native input (sr-only) draws its focus on its label;
-  // visibility is judged there rather than on the 1px input.
+  // visibility is judged there rather than on the 1px input. Only the element's
+  // own labels count (el.labels covers a wrapping label too): a hidden link that
+  // merely sits inside a checkbox's label is not drawn by it.
   function labelOf(el) {
-    const label = (el.labels && el.labels[0]) || el.closest('label');
+    const label = el.labels && el.labels[0];
     return label && hasSize(label) ? label : null;
   }
 

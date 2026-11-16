@@ -209,10 +209,16 @@ func (s *Session) waitLoad() error {
 		if err == nil || !errors.As(err, &cdpErr) || !navigatedAway(cdpErr.Message) {
 			return err
 		}
-		if ctxErr := s.page.GetContext().Err(); ctxErr != nil {
+		// CDP's message is the same for a target that closed or crashed: only
+		// one that still exists navigated, and only that is worth waiting on.
+		if _, infoErr := (proto.TargetGetTargetInfo{TargetID: s.page.TargetID}).Call(s.page); infoErr != nil {
 			return err
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-s.page.GetContext().Done():
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
