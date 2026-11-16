@@ -363,10 +363,12 @@ in GitHub Actions: a profile that dropped auth would silently turn off the signe
 URL and selector redaction for every CI run. A test that should run signed out sets `auth: false`
 on itself instead. The check walks the document, `profiles` and each profile through aliases and
 merge keys (`<<`) with the decoder's precedence, and compares keys as the decoder decodes them, so
-an alias key or a `!!binary` key that decodes to `auth` counts as `auth`. A profile name must
-resolve to a string: yaml.v3 records an unquoted `2024`, `1.5`, `true`, date or null key in its own
-type but looks merged keys up as strings, so a merged profile would replace an explicit one of the
-same name, and such names are a config error that says to quote them. The walk only produces the
+an alias key or a `!!binary` key that decodes to `auth` counts as `auth`. When `profiles` or the
+document root uses a merge key, a profile name must resolve to a string: yaml.v3 records an unquoted
+`2024`, `1.5`, `true`, date or null key in its own type but looks merged keys up as strings, so a
+merged profile would replace an explicit one of the same name, and such names are a config error
+that says to quote them. Without a merge key the quirk cannot arise and those names load as they
+always have, so released configs keep working. The walk only produces the
 error message. The safety comes from `applyProfile`, which inherits the top-level block whenever
 the decoded profile auth is nil, so a removal the walk missed would keep auth, never drop it. The
 walk expands each mapping once, so alias diamonds stay linear (it runs before the decoder's

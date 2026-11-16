@@ -479,9 +479,10 @@ enforcement for CI, and a `local` profile under an enforcing base can relax
 back to report-only with `expect: {}`. That restriction is the point: a second config file lets the
 test list drift until CI silently covers less than local. With profiles, one
 test list serves every environment by construction. Precedence is base config,
-then profile, then command-line flags. A profile name is a string: quote one
+then profile, then command-line flags. If `profiles:` or the top level of the
+config uses a YAML merge key (`<<`), profile names must be strings: quote one
 that YAML would read as a number, date, boolean or null (`"2024":`), or the
-config is rejected.
+config is rejected. Without a merge key such names load as they are.
 
 A profile's `auth` replaces the top-level block as a whole, the way `server`
 does; the two are never merged, so the profile restates `signedIn`, `loginPath`

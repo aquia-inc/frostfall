@@ -582,12 +582,15 @@ func Load(path, profile string) (*Config, error) {
 // checkProfiles rejects, in every profile, selected or not, what the
 // decoder would get wrong or silently accept:
 //
-//   - A profile name that is not a string (2024, 1.5, true, a date, null).
+//   - A profile name that is not a string (2024, 1.5, true, a date, null),
+//     when the profiles mapping or the document root uses a merge key.
 //     yaml.v3 records an explicit key in its own scalar type (the int 2024)
 //     but looks merged keys up as strings ("2024"), so a merged profile of
 //     the same name replaces the explicit one, the reverse of the rule
 //     everywhere else, and this walk and the decoder would disagree about
-//     what the profile holds. Quoting the name ("2024") avoids it.
+//     what the profile holds. Quoting the name ("2024") avoids it. Without
+//     a merge the quirk cannot arise, so such names load as they always
+//     have.
 //   - A profile whose auth is null or a scalar rather than a block. Decoded,
 //     `auth: null` leaves the pointer nil, which applyProfile reads as
 //     "inherit"; a profile that could turn auth off would drop the signed-in
@@ -604,14 +607,19 @@ func checkProfiles(text string) error {
 	if yaml.Unmarshal([]byte(text), &doc) != nil || len(doc.Content) == 0 {
 		return nil
 	}
-	profiles := effectivePairs(effectiveAt(doc.Content[0], "profiles"))
-	for _, p := range profiles {
-		if p.keyNode.ShortTag() != "!!str" {
-			text := p.keyNode.Value
-			if text == "" {
-				text = "null"
+	root := doc.Content[0]
+	profilesNode := effectiveAt(root, "profiles")
+	profiles := effectivePairs(profilesNode)
+	if hasMergeKey(root) || hasMergeKey(profilesNode) {
+		for _, p := range profiles {
+			if p.keyNode.ShortTag() != "!!str" {
+				text := p.keyNode.Value
+				if text == "" {
+					text = "null"
+				}
+				return fmt.Errorf("line %d: profile name %s must be a string; quote it "+
+					"(profile names must be strings when merge keys are used)", p.keyNode.Line, text)
 			}
-			return fmt.Errorf("line %d: profile name %s must be a string; quote it", p.keyNode.Line, text)
 		}
 	}
 	var names []string

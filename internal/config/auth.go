@@ -364,6 +364,21 @@ func isMergeKey(k *yaml.Node) bool {
 	return k.Kind == yaml.ScalarNode && k.Value == "<<" && (k.Tag == "" || k.Tag == "!" || k.ShortTag() == "!!merge")
 }
 
+// hasMergeKey reports whether n, alias-resolved, is a mapping with a merge
+// key (<<) of its own.
+func hasMergeKey(n *yaml.Node) bool {
+	n = resolveAlias(n)
+	if n == nil || n.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if isMergeKey(n.Content[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // keyName decodes a mapping key to the field or map key the decoder would
 // see: an alias is followed and the scalar decoded as a string, so
 // `!!binary YXV0aA==` is "auth". A key that does not decode keeps its text.

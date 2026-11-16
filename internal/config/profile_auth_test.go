@@ -302,22 +302,47 @@ func TestCheckProfilesDecodesKeys(t *testing.T) {
 	})
 }
 
-// A profile name that is not a string is a config error: yaml.v3 handles a
+// A profile name that is not a string is a config error when the profiles
+// mapping or the document root uses a merge key: yaml.v3 handles a
 // non-string key differently under a merge, so the walk and the decoder
-// could disagree about the profile. Quoted, the same name works.
+// could disagree about the profile. Without a merge the quirk cannot arise
+// and such names load as they always have. Quoted, the name always works.
 func TestProfileNameMustBeAString(t *testing.T) {
+	profile := "    defaults:\n      standard: section508\n"
 	for _, name := range []string{"2024", "1.5", "2024-01-01", "true", "~", "!!int 7"} {
 		t.Run(name, func(t *testing.T) {
-			path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+name+":\n    defaults:\n      standard: section508\n")
+			plain := profileAuthBase + "profiles:\n  " + name + ":\n" + profile
+			if _, err := Load(writeConfigIn(t, t.TempDir(), plain), ProfileNone); err != nil {
+				t.Errorf("without a merge key: %v", err)
+			}
+
 			line := strings.Count(profileAuthBase, "\n") + 2
-			want := fmt.Sprintf("line %d: profile name %s must be a string; quote it", line, strings.TrimPrefix(name, "!!int "))
-			for _, req := range []string{ProfileNone, "ci"} {
-				if _, err := Load(path, req); err == nil || !strings.Contains(err.Error(), want) {
-					t.Errorf("profile %q: err = %v, want %q", req, err, want)
+			want := fmt.Sprintf("line %d: profile name %s must be a string; quote it (profile names must be strings when merge keys are used)",
+				line, strings.TrimPrefix(name, "!!int "))
+			for where, body := range map[string]string{
+				"profiles merge": profileAuthBase + "profiles:\n  " + name + ":\n" + profile + "  <<: { other: { defaults: { standard: wcag21aa } } }\n",
+				"root merge":     profileAuthBase + "profiles:\n  " + name + ":\n" + profile + "<<: { baseline: none }\n",
+			} {
+				path := writeConfigIn(t, t.TempDir(), body)
+				for _, req := range []string{ProfileNone, "ci"} {
+					if _, err := Load(path, req); err == nil || !strings.Contains(err.Error(), want) {
+						t.Errorf("%s, profile %q: err = %v, want %q", where, req, err, want)
+					}
 				}
 			}
 		})
 	}
+	t.Run("selectable without a merge", func(t *testing.T) {
+		for name, req := range map[string]string{"2024": "2024", "true": "true", "1.5": "1.5"} {
+			cfg, err := Load(writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+name+":\n"+profile), req)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if cfg.Defaults.Standard != "section508" {
+				t.Errorf("%s: profile not applied: standard = %q", name, cfg.Defaults.Standard)
+			}
+		}
+	})
 	t.Run("merged", func(t *testing.T) {
 		path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  <<: { 2024: { defaults: { standard: section508 } } }\n")
 		if _, err := Load(path, ProfileNone); err == nil || !strings.Contains(err.Error(), "profile name 2024 must be a string") {
@@ -326,7 +351,7 @@ func TestProfileNameMustBeAString(t *testing.T) {
 	})
 	t.Run("quoted", func(t *testing.T) {
 		for _, quoted := range []string{`"2024"`, `'true'`, `!!str 1.5`} {
-			path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+quoted+":\n    defaults:\n      standard: section508\n")
+			path := writeConfigIn(t, t.TempDir(), profileAuthBase+"profiles:\n  "+quoted+":\n"+profile+"  <<: { other: { defaults: { standard: wcag21aa } } }\n")
 			want := strings.Trim(strings.TrimPrefix(quoted, "!!str "), `"'`)
 			cfg, err := Load(path, want)
 			if err != nil {
