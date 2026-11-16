@@ -894,6 +894,8 @@ comm -23 discovered.txt listed.txt   # found by the crawl, not in the config
 
 With `auth` configured the listing is discovery's own cleaned output, so it
 carries no query, `;param` or token, and a credential-looking path is left out.
+A path with a control character in it (a link that decodes to a newline) would
+print as two lines, so it is skipped signed in or out, and stderr says how many.
 
 ## Screenshots
 

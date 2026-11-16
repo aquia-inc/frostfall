@@ -11,7 +11,9 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aquia-inc/frostfall/internal/appname"
 	"github.com/aquia-inc/frostfall/internal/baseline"
@@ -627,9 +629,12 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 		fmt.Fprintln(os.Stderr, "discover error:", err)
 		return exitEnvironment
 	}
-	out, uncovered := dryRunListing(paths, cfg.Auth != nil, cfg.Tests)
+	out, uncovered, skipped := dryRunListing(paths, cfg.Auth != nil, cfg.Tests)
 	for _, p := range out {
 		fmt.Println(p)
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "skipped %d path(s) with a control character in them (a newline would split the listing)\n", skipped)
 	}
 	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
 	return exitOK
@@ -644,13 +649,21 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 // misreads a literal % as a bad escape and a leading // as a host. What is
 // kept is MaskSegments, which works on the text and never parses. The count is
 // of printed lines, after the dedupe, so it cannot exceed the number listed.
-func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered int) {
+//
+// A path with a control character in it (a %0A in a link decodes to a real
+// newline) would print as two lines, signed in or out: it is skipped, not
+// listed or counted, and skipped says how many so the caller can report it.
+func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered, skipped int) {
 	covered := map[string]bool{}
 	for _, t := range tests {
 		covered[t.Path] = true
 	}
 	listed := map[string]bool{}
 	for _, p := range paths {
+		if strings.ContainsFunc(p, unicode.IsControl) {
+			skipped++
+			continue
+		}
 		if auth {
 			p = secrets.MaskSegments(p)
 		}
@@ -664,7 +677,7 @@ func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []stri
 		lines = append(lines, p)
 	}
 	sort.Strings(lines)
-	return lines, uncovered
+	return lines, uncovered, skipped
 }
 
 // runInit detects the project in the working directory and writes a tailored

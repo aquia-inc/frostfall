@@ -579,7 +579,7 @@ func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
 		{ID: "a", Path: "/a"},
 		{ID: "abs", URL: "http://example.test/c"},
 	}
-	lines, uncovered := dryRunListing([]string{"/", "/a", "/b", "/b", "/c"}, false, tests)
+	lines, uncovered, _ := dryRunListing([]string{"/", "/a", "/b", "/b", "/c"}, false, tests)
 	if want := []string{"/", "/a", "/b", "/c"}; !slices.Equal(lines, want) {
 		t.Errorf("lines = %q, want %q", lines, want)
 	}
@@ -588,9 +588,25 @@ func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
 	}
 	// Duplicates that are not covered are counted once, so the count cannot
 	// exceed the pages listed.
-	lines, uncovered = dryRunListing([]string{"/x", "/x", "/x"}, false, nil)
+	lines, uncovered, _ = dryRunListing([]string{"/x", "/x", "/x"}, false, nil)
 	if len(lines) != 1 || uncovered != 1 {
 		t.Errorf("lines = %q, uncovered = %d, want one line and 1", lines, uncovered)
+	}
+}
+
+// A path with a control character in it would print as more than one line, so
+// it is skipped, not listed, not counted as a page, and counted as skipped.
+// That holds signed in and out, and for any control character, not just \n.
+func TestDryRunListingSkipsControlCharacters(t *testing.T) {
+	paths := []string{"/alpha\n/beta", "/ok", "/tab\there", "/cr\r", "/nul\x00", "/ok2"}
+	for _, auth := range []bool{false, true} {
+		lines, uncovered, skipped := dryRunListing(paths, auth, nil)
+		if want := []string{"/ok", "/ok2"}; !slices.Equal(lines, want) {
+			t.Errorf("auth=%v: lines = %q, want %q", auth, lines, want)
+		}
+		if uncovered != 2 || skipped != 4 {
+			t.Errorf("auth=%v: uncovered = %d, skipped = %d, want 2 and 4", auth, uncovered, skipped)
+		}
 	}
 }
 
@@ -600,7 +616,7 @@ func TestDryRunListingCountsAgainstAllTestsAfterDedupe(t *testing.T) {
 // is a secret by shape is still masked, so a token cannot be printed.
 func TestDryRunListingAuthKeepsDecodedPathsAndMasksTokens(t *testing.T) {
 	const token = "0123456789abcdef0123456789abcdef"
-	lines, _ := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
+	lines, _, _ := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
 	want := []string{"//x", "/100%", "/50%/off", "/reset/[redacted]"}
 	if !slices.Equal(lines, want) {
 		t.Errorf("lines = %q, want %q", lines, want)
@@ -664,7 +680,11 @@ func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
 		}
 		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main>`+marker)
 		if r.URL.Path == "/" {
-			for _, l := range []string{"/100%25", "/%2Fx", "/reports?token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain"} {
+			for _, l := range []string{"/100%25", "/%2Fx", "/reports?token=" + secret, "/reset/0123456789abcdef0123456789abcdef", "/plain",
+				// The same secret smuggled past the query and path checks: a
+				// %23 that decodes to a #, a %3F and %3D double-encoded, and a
+				// %0A that would split a printed line. A real hash route stays.
+				"/a%23" + secret, "/reports%253Ftoken%253D" + secret, "/alpha%0A/beta", "/#/app/page"} {
 				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
 			}
 		}
@@ -689,7 +709,10 @@ func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
 	if strings.Contains(stdout+stderr, secret) || strings.Contains(stdout, "0123456789abcdef") {
 		t.Errorf("a token was printed: stdout = %q, stderr = %q", stdout, stderr)
 	}
-	if want := "/\n//x\n/100%\n/plain\n/reports\n"; stdout != want {
+	if want := "/\n/#/app/page\n//x\n/100%\n/plain\n/reports\n"; stdout != want {
 		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if !strings.Contains(stderr, "skipped 1 path(s) with a control character") || strings.Contains(stderr, "alpha") {
+		t.Errorf("stderr = %q, want a count of the skipped path and not the path", stderr)
 	}
 }
