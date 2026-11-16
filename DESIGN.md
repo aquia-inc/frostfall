@@ -493,7 +493,15 @@ dedupe by shape (`/items/1` and `/items/999` are one route, one representative s
 path collision, but only a test with a `path:` can: a test with an absolute `url:` never covers a
 discovered page, so its page can still be discovered and scanned a second time. `--dry-run` lists the crawl's
 paths without scanning and counts coverage the same way, against every test in the config
-(`--id`/`--path` do not narrow it). Discovery is additive to the config, not a replacement — the recommended shape is a
+(`--id`/`--path` do not narrow it). Signed in, the listing fails closed at the print boundary
+rather than trusting the crawl's cleaning: a path with any of `%`, `?`, `;`, `&`, `=`, or a `#` that
+is not a single `#/` hash route, is skipped and counted on stderr, never printed. Decoding layer by
+layer to look for a hidden credential was tried and has no stopping point (a stray `%` ends the
+decode, and each new encoding needs a new check), while a character rule has nothing to decode. The
+cost is that a signed-in `/100%` is skipped too; `//x` still prints. A plain secret in an ordinary
+segment (`/a/s3cr3t`) carries none of those characters and is not caught. A path with a control
+character is skipped signed in or out, since it would print as more than one line.
+Discovery is additive to the config, not a replacement — the recommended shape is a
 handful of explicit stateful tests plus discovery for coverage breadth. (Next.js routes-manifest
 parsing is future work, §10.)
 

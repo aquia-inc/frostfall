@@ -153,17 +153,6 @@ var pathParams = regexp.MustCompile(`;[^/]*`)
 // like it carries a credential, by name (credentialMarks) or by shape
 // (tokenLike), is rejected. Without auth nothing is changed: discovery output
 // stays as it always was.
-//
-// Two more things are rejected, because the path has already been decoded once
-// (a link's %23 is a '#' here, a %3F a '?') and a secret can hide in what is
-// left. A '#' that does not start a hash route (#/...) is not a fragment that
-// RouteKey kept, it is a decoded %23: the path is rejected rather than cut,
-// since cutting would turn /a%23secret into /a, a page the link never named.
-// And the path is decoded once more on a copy, used for checking only (the
-// path itself is returned as it was, so a literal % or a leading // survive):
-// if that copy holds a '?' or a stray '#', or a credential name or shape, the
-// link was double-encoded to get past the checks above. A path that does not
-// decode (a literal %) is checked as written, not refused for that.
 func cleanAuthPath(p string) (string, bool) {
 	route, hash, hasHash := strings.Cut(p, "#")
 	if i := strings.IndexByte(route, '?'); i >= 0 {
@@ -174,9 +163,6 @@ func cleanAuthPath(p string) (string, bool) {
 		route = "/"
 	}
 	if hasHash {
-		if !strings.HasPrefix(hash, "/") {
-			return "", false
-		}
 		if i := strings.IndexAny(hash, "#?&="); i >= 0 {
 			hash = hash[:i]
 		}
@@ -184,44 +170,18 @@ func cleanAuthPath(p string) (string, bool) {
 			route += "#" + hash
 		}
 	}
-	if !credentialFree(route) {
-		return "", false
-	}
-	// Peel further layers of encoding off copies of the route and its hash
-	// route, checking each, until they stop changing or stop decoding (a
-	// literal %). A chain longer than a few layers is not a link anyone wrote,
-	// so one that is still changing at the cap is rejected.
-	path, frag, _ := strings.Cut(route, "#")
-	const maxLayers = 5
-	for layer := 0; ; layer++ {
-		dpath, perr := url.PathUnescape(path)
-		dfrag, ferr := url.PathUnescape(frag)
-		if perr != nil || ferr != nil || (dpath == path && dfrag == frag) {
-			break
-		}
-		if layer == maxLayers {
+	lower := strings.ToLower(route)
+	for _, mark := range secrets.CredentialNames {
+		if strings.Contains(lower, mark) {
 			return "", false
 		}
-		path, frag = dpath, dfrag
-		if strings.ContainsAny(path+frag, "?#") || !credentialFree(path+"#"+frag) {
+	}
+	for _, seg := range strings.FieldsFunc(route, func(r rune) bool { return r == '/' || r == '#' }) {
+		if secrets.TokenLike(seg) {
 			return "", false
 		}
 	}
 	return route, true
-}
-
-// credentialFree reports whether no credential name appears in s and no
-// segment of it (split on / and #) looks like a secret by shape.
-func credentialFree(s string) bool {
-	if secrets.HasCredentialName(s) {
-		return false
-	}
-	for _, seg := range strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == '#' }) {
-		if secrets.TokenLike(seg) {
-			return false
-		}
-	}
-	return true
 }
 
 // shown is path as it may be printed: redacted when signed in, unchanged

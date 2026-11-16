@@ -892,10 +892,20 @@ yq '.tests[].path | select(. != null)' .frostfall.yml | sort > listed.txt
 comm -23 discovered.txt listed.txt   # found by the crawl, not in the config
 ```
 
-With `auth` configured the listing is discovery's own cleaned output, so it
-carries no query, `;param` or token, and a credential-looking path is left out.
+With `auth` configured the crawl cuts queries, `;params` and hash payloads and
+leaves out credential-looking links, and the listing then fails closed: a path
+is printed only if it contains none of `%`, `?`, `;`, `&` or `=`, and no `#`
+other than a single `#/` that starts a hash route. Any other path is skipped,
+not printed and not counted as uncovered, and stderr says how many
+(`skipped N path(s) that can't be listed safely ...`). An encoded credential
+(`%253Ftoken%253D...`, any number of layers deep) is skipped that way, and so
+is an ordinary page whose path has a literal `%`: signed in, `/100%` is skipped,
+while `//x` and `/#/app/page` still print. A segment shaped like a token is
+masked as `[redacted]`. A plain secret in an ordinary segment (`/a/s3cr3t`, or
+after `#/`) looks like any other path to a character rule, so it is not caught.
 A path with a control character in it (a link that decodes to a newline) would
-print as two lines, so it is skipped signed in or out, and stderr says how many.
+print as two lines, so it is skipped signed in or out and counted the same way;
+signed out, that is the only path the listing skips.
 
 ## Screenshots
 

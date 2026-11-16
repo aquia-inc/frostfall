@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -610,22 +611,158 @@ func TestDryRunListingSkipsControlCharacters(t *testing.T) {
 	}
 }
 
-// With auth the paths are the crawler's decoded, cleaned ones, and printing
-// them must not parse them as URLs again: a literal % and a leading // come
-// out as they are, and nothing collapses into a placeholder line. A path that
-// is a secret by shape is still masked, so a token cannot be printed.
+// With auth the paths are the crawler's decoded ones, and printing them must
+// not parse them as URLs again: a leading // comes out as it is, and nothing
+// collapses into a placeholder line. A literal % is skipped and counted, as
+// any % is when signed in. A path that is a secret by shape is still masked,
+// so a token cannot be printed.
 func TestDryRunListingAuthKeepsDecodedPathsAndMasksTokens(t *testing.T) {
 	const token = "0123456789abcdef0123456789abcdef"
-	lines, _, _ := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
-	want := []string{"//x", "/100%", "/50%/off", "/reset/[redacted]"}
+	lines, uncovered, skipped := dryRunListing([]string{"/100%", "//x", "/50%/off", "/reset/" + token}, true, nil)
+	want := []string{"//x", "/reset/[redacted]"}
 	if !slices.Equal(lines, want) {
 		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 2 || skipped != 2 {
+		t.Errorf("uncovered = %d, skipped = %d, want 2 and 2", uncovered, skipped)
 	}
 	for _, l := range lines {
 		if strings.Contains(l, token) || strings.Contains(l, "<unparsable url>") {
 			t.Errorf("listed %q", l)
 		}
 	}
+}
+
+// listableLine is the signed-in listing's character rule, written out here on
+// its own so the tests do not check the code against itself: no % ? ; & =, no
+// control character, and no '#' but a single one directly followed by '/'.
+func listableLine(l string) bool {
+	for _, r := range l {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || strings.ContainsRune("%?;&=", r) {
+			return false
+		}
+	}
+	switch strings.Count(l, "#") {
+	case 0:
+		return true
+	case 1:
+		return strings.Contains(l, "#/")
+	default:
+		return false
+	}
+}
+
+// encodeN percent-encodes c n times: n=0 is c itself, 1 is %3F, 2 is %253F,
+// and so on, each layer encoding the % of the one below.
+func encodeN(c byte, n int) string {
+	if n == 0 {
+		return string(c)
+	}
+	return "%" + strings.Repeat("25", n-1) + fmt.Sprintf("%02X", c)
+}
+
+// dryRunLeakProbes are paths as they reach dryRunListing after RouteKey has
+// decoded a link once, each with secret planted behind a character that can
+// carry or hide it. They cover every carrier at every encoding depth from 0 to
+// 6, behind a clean prefix, a stray %, a literal % segment, a hash route and a
+// stray % in front of a hash route, plus the exact probes reviewers sent.
+func dryRunLeakProbes(secret string) []string {
+	probes := []string{
+		"/%zz%253Ftoken%253Ds3cr3t",
+		"/100%/x%253Ftoken%253Dabc",
+		"/#/100%/x%3Ftoken%3Dx",
+		"/x%zz#/y%3Ftoken%3Dx",
+		"/a%3Bfoo=secret",
+		"/a%253Bfoo%253Dsecret",
+		"/r&pw=secretvalue",
+		"/%25zz%25253Ftoken%25253Ds3cr3t",
+	}
+	prefixes := []string{"/x", "/%zz", "/100%/x", "/#/x", "/x%zz#/y", "/%/#/x"}
+	for _, c := range []byte("?#;&=") {
+		for depth := 0; depth <= 6; depth++ {
+			carrier := encodeN(c, depth)
+			eq := encodeN('=', depth)
+			for _, pre := range prefixes {
+				probes = append(probes, pre+carrier+secret, pre+carrier+"pw"+eq+secret)
+				// A literal # followed by / is a hash route, which prints, and
+				// a plain secret in a route segment is the documented residual
+				// no character rule can see, so it is not a probe here.
+				if c != '#' || depth > 0 {
+					probes = append(probes, pre+"/a"+carrier+"/"+secret)
+				}
+			}
+		}
+	}
+	return probes
+}
+
+// Signed in, no path that carries or encodes a carrier character is printed,
+// at any encoding depth: each probe, run on its own, is skipped and counted,
+// never listed or counted as uncovered, and whatever is printed from the whole
+// set obeys the character rule and holds no secret. Without the filter the
+// secrets print, so this fails.
+func TestDryRunListingAuthSkipsCarriersAtAnyDepth(t *testing.T) {
+	const secret = "s3cr3tvalue"
+	probes := dryRunLeakProbes(secret)
+	for _, p := range probes {
+		lines, uncovered, skipped := dryRunListing([]string{p}, true, nil)
+		if len(lines) != 0 || uncovered != 0 || skipped != 1 {
+			t.Errorf("%q: lines = %q, uncovered = %d, skipped = %d, want nothing listed and 1 skipped", p, lines, uncovered, skipped)
+		}
+	}
+	safe := []string{"/", "/plain", "//x", "/#/app/page", "/a/b-c_d.e~f", "/docs/release-notes-2024"}
+	lines, uncovered, skipped := dryRunListing(append(slices.Clone(probes), safe...), true, nil)
+	for _, l := range lines {
+		if !listableLine(l) || strings.Contains(l, secret) || strings.Contains(l, "s3cr3t") || strings.Contains(l, "secret") {
+			t.Errorf("listed %q", l)
+		}
+	}
+	// The rule is not "print nothing": ordinary paths, a leading // and a hash
+	// route still print.
+	want := slices.Clone(safe)
+	sort.Strings(want)
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if skipped != len(probes) || uncovered != len(safe) {
+		t.Errorf("skipped = %d, uncovered = %d, want %d and %d", skipped, uncovered, len(probes), len(safe))
+	}
+}
+
+// Signed out the listing is unchanged from a plain --discover run: the same
+// probes print as they are, and only a control character is skipped.
+func TestDryRunListingSignedOutKeepsEncodedPaths(t *testing.T) {
+	paths := []string{"/100%", "/a%3Bfoo=x", "/r&pw=x", "/x%253Fk", "/a#b", "/alpha\n/beta"}
+	lines, uncovered, skipped := dryRunListing(paths, false, nil)
+	want := []string{"/100%", "/a#b", "/a%3Bfoo=x", "/r&pw=x", "/x%253Fk"}
+	if !slices.Equal(lines, want) {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+	if uncovered != 5 || skipped != 1 {
+		t.Errorf("uncovered = %d, skipped = %d, want 5 and 1", uncovered, skipped)
+	}
+}
+
+// Whatever path reaches a signed-in listing, every printed line obeys the
+// character rule, and the listed and skipped paths add up to what came in.
+func FuzzDryRunListingAuth(f *testing.F) {
+	for _, p := range dryRunLeakProbes("s3cr3tvalue") {
+		f.Add(p)
+	}
+	for _, p := range []string{"/", "//x", "/#/app/page", "/#/a#/b", "/#x", "/a#", "/100%", "/\u202e"} {
+		f.Add(p)
+	}
+	f.Fuzz(func(t *testing.T, p string) {
+		lines, uncovered, skipped := dryRunListing([]string{p}, true, nil)
+		if len(lines)+skipped != 1 || uncovered != len(lines) {
+			t.Fatalf("%q: lines = %q, uncovered = %d, skipped = %d", p, lines, uncovered, skipped)
+		}
+		for _, l := range lines {
+			if !listableLine(l) {
+				t.Errorf("%q: listed %q, which breaks the character rule", p, l)
+			}
+		}
+	})
 }
 
 // --id and --path narrow what a run scans, not what a dry run counts as
@@ -665,9 +802,12 @@ func TestDiscoverDryRunCoverageIgnoresFilters(t *testing.T) {
 	}
 }
 
-// Signed in, links whose decoded path holds a literal % or starts with // are
-// listed as they are (not as <unparsable url>, not with a slash lost), and a
-// token in a query or a path never reaches stdout or stderr.
+// Signed in, a link whose decoded path starts with // is listed as it is (not
+// as <unparsable url>, not with a slash lost), a hash route is listed, and a
+// token in a query or a path never reaches stdout or stderr. Any path left
+// holding a %, ?, ;, &, = or a stray # after the crawl's cleaning (a literal
+// /100% included) is skipped and counted on stderr, as is one that decodes to
+// a newline; none of them is printed.
 func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
@@ -684,7 +824,9 @@ func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
 				// The same secret smuggled past the query and path checks: a
 				// %23 that decodes to a #, a %3F and %3D double-encoded, and a
 				// %0A that would split a printed line. A real hash route stays.
-				"/a%23" + secret, "/reports%253Ftoken%253D" + secret, "/alpha%0A/beta", "/#/app/page"} {
+				"/a%23" + secret, "/reports%253Ftoken%253D" + secret, "/alpha%0A/beta", "/#/app/page",
+				// A ;param and an &pw= double-encoded, and a literal & carrier.
+				"/a%253Bfoo%253D" + secret, "/r&pw=" + secret} {
 				fmt.Fprintf(w, `<a href=%q>x</a>`, l)
 			}
 		}
@@ -709,10 +851,18 @@ func TestDiscoverDryRunWithAuthKeepsOddPathsAndNoTokens(t *testing.T) {
 	if strings.Contains(stdout+stderr, secret) || strings.Contains(stdout, "0123456789abcdef") {
 		t.Errorf("a token was printed: stdout = %q, stderr = %q", stdout, stderr)
 	}
-	if want := "/\n/#/app/page\n//x\n/100%\n/plain\n/reports\n"; stdout != want {
+	t.Logf("stdout = %q", stdout)
+	t.Logf("stderr = %q", stderr)
+	if want := "/\n/#/app/page\n//x\n/plain\n/reports\n"; stdout != want {
 		t.Errorf("stdout = %q, want %q", stdout, want)
 	}
-	if !strings.Contains(stderr, "skipped 1 path(s) with a control character") || strings.Contains(stderr, "alpha") {
-		t.Errorf("stderr = %q, want a count of the skipped path and not the path", stderr)
+	// Skipped: /100%, /a#<secret>, /reports%3Ftoken%3D<secret>,
+	// /alpha<newline>/beta, /a%3Bfoo%3D<secret> and /r&pw=<secret>. The reset
+	// token never gets this far: the crawl drops it as credential-looking.
+	if !strings.Contains(stderr, "skipped 6 path(s) that can't be listed safely") || strings.Contains(stderr, "alpha") {
+		t.Errorf("stderr = %q, want a count of the skipped paths and not the paths", stderr)
+	}
+	if !strings.Contains(stderr, "discovered 5 page(s), 4 not covered by an explicit test") {
+		t.Errorf("stderr = %q, want 5 discovered and 4 not covered", stderr)
 	}
 }

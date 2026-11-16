@@ -634,7 +634,7 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 		fmt.Println(p)
 	}
 	if skipped > 0 {
-		fmt.Fprintf(os.Stderr, "skipped %d path(s) with a control character in them (a newline would split the listing)\n", skipped)
+		fmt.Fprintf(os.Stderr, "skipped %d path(s) that can't be listed safely (encoded characters, query-like characters, or control characters)\n", skipped)
 	}
 	fmt.Fprintf(os.Stderr, "discovered %d page(s), %d not covered by an explicit test\n", len(out), uncovered)
 	return exitOK
@@ -643,16 +643,19 @@ func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config
 // dryRunListing turns the crawl's paths into the sorted, deduped lines to
 // print, and counts how many of those lines no test in tests covers.
 //
-// With auth the crawler has already cleaned every path (query, ;params and
-// hash payloads cut, credential-looking ones dropped), and these are the
-// decoded paths it returns, so they are not parsed as URLs again: that
-// misreads a literal % as a bad escape and a leading // as a host. What is
-// kept is MaskSegments, which works on the text and never parses. The count is
-// of printed lines, after the dedupe, so it cannot exceed the number listed.
-//
 // A path with a control character in it (a %0A in a link decodes to a real
 // newline) would print as two lines, signed in or out: it is skipped, not
 // listed or counted, and skipped says how many so the caller can report it.
+//
+// Signed in, the crawler cuts queries, ;params and hash payloads, but a link
+// can hide a credential behind any number of encoding layers (%253F is a ?
+// two decodes down), and no decoder can know when to stop. So the listing
+// fails closed instead: a path is printed only if signedInListable accepts
+// it, and every other path is skipped and counted the same way. The paths are
+// not parsed as URLs again (that misreads a literal % as a bad escape and a
+// leading // as a host); MaskSegments, which works on the text, still masks a
+// segment that is a secret by shape. The count is of printed lines, after the
+// dedupe, so it cannot exceed the number listed.
 func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []string, uncovered, skipped int) {
 	covered := map[string]bool{}
 	for _, t := range tests {
@@ -660,7 +663,7 @@ func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []stri
 	}
 	listed := map[string]bool{}
 	for _, p := range paths {
-		if strings.ContainsFunc(p, unicode.IsControl) {
+		if strings.ContainsFunc(p, unicode.IsControl) || (auth && !signedInListable(p)) {
 			skipped++
 			continue
 		}
@@ -678,6 +681,25 @@ func dryRunListing(paths []string, auth bool, tests []config.Test) (lines []stri
 	}
 	sort.Strings(lines)
 	return lines, uncovered, skipped
+}
+
+// signedInListable reports whether a signed-in dry run may print p: it holds
+// none of the characters a credential is carried or encoded with (% ? ; & =),
+// and no '#' unless it is a single '#' directly followed by '/', a hash
+// route. This is a character rule, not a decoder, so it has no layer it can
+// be talked past. It cannot see a plain secret in an ordinary segment
+// (/a/s3cr3t); MaskSegments catches one shaped like a token.
+func signedInListable(p string) bool {
+	if strings.ContainsAny(p, "%?;&=") {
+		return false
+	}
+	if i := strings.IndexByte(p, '#'); i >= 0 {
+		rest := p[i+1:]
+		if !strings.HasPrefix(rest, "/") || strings.Contains(rest, "#") {
+			return false
+		}
+	}
+	return true
 }
 
 // runInit detects the project in the working directory and writes a tailored

@@ -52,26 +52,6 @@ func TestCleanAuthPath(t *testing.T) {
 		// 32 hex characters is a secret, 31 letters-only is a name.
 		{"/h/abcdefabcdefabcdefabcdefabcdefab", "", false},
 		{"/h/abcdefabcdefabcdefabcdefabcdefa", "/h/abcdefabcdefabcdefabcdefabcdefa", true},
-		// A %23 decodes to a '#' that is not a hash route: not a fragment to
-		// cut, a secret to reject. A real hash route (#/...) is kept.
-		{"/a#s3cr3tvalue", "", false},
-		{"/a#", "", false},
-		{"/a#x#/r", "", false},
-		{"/#/app/page", "/#/app/page", true},
-		// One more layer of encoding, checked on a copy: the path itself is
-		// returned as it was.
-		{"/reports%3Ftoken%3Ds3cr3tvalue", "", false},
-		{"/reports%3Fx", "", false},
-		{"/a%23b", "", false},
-		{"/a%2Fsession%3D1", "", false},
-		{"/x%2Fdyfjd8s7Dkf9s0Dkd8s7Dkf9s0Dk", "", false},
-		{"/%2525253Fk", "", false},               // three layers down is a ?
-		{"/%252525252525252525253Fk", "", false}, // deeper than the cap is refused too
-		{"/#/r%3Ftoken%3Dx", "", false},
-		{"/100%", "/100%", true}, // does not decode: checked as written
-		{"//x", "//x", true},
-		{"/50%20off", "/50%20off", true},
-		{"/a%2Fb", "/a%2Fb", true},
 		// Names and slugs are kept.
 		{"/docs/release-notes-2024-01-15-summary", "/docs/release-notes-2024-01-15-summary", true},
 		{"/docs/internationalization-guidelines", "/docs/internationalization-guidelines", true},
