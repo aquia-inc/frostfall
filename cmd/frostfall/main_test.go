@@ -152,6 +152,30 @@ func TestProfileSwitchesSetupToStorageState(t *testing.T) {
 	}
 }
 
+// A literal password in a profile that is not selected still reaches stderr
+// as a warning, naming the profile and never the value, and does not change
+// the exit code. --profile none keeps GITHUB_ACTIONS from selecting ci.
+func TestPasswordLintWarnsForUnselectedProfile(t *testing.T) {
+	const literal = "hunter2-cli-literal"
+	cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+	body := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n" +
+		"profiles:\n  ci:\n    auth:\n      signedIn: \"#in\"\n      setup:\n        path: /login\n        steps:\n" +
+		"          - fill: { \"#password\": \"" + literal + "\" }\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr := runCaptured(t, "--config", cfg, "--profile", "none", "--validate")
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if want := `warning: profiles.ci.auth.setup.steps[0].fill "#password": a password field is filled with a literal value`; !strings.Contains(stderr, want) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr, want)
+	}
+	if strings.Contains(stderr, literal) {
+		t.Errorf("stderr leaks the literal password: %q", stderr)
+	}
+}
+
 // A trailing slash on --base-url must not put a double slash in every URL
 // built from it.
 func TestBaseURLTrailingSlashIsTrimmed(t *testing.T) {

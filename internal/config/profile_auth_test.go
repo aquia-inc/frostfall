@@ -331,3 +331,52 @@ func TestReadmeProfileAuthExampleLoads(t *testing.T) {
 		t.Errorf("warnings = %v, want none for env-referenced secrets", base.Warnings)
 	}
 }
+
+// Merge keys inside a profile's auth block resolve as anywhere else in the
+// file: merged keys count, an explicit key overrides a merged one, and the
+// result gets the full checks with the profile named in errors.
+func TestProfileAuthMergeKeys(t *testing.T) {
+	dir := stateDir(t)
+	shared := "profiles:\n  staging:\n    auth: &shared\n      storageState: state.json\n      signedIn: \"#in\"\n      loginPath: /login\n"
+
+	cfg, err := Load(writeConfigIn(t, dir, profileAuthBase+shared+"  ci:\n    auth:\n      <<: *shared\n      signedIn: \"#ci-shell\"\n"), "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Auth
+	if a == nil || a.Setup != nil || a.StorageState != "state.json" || a.LoginPath != "/login" || a.SignedIn != "#ci-shell" {
+		t.Fatalf("merged profile auth = %+v, want storageState and loginPath merged, signedIn overridden", a)
+	}
+	if a.State == nil || len(a.State.Cookies) != 1 {
+		t.Errorf("merged storageState was not loaded: %v", a.State)
+	}
+
+	cases := []struct {
+		name, body, want string
+	}{
+		{
+			"merged setup under a storageState is both",
+			"version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\nauth: &base\n" + validSetup + signed +
+				"profiles:\n  ci:\n    auth:\n      <<: *base\n      storageState: state.json\n",
+			`profile "ci": auth: set exactly one of setup and storageState, not both`,
+		},
+		{
+			"merged block missing signedIn",
+			profileAuthBase + "profiles:\n  staging:\n    auth: &s\n      storageState: state.json\n  ci:\n    auth:\n      <<: *s\n      loginPath: /login\n",
+			`profile "ci": auth.signedIn: required`,
+		},
+		{
+			"merged origin is validated",
+			profileAuthBase + shared + "  ci:\n    auth:\n      <<: [ { allowedOrigins: [\"/sso\"] }, *shared ]\n",
+			`profile "ci": auth.allowedOrigins[0]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfigIn(t, dir, tc.body), "ci")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
