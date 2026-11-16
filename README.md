@@ -242,8 +242,8 @@ baseline: .frostfall-baseline.json   # known-debt file; see step 6 above
 profiles:                        # named overlays for environment differences
   ci:                            # "ci" auto-applies in GitHub Actions
     server:                      # may override: server, defaults, baseline,
-      serve: ./dist              # discover - NEVER tests (one test list for
-    defaults:                    # every environment, so coverage can't fork)
+      serve: ./dist              # discover, auth - NEVER tests (one test list
+    defaults:                    # for every environment, so coverage can't fork)
       expect:
         severity: serious
 
@@ -473,13 +473,26 @@ The `ci` profile applies automatically in GitHub Actions; use `--profile ci`
 to test it locally or `--profile none` to suppress it in CI. Any other name
 (`staging`, `nightly`) is available via `--profile NAME`.
 
-A profile may override `server`, `defaults`, `baseline`, and `discover` -
-**never `tests`**. Overrides work in both directions: a profile can add
+A profile may override `server`, `defaults`, `baseline`, `discover`, and
+`auth` - **never `tests`**. Overrides work in both directions: a profile can add
 enforcement for CI, and a `local` profile under an enforcing base can relax
 back to report-only with `expect: {}`. That restriction is the point: a second config file lets the
 test list drift until CI silently covers less than local. With profiles, one
 test list serves every environment by construction. Precedence is base config,
-then profile, then command-line flags.
+then profile, then command-line flags. If `profiles:` or the top level of the
+config uses a YAML merge key (`<<`), profile names must be strings: quote one
+that YAML would read as a number, date, boolean or null (`"2024":`), or the
+config is rejected. Without a merge key such names load as they are.
+
+A profile's `auth` replaces the top-level block as a whole, the way `server`
+does; the two are never merged, so the profile restates `signedIn`, `loginPath`
+and `allowedOrigins`. A profile cannot remove auth: `auth:` with no block,
+`auth: null` or `auth: false` in any profile is a config error. The `ci` profile
+is selected automatically in GitHub Actions, so a profile that dropped auth
+would silently turn off the signed-in guard and the URL and selector
+redaction for every CI run. Set `auth: false` on the tests that should run
+signed out instead. See
+[setup locally, storageState in CI](#setup-locally-storagestate-in-ci).
 
 For values rather than structure, environment interpolation is often enough:
 `baseUrl: ${APP_URL:-http://localhost:5173}`.
@@ -594,6 +607,49 @@ await context.storageState({ path: '.auth/state.json' });
 
 Playwright writes `cookies` and `origins[].localStorage`, which is what Frostfall
 reads (it does not read `sessionStorage` or IndexedDB from the file).
+
+#### Setup locally, storageState in CI
+
+A config sets one of `setup` and `storageState`, but a [profile](#profiles-one-config-different-environments)
+can swap one for the other: log in with the flow on a laptop and inject a file
+captured by an earlier CI step, from one config and one test list.
+
+```yaml
+auth:                                # local: the login flow
+  setup:
+    path: /login
+    steps:
+      - fill: { "#email": "${A11Y_USER:-}" }
+      - fill: { "#password": "${A11Y_PASS:-}" }
+      - click: "button[type=submit]"
+      - waitFor: "[data-testid=account-menu]"
+  signedIn: "[data-testid=account-menu]"
+  loginPath: /login
+
+profiles:
+  ci:
+    auth:                            # CI: replaces the block above entirely
+      storageState: .auth/state.json
+      signedIn: "[data-testid=account-menu]"
+      loginPath: /login
+```
+
+The `:-` empty defaults matter: `${VAR}` interpolation runs over the whole file
+before a profile is applied, so with plain `${A11Y_USER}` a CI job that holds
+only the state file would stop with exit 2 on variables for a setup flow it
+never runs. The cost is local: an unset variable now fills an empty value
+instead of failing the load. If the login flow then fails, its error ends by
+naming the variables that were unset and filled empty (names only, never
+values); a run that succeeds, or `--validate`, says nothing, since in CI they
+are unset on purpose.
+
+The selected profile's block gets every check a top-level one does, and its
+errors name the profile (`profile "ci": auth.signedIn: required`). A profile
+that is not selected is only checked for unknown keys and for removing auth,
+like its other fields, so its `storageState` file need not exist on a laptop;
+`frostfall --validate --profile ci` checks it, file included. The
+literal-password warning covers every profile's `setup` steps, selected or
+not.
 
 **The guard.** On the app's origin, a test fails with exit 3 when `signedIn` is
 absent. The login route is a second signal and gives a clearer message:

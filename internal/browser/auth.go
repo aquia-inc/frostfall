@@ -104,6 +104,9 @@ type Auth struct {
 	loginKey     string
 	// setupPath is the configured flow's start page, for the probe.
 	setupPath string
+	// unsetEmpty names the variables that took an empty ${VAR:-} default,
+	// for the hint on a failed setup flow.
+	unsetEmpty []string
 }
 
 // NewAuth prepares the config's auth block: it loads a storage-state file's
@@ -136,6 +139,7 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 	}
 	if cfg.Auth.Setup != nil {
 		a.setupPath = cfg.Auth.Setup.Path
+		a.unsetEmpty = cfg.UnsetEmptyVars()
 	}
 	if route := cfg.Auth.LoginRoute(); route != "" {
 		a.loginPath = route
@@ -408,8 +412,28 @@ func (a *Auth) captureOnce(b *Browser, setup *config.AuthSetup) (*State, error) 
 // runSetup drives the login flow in s through the ordinary step machinery,
 // then checks that it actually ended signed in. Errors name the step index
 // and the action's selector, and never a filled value or a URL query, so a
-// failed login cannot leak a credential into CI logs.
+// failed login cannot leak a credential into CI logs. When variables in the
+// config were unset and filled empty (${VAR:-}), a failure names them: an
+// empty credential otherwise shows up only as a timeout on some selector.
 func (a *Auth) runSetup(s *Session, setup *config.AuthSetup) error {
+	err := a.runSetupFlow(s, setup)
+	if err == nil || len(a.unsetEmpty) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w %s", err, unsetEmptyHint(a.unsetEmpty))
+}
+
+// unsetEmptyHint is the note runSetup appends to a failed flow's error.
+func unsetEmptyHint(names []string) string {
+	verb := "was"
+	if len(names) > 1 {
+		verb = "were"
+	}
+	return fmt.Sprintf("(%s %s unset and filled empty)", strings.Join(names, ", "), verb)
+}
+
+// runSetupFlow is runSetup without the hint.
+func (a *Auth) runSetupFlow(s *Session, setup *config.AuthSetup) error {
 	settle := a.defaults.SettleTime.Std()
 	a.logf("auth setup: loading %s", RedactURL(setup.Path))
 	if err := s.navigate(config.JoinURL(a.baseURL, setup.Path), readiness(a.defaults.WaitFor), settle); err != nil {

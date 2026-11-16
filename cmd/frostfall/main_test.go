@@ -88,6 +88,132 @@ func TestAuthFixtureExitCodes(t *testing.T) {
 	}
 }
 
+// The issue #63 setup: a setup flow locally, a storageState file in CI, from
+// one config. Against the auth fixture the base setup cannot sign in (the
+// login page has no form), so it stops with exit 3, while the ci profile's
+// state file reaches the protected page and finds its planted violation
+// (exit 1), which a merged setup+storageState block could not (exit 2). A bad
+// profile auth block is exit 2 and names the profile. --profile is explicit
+// everywhere, so GITHUB_ACTIONS cannot change which block applies.
+//
+// The guard and redaction follow the resolved block: a ci profile whose
+// signedIn marker the page lacks is the guard's exit 3, naming the ci
+// marker (the guard prints the resolved selector on purpose); the
+// unselected base block's login path and marker appear nowhere, and neither
+// does the ci block's login path, since the run never lands on that route;
+// and the test URL's query (a stand-in for a token) is redacted.
+//
+// The base setup path also carries ${FF_E2E_LOGIN_USER:-}, left unset: a
+// failed setup names it, and runs that never run the setup do not.
+func TestProfileSwitchesSetupToStorageState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	site, err := filepath.Abs("../../testdata/auth/site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile("../../testdata/auth/state-valid.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FF_E2E_LOGIN_USER", "")
+	if err := os.Unsetenv("FF_E2E_LOGIN_USER"); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		secret     = "ff-e2e-query-secret"
+		hint       = "(FF_E2E_LOGIN_USER was unset and filled empty)"
+		baseLogin  = "/base-login-route.html"
+		baseMarker = "[data-testid=base-only-marker]"
+		ciMarker   = "[data-testid=ci-only-marker]"
+		ciLogin    = "/ci-login-route.html"
+	)
+	dir := t.TempDir()
+	// Relative to the config file, as a top-level storageState is.
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, baseLogin, baseMarker, ciAuth string) string {
+		cfg := filepath.Join(dir, name)
+		body := "version: 1\nserver:\n  serve: " + site + "\n" +
+			"auth:\n  setup:\n    path: /login.html?u=${FF_E2E_LOGIN_USER:-}\n    steps:\n      - waitFor: h1\n" +
+			"  loginPath: " + baseLogin + "\n  signedIn: \"" + baseMarker + "\"\n" +
+			"defaults:\n  waitFor: load\n  expect:\n    severity: serious\n" +
+			"profiles:\n  ci:\n    auth:\n" + ciAuth +
+			"tests:\n  - id: protected\n    path: /protected.html?token=" + secret + "\n"
+		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	good := write("frostfall.yml", "/login.html", "[data-testid=app-shell]", "      storageState: state.json\n      loginPath: /login.html\n      signedIn: \"[data-testid=app-shell]\"\n")
+	bad := write("bad.yml", "/login.html", "[data-testid=app-shell]", "      storageState: state.json\n")
+	// The base block names a login route and a marker of its own; with the
+	// ci profile selected neither may show up anywhere.
+	noMarker := write("nomarker.yml", baseLogin, baseMarker, "      storageState: state.json\n      loginPath: "+ciLogin+"\n      signedIn: \""+ciMarker+"\"\n")
+
+	cases := []struct {
+		name      string
+		args      []string
+		want      int
+		stderrHas []string
+		lacks     []string // in stdout and stderr
+	}{
+		{"base setup", []string{"--config", good, "--profile", "none"}, exitEnvironment, []string{"auth setup: still on the login page", hint}, []string{secret}},
+		{"ci storageState", []string{"--config", good, "--profile", "ci"}, exitViolations, nil, []string{secret, hint}},
+		{"ci validate", []string{"--config", good, "--profile", "ci", "--validate"}, exitOK, nil, []string{hint}},
+		{"base validate", []string{"--config", good, "--profile", "none", "--validate"}, exitOK, nil, []string{hint}},
+		{"ci marker missing", []string{"--config", noMarker, "--profile", "ci"}, exitEnvironment,
+			[]string{`test "protected": landed on`, "without the signedIn selector \"" + ciMarker + "\""},
+			[]string{secret, hint, baseLogin, baseMarker, ciLogin}},
+		{"bad ci block", []string{"--config", bad, "--profile", "ci", "--validate"}, exitBadConfig, []string{`profile "ci": auth.signedIn: required`}, nil},
+		{"bad ci block, not selected", []string{"--config", bad, "--profile", "none", "--validate"}, exitOK, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runBoth(t, append(tc.args, "--no-screenshots", "--baseline", "none")...)
+			if code != tc.want {
+				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tc.want, stderr)
+			}
+			for _, want := range tc.stderrHas {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr, want)
+				}
+			}
+			for _, lack := range tc.lacks {
+				if strings.Contains(stdout, lack) || strings.Contains(stderr, lack) {
+					t.Errorf("output contains %q:\nstdout: %s\nstderr: %s", lack, stdout, stderr)
+				}
+			}
+		})
+	}
+}
+
+// A literal password in a profile that is not selected still reaches stderr
+// as a warning, naming the profile and never the value, and does not change
+// the exit code. --profile none keeps GITHUB_ACTIONS from selecting ci.
+func TestPasswordLintWarnsForUnselectedProfile(t *testing.T) {
+	const literal = "hunter2-cli-literal"
+	cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+	body := "version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\n" +
+		"profiles:\n  ci:\n    auth:\n      signedIn: \"#in\"\n      setup:\n        path: /login\n        steps:\n" +
+		"          - fill: { \"#password\": \"" + literal + "\" }\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr := runCaptured(t, "--config", cfg, "--profile", "none", "--validate")
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if want := `warning: profiles.ci.auth.setup.steps[0].fill "#password": a password field is filled with a literal value`; !strings.Contains(stderr, want) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr, want)
+	}
+	if strings.Contains(stderr, literal) {
+		t.Errorf("stderr leaks the literal password: %q", stderr)
+	}
+}
+
 // A trailing slash on --base-url must not put a double slash in every URL
 // built from it.
 func TestBaseURLTrailingSlashIsTrimmed(t *testing.T) {

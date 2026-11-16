@@ -139,7 +139,7 @@ defaults:
 baseline: .frostfall-baseline.json
 
 # Environment overlays. "ci" applies automatically in GitHub Actions.
-# Profiles may override server/defaults/baseline/discover - never tests.
+# Profiles may override server/defaults/baseline/discover/auth - never tests.
 # profiles:
 #   ci:
 #     server:

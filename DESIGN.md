@@ -351,6 +351,30 @@ always set. The whole block is validated at load: every mistake in it is a confi
 silently ignoring auth means scanning a login page and passing. A `storageState` file is read at
 load, so `--validate` needs it to exist.
 
+**Profiles.** A profile may set `auth`, which replaces the top-level block wholesale (never merged:
+setup from one and `storageState` from the other would be both). Validation runs on the resolved
+block after the profile applies, with errors prefixed `profile "<name>":`, and everything
+downstream (the guard, redaction, `RedactingAuth`, `CheckTestOrigins`) reads only the resolved
+`Config.Auth`. An unselected profile's auth gets strict decoding only, like its other fields, so a
+CI-only state file is not read locally. A profile cannot remove auth: a null or scalar `auth` in
+any profile is a config error, since `auth: null` decodes like an absent key and would otherwise
+be read as "inherit". The reason for the rule is that the `ci` profile is selected automatically
+in GitHub Actions: a profile that dropped auth would silently turn off the signed-in guard and the
+URL and selector redaction for every CI run. A test that should run signed out sets `auth: false`
+on itself instead. The check walks the document, `profiles` and each profile through aliases and
+merge keys (`<<`) with the decoder's precedence, and compares keys as the decoder decodes them, so
+an alias key or a `!!binary` key that decodes to `auth` counts as `auth`. When `profiles` or the
+document root uses a merge key, a profile name must resolve to a string: yaml.v3 records an unquoted
+`2024`, `1.5`, `true`, date or null key in its own type but looks merged keys up as strings, so a
+merged profile would replace an explicit one of the same name, and such names are a config error
+that says to quote them. Without a merge key the quirk cannot arise and those names load as they
+always have, so released configs keep working. The walk only produces the
+error message. The safety comes from `applyProfile`, which inherits the top-level block whenever
+the decoded profile auth is nil, so a removal the walk missed would keep auth, never drop it. The
+walk expands each mapping once, so alias diamonds stay linear (it runs before the decoder's
+excessive-aliasing check) and a self-merge ends there and is reported by the decoder. The
+password lint reads every profile's `auth.setup.steps` as well as the top-level ones.
+
 **`signedIn` is the guard's main signal.** A URL comparison cannot tell a signed-out page from a
 signed-in one: a login can be rendered in place, an identity provider's page is on another origin, a
 route can be renamed. A marker in the page can, so the selector is required and must exist on every

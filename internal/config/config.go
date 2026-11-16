@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +58,12 @@ type Config struct {
 	// dir is the config file's directory, which relative paths in the
 	// config (auth.storageState) resolve against.
 	dir string
+	// authProfile names the profile whose auth block replaced the top-level
+	// one, so its errors can say where to look; "" when none did.
+	authProfile string
+	// unsetEmpty names the variables that were unset and took an empty
+	// ${VAR:-} default, in file order; see UnsetEmptyVars.
+	unsetEmpty []string
 }
 
 // Profile is a named overlay for environment differences (local vs CI). It
@@ -68,6 +75,10 @@ type Profile struct {
 	Defaults *ProfileDefaults `yaml:"defaults"`
 	Baseline string           `yaml:"baseline"`
 	Discover *Discover        `yaml:"discover"`
+	// Auth replaces the top-level auth block wholesale when set (setup in
+	// one environment, storageState in another). It cannot remove auth;
+	// see profileRemovingAuth.
+	Auth *Auth `yaml:"auth"`
 }
 
 // ProfileDefaults mirrors Defaults with pointer fields so an overlay can
@@ -536,9 +547,15 @@ func Load(path, profile string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	interpolated, err := interpolate(string(raw))
+	interpolated, unsetEmpty, err := interpolate(string(raw))
 	if err != nil {
 		return nil, err
+	}
+
+	// Checked for every profile, selected or not, like strict decoding, and
+	// before it, so auth: false gets this message rather than a type error.
+	if err := checkProfiles(interpolated); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(interpolated))
@@ -548,6 +565,7 @@ func Load(path, profile string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	cfg.dir = filepath.Dir(path)
+	cfg.unsetEmpty = unsetEmpty
 	// Lint the raw text: interpolation has already replaced the ${VAR}
 	// references the lint looks for.
 	cfg.Warnings = lintSecrets(string(raw))
@@ -561,8 +579,64 @@ func Load(path, profile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// checkProfiles rejects, in every profile, selected or not, what the
+// decoder would get wrong or silently accept:
+//
+//   - A profile name that is not a string (2024, 1.5, true, a date, null),
+//     when the profiles mapping or the document root uses a merge key.
+//     yaml.v3 records an explicit key in its own scalar type (the int 2024)
+//     but looks merged keys up as strings ("2024"), so a merged profile of
+//     the same name replaces the explicit one, the reverse of the rule
+//     everywhere else, and this walk and the decoder would disagree about
+//     what the profile holds. Quoting the name ("2024") avoids it. Without
+//     a merge the quirk cannot arise, so such names load as they always
+//     have.
+//   - A profile whose auth is null or a scalar rather than a block. Decoded,
+//     `auth: null` leaves the pointer nil, which applyProfile reads as
+//     "inherit"; a profile that could turn auth off would drop the signed-in
+//     guard for a whole environment. The safety itself comes from that
+//     inheritance: this check only turns a removal the decoder would ignore
+//     into an error that says so.
+//
+// The walk follows aliases and merge keys at the document, profiles and
+// profile levels, and decodes keys as the decoder does (keyName). Removal is
+// reported for the lowest profile name. Text that does not parse yields nil:
+// the real decode reports that.
+func checkProfiles(text string) error {
+	var doc yaml.Node
+	if yaml.Unmarshal([]byte(text), &doc) != nil || len(doc.Content) == 0 {
+		return nil
+	}
+	root := doc.Content[0]
+	profilesNode := effectiveAt(root, "profiles")
+	profiles := effectivePairs(profilesNode)
+	if hasMergeKey(root) || hasMergeKey(profilesNode) {
+		for _, p := range profiles {
+			if p.keyNode.ShortTag() != "!!str" {
+				text := p.keyNode.Value
+				if text == "" {
+					text = "null"
+				}
+				return fmt.Errorf("line %d: profile name %s must be a string; quote it "+
+					"(profile names must be strings when merge keys are used)", p.keyNode.Line, text)
+			}
+		}
+	}
+	var names []string
+	for _, p := range profiles {
+		if a := effectiveAt(p.val, "auth"); a != nil && a.Kind != yaml.MappingNode {
+			names = append(names, p.key)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return fmt.Errorf("profile %q: auth: a profile can replace the auth block but not remove it; "+
+		"set auth: false on the tests that should run signed out", slices.Min(names))
+}
+
 // applyProfile merges the selected overlay onto the base config. Blocks
-// override as units (server, discover, rules, expect); scalar defaults
+// override as units (server, discover, auth, rules, expect); scalar defaults
 // override field-wise where the profile sets them. Precedence overall:
 // base config, then profile, then command-line flags.
 func (c *Config) applyProfile(profile string) error {
@@ -589,6 +663,12 @@ func (c *Config) applyProfile(profile string) error {
 	}
 	if p.Discover != nil {
 		c.Discover = p.Discover
+	}
+	// Wholesale, never merged: setup from the base and storageState from
+	// the profile would be both, and validate checks the result.
+	if p.Auth != nil {
+		c.Auth = p.Auth
+		c.authProfile = profile
 	}
 	if d := p.Defaults; d != nil {
 		if d.Standard != nil {
@@ -625,9 +705,10 @@ func (c *Config) applyProfile(profile string) error {
 var envRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}`)
 
 // interpolate expands ${VAR} and ${VAR:-default}; an unset var without a
-// default is an error.
-func interpolate(s string) (string, error) {
-	var missing []string
+// default is an error. It also returns the unset variables that fell back to
+// an empty default (${VAR:-}), each once, for UnsetEmptyVars.
+func interpolate(s string) (string, []string, error) {
+	var missing, unsetEmpty []string
 	out := envRe.ReplaceAllStringFunc(s, func(m string) string {
 		groups := envRe.FindStringSubmatch(m)
 		name, hasDefault, def := groups[1], groups[2] != "", groups[3]
@@ -635,15 +716,27 @@ func interpolate(s string) (string, error) {
 			return v
 		}
 		if hasDefault {
+			if def == "" && !slices.Contains(unsetEmpty, name) {
+				unsetEmpty = append(unsetEmpty, name)
+			}
 			return def
 		}
 		missing = append(missing, name)
 		return m
 	})
 	if len(missing) > 0 {
-		return "", fmt.Errorf("unset environment variables: %s", strings.Join(missing, ", "))
+		return "", nil, fmt.Errorf("unset environment variables: %s", strings.Join(missing, ", "))
 	}
-	return out, nil
+	return out, unsetEmpty, nil
+}
+
+// UnsetEmptyVars names the variables that were unset when the config loaded
+// and so took an empty ${VAR:-} default, in file order. That is deliberate
+// in CI, where a profile replaces the block that uses them, so it is no
+// warning; but a setup flow that then fails may well have typed empty
+// credentials, and the error can say so. Names only, never values.
+func (c *Config) UnsetEmptyVars() []string {
+	return slices.Clone(c.unsetEmpty)
 }
 
 func (c *Config) applyDefaults() {
@@ -730,6 +823,9 @@ func (c *Config) validate() error {
 	}
 	if c.Auth != nil {
 		if err := c.validateAuth(); err != nil {
+			if c.authProfile != "" {
+				return fmt.Errorf("profile %q: %w", c.authProfile, err)
+			}
 			return err
 		}
 	}

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -274,14 +276,31 @@ var (
 // password-looking field. It reads the text before interpolation, which is
 // the only place a literal and a ${VAR} reference differ. The findings name
 // the field, never the value. A file that does not parse yields nothing:
-// the real decode reports that.
+// the real decode reports that. Every profile's auth block is linted too,
+// selected or not: the literal is in the file either way.
 func lintSecrets(raw string) []string {
 	masked := envRe.ReplaceAllString(raw, envMarker)
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(masked), &doc); err != nil || len(doc.Content) == 0 {
 		return nil
 	}
-	steps := nodeAt(doc.Content[0], "auth", "setup", "steps")
+	root := doc.Content[0]
+	out := lintSetupSteps("", nodeAt(root, "auth", "setup", "steps"))
+	if profiles := nodeAt(root, "profiles"); profiles != nil && profiles.Kind == yaml.MappingNode {
+		byName := map[string]*yaml.Node{}
+		for i := 0; i+1 < len(profiles.Content); i += 2 {
+			byName[profiles.Content[i].Value] = profiles.Content[i+1]
+		}
+		for _, name := range slices.Sorted(maps.Keys(byName)) {
+			out = append(out, lintSetupSteps("profiles."+name+".", nodeAt(byName[name], "auth", "setup", "steps"))...)
+		}
+	}
+	return out
+}
+
+// lintSetupSteps is lintSecrets for one auth.setup.steps sequence; prefix
+// says whose auth block it is.
+func lintSetupSteps(prefix string, steps *yaml.Node) []string {
 	if steps == nil || steps.Kind != yaml.SequenceNode {
 		return nil
 	}
@@ -298,8 +317,8 @@ func lintSecrets(raw string) []string {
 				continue
 			}
 			if !strings.Contains(val.Value, envMarker) {
-				out = append(out, fmt.Sprintf("auth.setup.steps[%d].fill %q: a password field is filled with a literal value; "+
-					"write it as ${ENV_VAR} so the secret stays out of the config file", i, sel))
+				out = append(out, fmt.Sprintf("%sauth.setup.steps[%d].fill %q: a password field is filled with a literal value; "+
+					"write it as ${ENV_VAR} so the secret stays out of the config file", prefix, i, sel))
 			}
 		}
 	}
@@ -329,6 +348,113 @@ func nodeAt(n *yaml.Node, keys ...string) *yaml.Node {
 		n = next
 	}
 	return resolveAlias(n)
+}
+
+// yamlPair is one key/value of a mapping as the decoder sees it. key is the
+// decoded name; keyNode is the alias-resolved key, for its tag and line.
+type yamlPair struct {
+	key     string
+	keyNode *yaml.Node
+	val     *yaml.Node
+}
+
+// isMergeKey matches a merge key (<<) the way yaml.v3 does: a plain or
+// !!merge-tagged scalar, not a quoted "<<" string or an alias to one.
+func isMergeKey(k *yaml.Node) bool {
+	return k.Kind == yaml.ScalarNode && k.Value == "<<" && (k.Tag == "" || k.Tag == "!" || k.ShortTag() == "!!merge")
+}
+
+// hasMergeKey reports whether n, alias-resolved, is a mapping with a merge
+// key (<<) of its own.
+func hasMergeKey(n *yaml.Node) bool {
+	n = resolveAlias(n)
+	if n == nil || n.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if isMergeKey(n.Content[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// keyName decodes a mapping key to the field or map key the decoder would
+// see: an alias is followed and the scalar decoded as a string, so
+// `!!binary YXV0aA==` is "auth". A key that does not decode keeps its text.
+func keyName(k *yaml.Node) (string, *yaml.Node) {
+	k = resolveAlias(k)
+	var s string
+	if err := k.Decode(&s); err != nil {
+		return k.Value, k
+	}
+	return s, k
+}
+
+// effectivePairs returns the key/value pairs a mapping decodes to: aliases
+// followed, keys decoded (keyName), and merge keys (<<, given a mapping, an
+// alias to one, or a sequence of them) expanded in the decoder's order, so an
+// explicit key shadows a merged one wholesale and an earlier merged mapping
+// shadows a later one. Values are alias-resolved; nil unless n is a mapping.
+//
+// Each mapping is expanded at most once per call. Keys are first-wins, so a
+// second visit could only offer keys already taken; skipping it keeps alias
+// diamonds (&aN {<<: [*aN-1, *aN-1]}) linear rather than exponential, since
+// this runs before the decoder's own excessive-aliasing check, and it ends
+// cycles (a mapping that merges itself), which the real decode reports.
+func effectivePairs(n *yaml.Node) []yamlPair {
+	var out []yamlPair
+	seen := map[string]bool{}
+	visited := map[*yaml.Node]bool{}
+	var walk func(m *yaml.Node)
+	walk = func(m *yaml.Node) {
+		m = resolveAlias(m)
+		if m == nil || m.Kind != yaml.MappingNode || visited[m] {
+			return
+		}
+		visited[m] = true
+		var merge *yaml.Node
+		for i := 0; i+1 < len(m.Content); i += 2 {
+			if isMergeKey(m.Content[i]) {
+				merge = resolveAlias(m.Content[i+1]) // the last << wins, as in the decoder
+				continue
+			}
+			name, k := keyName(m.Content[i])
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, yamlPair{name, k, resolveAlias(m.Content[i+1])})
+			}
+		}
+		if merge != nil && merge.Kind == yaml.SequenceNode {
+			for _, item := range merge.Content {
+				walk(item)
+			}
+		} else if merge != nil {
+			walk(merge)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// effectiveAt is nodeAt over effectivePairs: it follows merge keys at every
+// level as well as aliases. nil when any key is absent.
+func effectiveAt(n *yaml.Node, keys ...string) *yaml.Node {
+	n = resolveAlias(n)
+	for _, k := range keys {
+		var next *yaml.Node
+		for _, p := range effectivePairs(n) {
+			if p.key == k {
+				next = p.val
+				break
+			}
+		}
+		if next == nil {
+			return nil
+		}
+		n = next
+	}
+	return n
 }
 
 // CheckTestOrigins rejects, for a config with auth, a test whose url: is not
