@@ -8,11 +8,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -563,27 +566,126 @@ func writeStructured(formatName, out string, res *runner.Run, meta format.Report
 	return nil
 }
 
-// writeFileAtomic renders into a temp file in out's directory and renames it
-// into place, so a render or write that fails midway leaves the previous file
-// as it was, never a partial one, and no temp file behind.
+// writeFileAtomic renders into a temp file beside out and renames it into
+// place, so a render or write that fails midway leaves the previous file as it
+// was, never a partial one, and no temp file behind. It otherwise behaves the
+// way the direct os.Create write it replaced did: an existing file keeps its
+// mode, a new one gets 0666 less the umask, a symlink is written through (the
+// temp file goes next to the link's target and is renamed onto it, so the link
+// stays), and a destination that is not a regular file (/dev/stdout,
+// /dev/null, a pipe) or cannot be resolved is written directly. Errors name
+// out, never the temp file.
 func writeFileAtomic(out string, render func(io.Writer) error) error {
-	f, err := os.CreateTemp(filepath.Dir(out), "."+filepath.Base(out)+".tmp-*")
+	dest, mode, keepMode, direct := atomicTarget(out)
+	if direct {
+		return writeFileDirect(out, render)
+	}
+	f, err := createSibling(dest)
 	if err != nil {
-		return err
+		return nameOut(err, "", out)
 	}
 	tmp := f.Name()
-	err = render(f)
+	if keepMode {
+		// Before anything is written, so a 0600 report is never readable
+		// more widely, even briefly.
+		err = f.Chmod(mode)
+	}
 	if err == nil {
-		err = f.Chmod(0o644)
+		err = render(outWriter{f: f, tmp: tmp, out: out})
+	}
+	if err == nil {
+		err = f.Sync()
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Rename(tmp, out)
+		err = os.Rename(tmp, dest)
 	}
 	if err != nil {
 		os.Remove(tmp)
+		return nameOut(err, tmp, out)
+	}
+	return nil
+}
+
+// atomicTarget decides where writeFileAtomic writes. dest is the regular
+// file to rename onto (a symlink resolved to its target); keepMode says that
+// file exists and its mode is mode. direct means write out in place instead:
+// it exists and is not a regular file, it is a dangling symlink, or it cannot
+// be examined, all cases where os.Create's own behavior is the right one.
+func atomicTarget(out string) (dest string, mode os.FileMode, keepMode, direct bool) {
+	fi, err := os.Stat(out)
+	switch {
+	case err == nil && fi.Mode().IsRegular():
+		resolved, rerr := filepath.EvalSymlinks(out)
+		if rerr != nil {
+			return out, 0, false, true
+		}
+		return resolved, fi.Mode().Perm(), true, false
+	case err == nil:
+		return out, 0, false, true
+	case errors.Is(err, fs.ErrNotExist):
+		if _, lerr := os.Lstat(out); lerr == nil {
+			return out, 0, false, true // a symlink to nothing: os.Create writes through it
+		}
+		return out, 0, false, false
+	default:
+		return out, 0, false, true
+	}
+}
+
+// createSibling creates an empty temp file next to dest. It is opened with
+// mode 0666, the mode os.Create uses, so the umask applies to it the same way
+// and a new report gets exactly the mode a direct write would have given it.
+// O_EXCL means an existing file or symlink of that name is never opened.
+func createSibling(dest string) (*os.File, error) {
+	prefix := filepath.Join(filepath.Dir(dest), "."+filepath.Base(dest)+".tmp-")
+	for range 100 {
+		f, err := os.OpenFile(prefix+strconv.FormatUint(rand.Uint64(), 36), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		if !errors.Is(err, fs.ErrExist) {
+			return f, err
+		}
+	}
+	return nil, &os.PathError{Op: "open", Path: dest, Err: fs.ErrExist}
+}
+
+// writeFileDirect is os.Create's truncate-and-write, for destinations a temp
+// file and rename cannot replace.
+func writeFileDirect(out string, render func(io.Writer) error) error {
+	f, err := os.Create(out)
+	if err != nil {
+		return err
+	}
+	err = render(f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// outWriter writes to the temp file but reports a write error against out,
+// the path the user asked for.
+type outWriter struct {
+	f        *os.File
+	tmp, out string
+}
+
+func (w outWriter) Write(p []byte) (int, error) {
+	n, err := w.f.Write(p)
+	return n, nameOut(err, w.tmp, w.out)
+}
+
+// nameOut rewrites a file error that names the temp file (or, when tmp is
+// empty, any path) so it names out instead. Other errors pass through.
+func nameOut(err error, tmp, out string) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) && (tmp == "" || pe.Path == tmp) {
+		return &os.PathError{Op: pe.Op, Path: out, Err: pe.Err}
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return &os.PathError{Op: le.Op, Path: out, Err: le.Err}
 	}
 	return err
 }

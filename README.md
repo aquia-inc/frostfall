@@ -552,10 +552,16 @@ failed run. The JSON then has `run.exitStatus` 2 or 3, `run.error`, and no
 describe: `run.mode` is `"unknown"` and `run.enforcing` is `false`, so scripts
 should read `run.exitStatus`, not `enforcing`, to decide pass or fail. The
 message in `run.error` is the one printed on stderr, except that with auth
-configured URLs and selector values in it are redacted. These runs still
+configured the report's copy is redacted word by word: anything from a `?` or
+`#` on is cut, a word that still holds `=` or `@` or an unclosed bracket
+becomes `[redacted]`, and selector values and URL paths are then cleaned the
+way the rest of the report is. These runs still
 print `report written to <path>` on stdout. The file is written to a temp file
 and renamed, so a write that fails leaves the previous file untouched rather
-than a partial one. `text`, `html` and `sarif` leave their file alone in that
+than a partial one. The file keeps its mode (a new one gets the usual
+umask-derived mode), a symlinked `--output` is written through to its
+target, and a non-file destination such as `/dev/stdout` is written
+directly. `text`, `html` and `sarif` leave their file alone in that
 case, and so does `--validate`. The one gap: a mistake in the flags themselves
 (an unparsable flag, or an unknown `--format`) is rejected before the format
 is known, so no report is written and an older file stays.

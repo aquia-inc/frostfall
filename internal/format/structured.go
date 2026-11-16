@@ -168,22 +168,97 @@ func (p *scanPoint) split(meta ReportMeta) (failing, info []runner.Result, basel
 	return failing, info, baselined
 }
 
-var urlInText = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>)\]]+`)
+// tokenRe is one whitespace-separated token of a run error. Replacing tokens
+// leaves the whitespace between them exactly as it was.
+var tokenRe = regexp.MustCompile(`\S+`)
+
+// urlInText is a URL inside one token. It may contain brackets (an IPv6 host,
+// a path like /a[0]); trimURL takes trailing punctuation back off.
+var urlInText = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]+`)
 
 // failureText is the failure message as a report may show it. A run error is
 // free text from the browser, the auth flow or the server probe, and it can
-// quote a URL or a selector. With auth configured the report's copy is cleaned
-// the way the rest of the report is: attribute values in selectors are
-// dropped and every URL is reduced to where it points. stderr keeps the
-// original.
+// quote a URL (with or without a scheme) or a selector. With auth configured
+// the report's copy is cleaned fail-closed, one token at a time: see
+// redactRunError. stderr keeps the original.
 func (m ReportMeta) failureText() string {
 	msg := m.Failure.Message
 	if !m.Redact {
 		return msg
 	}
-	msg = secrets.ScrubSelector(msg)
-	return urlInText.ReplaceAllStringFunc(msg, func(u string) string {
-		trimmed := strings.TrimRight(u, ".,;:!?")
-		return secrets.RedactURL(trimmed) + u[len(trimmed):]
+	return redactRunError(msg)
+}
+
+// redactRunError cleans a run error in two passes over its tokens. The first
+// fails closed without trying to recognize anything: every token is cut at its
+// first '?' or '#' (a query or fragment, which is where tokens and codes
+// travel), and a token that still holds '=' or '@' (an attribute value, a
+// key=value pair, userinfo) or whose brackets do not nest is replaced whole by
+// [redacted]. Only then are attribute values scrubbed from what looks like a
+// selector and URLs reduced to where they point. That order means the later,
+// pattern-based pass only ever sees what the first one let through, so a URL
+// or selector it fails to parse cannot carry a secret past it. Text without
+// those characters comes through unchanged.
+func redactRunError(msg string) string {
+	return scrubTokens(failClosedTokens(msg))
+}
+
+// failClosedTokens is the first pass of redactRunError.
+func failClosedTokens(msg string) string {
+	return tokenRe.ReplaceAllStringFunc(msg, func(tok string) string {
+		if i := strings.IndexAny(tok, "?#"); i >= 0 {
+			tok = tok[:i]
+		}
+		if strings.ContainsAny(tok, "=@") || !bracketsNest(tok) {
+			return "[redacted]"
+		}
+		return tok
 	})
+}
+
+// scrubTokens is the second pass of redactRunError: the selector scrub and URL
+// redaction, applied per token so neither can reach across a token boundary.
+func scrubTokens(msg string) string {
+	return tokenRe.ReplaceAllStringFunc(msg, func(tok string) string {
+		tok = secrets.ScrubSelector(tok)
+		return urlInText.ReplaceAllStringFunc(tok, func(u string) string {
+			trimmed := trimURL(u)
+			return secrets.RedactURL(trimmed) + u[len(trimmed):]
+		})
+	})
+}
+
+// bracketsNest reports whether every '[' in s is closed by a later ']' and no
+// ']' comes before its '['. Equal counts are not enough: "]x[" would still
+// hand the selector scrub an unterminated bracket.
+func bracketsNest(s string) bool {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+// trimURL takes sentence punctuation off the end of a URL found in text, and
+// a closing ')' or ']' that has no opening partner inside it.
+func trimURL(u string) string {
+	for u != "" {
+		switch c := u[len(u)-1]; {
+		case strings.IndexByte(".,;:!?", c) >= 0:
+		case c == ')' && strings.Count(u, "(") < strings.Count(u, ")"):
+		case c == ']' && strings.Count(u, "[") < strings.Count(u, "]"):
+		default:
+			return u
+		}
+		u = u[:len(u)-1]
+	}
+	return u
 }

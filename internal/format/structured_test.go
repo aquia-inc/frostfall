@@ -682,6 +682,123 @@ func TestRunErrorTextIsRedactedUnderAuth(t *testing.T) {
 	}
 }
 
+// runErrorCases are run errors the report copy must clean under auth. Each
+// leak case once got its secret past a pattern-based scrub; secret is what
+// must never appear, and want, when set, is the exact cleaned text. The
+// unchanged cases carry none of '?', '#', '=', '@' or an unnested bracket and
+// must come through exactly as written.
+var runErrorCases = []struct {
+	name, msg, secret, want string
+}{
+	{
+		name:   "bracket in a url path stops a url pattern",
+		msg:    "goto https://a.com/a[0]?t=secret end",
+		secret: "secret",
+		want:   "goto https://a.com/a[0] end",
+	},
+	{
+		name:   "ipv6 host",
+		msg:    "goto http://[::1]:8080/p?t=secret failed",
+		secret: "secret",
+		want:   "goto http://[::1]:8080/p failed",
+	},
+	{
+		name:   "unterminated bracket swallows what follows",
+		msg:    "no element a[href after 5s; retry with token=abc123 next",
+		secret: "abc123",
+		want:   "no element [redacted] after 5s; retry with [redacted] next",
+	},
+	{
+		name:   "scheme-less host and port",
+		msg:    "redirected to localhost:3000/cb?code=abc then stopped",
+		secret: "abc",
+		want:   "redirected to localhost:3000/cb then stopped",
+	},
+	{
+		name:   "scheme-less host name",
+		msg:    "landed on app.example.com/cb?code=secret instead",
+		secret: "secret",
+		want:   "landed on app.example.com/cb instead",
+	},
+	{
+		// The cut is at the first '#', so a hash route goes too: fail-closed
+		// does not try to tell a route from a token.
+		name:   "fragment token",
+		msg:    "landed on https://h/#/home#access_token=f4g",
+		secret: "f4g",
+		want:   "landed on https://h/",
+	},
+	{
+		name:   "userinfo",
+		msg:    "dial https://admin:hunter2@h/login failed",
+		secret: "hunter2",
+		want:   "dial [redacted] failed",
+	},
+	{
+		name:   "quoted attribute value with spaces",
+		msg:    `missing a[data-k="s3cr3t x"] > input`,
+		secret: "s3cr3t",
+		want:   "missing [redacted] [redacted] > input",
+	},
+	{
+		name:   "brackets that close before they open",
+		msg:    "bad ]sel[ret",
+		secret: "ret",
+		want:   "bad [redacted]",
+	},
+	{
+		name:   "whitespace is kept as written",
+		msg:    "a\tb  c\nk=v",
+		secret: "k=v",
+		want:   "a\tb  c\n[redacted]",
+	},
+	{name: "unchanged browser error", msg: "browser error: chrome failed to start: exit status 1"},
+	{name: "unchanged config error", msg: "config error: tests[0].path is required"},
+	{name: "unchanged landing error", msg: `run error: test "dashboard": landed on the login page /login: the auth session was not applied or has expired`},
+	{name: "unchanged url without query", msg: "server probe: https://h/app/ did not answer (timeout)."},
+}
+
+// Under auth a run error's report copy is cleaned fail-closed: no case may
+// leak its secret, and a message with nothing to clean is left exactly as it
+// was. Without auth it is verbatim.
+func TestRunErrorRedactionFailsClosed(t *testing.T) {
+	for _, tc := range runErrorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := ReportMeta{Redact: true, Failure: &RunFailure{Message: tc.msg}}
+			got := meta.failureText()
+			want := tc.want
+			if tc.secret == "" {
+				want = tc.msg
+			}
+			if tc.secret != "" && strings.Contains(got, tc.secret) {
+				t.Errorf("secret %q leaked: %q", tc.secret, got)
+			}
+			if got != want {
+				t.Errorf("failureText(%q)\n got %q\nwant %q", tc.msg, got, want)
+			}
+			meta.Redact = false
+			if got := meta.failureText(); got != tc.msg {
+				t.Errorf("without auth the text changed: %q", got)
+			}
+		})
+	}
+}
+
+// The fail-closed token pass is what the table above rests on, not the
+// selector scrub and URL redaction after it: with the pass taken out, some
+// leak case must leak. If this fails, the table no longer tests the pass.
+func TestRunErrorTableNeedsTheTokenPass(t *testing.T) {
+	leaked := 0
+	for _, tc := range runErrorCases {
+		if tc.secret != "" && strings.Contains(scrubTokens(tc.msg), tc.secret) {
+			leaked++
+		}
+	}
+	if leaked == 0 {
+		t.Error("every leak case is clean without the token pass, so the table does not test it")
+	}
+}
+
 func keysOf(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
 	var m map[string]json.RawMessage
