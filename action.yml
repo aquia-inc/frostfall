@@ -26,8 +26,23 @@ inputs:
     description: Report format (text, html, sarif, json, junit).
     default: html
   output:
-    description: Path to write the formatted report.
-    default: frostfall-report.html
+    description: "Path to write the formatted report. Empty uses the format's default: frostfall-report.html (html), frostfall.sarif (sarif), frostfall.json (json), frostfall-junit.xml (junit)."
+    default: ""
+  profile:
+    description: "Config profile to apply. Empty passes no flag, so the ci profile still applies automatically in Actions when the config defines one. \"none\" forces the base config."
+    default: ""
+  id:
+    description: Run only tests whose id matches this Go regex.
+    default: ""
+  path:
+    description: Run only tests whose path matches this Go regex (combines with id).
+    default: ""
+  discover:
+    description: 'Set "true" to crawl same-origin links from the root and scan discovered pages in addition to configured tests.'
+    default: ""
+  screenshots:
+    description: 'Violation screenshots. Empty keeps the CLI default (on in Actions). "true" forces them on, "false" disables them.'
+    default: ""
   gh-issues:
     description: Set "true" to file/maintain GitHub issues for failing violations (workflow needs issues write permission).
     default: "false"
@@ -65,6 +80,7 @@ runs:
       shell: bash
       # Inputs pass through env, never interpolated into the script body:
       # a crafted input must not be able to execute in the caller's runner.
+      # scripts/run.sh turns them into a quoted argument array.
       env:
         FF_CONFIG: ${{ inputs.config }}
         FF_SERVE: ${{ inputs.serve }}
@@ -73,11 +89,9 @@ runs:
         FF_FORMAT: ${{ inputs.format }}
         FF_OUTPUT: ${{ inputs.output }}
         FF_GH_ISSUES: ${{ inputs.gh-issues }}
-      run: |
-        ARGS=(--config "$FF_CONFIG" --format "$FF_FORMAT")
-        [ -n "$FF_SERVE" ]    && ARGS+=(--serve "$FF_SERVE")
-        [ -n "$FF_BASE_URL" ] && ARGS+=(--base-url "$FF_BASE_URL")
-        [ -n "$FF_BASELINE" ] && ARGS+=(--baseline "$FF_BASELINE")
-        [ -n "$FF_OUTPUT" ]   && ARGS+=(--output "$FF_OUTPUT")
-        [ "$FF_GH_ISSUES" = "true" ] && ARGS+=(--gh-issues)
-        frostfall "${ARGS[@]}"
+        FF_PROFILE: ${{ inputs.profile }}
+        FF_ID: ${{ inputs.id }}
+        FF_PATH: ${{ inputs.path }}
+        FF_DISCOVER: ${{ inputs.discover }}
+        FF_SCREENSHOTS: ${{ inputs.screenshots }}
+      run: ${{ github.action_path }}/scripts/run.sh

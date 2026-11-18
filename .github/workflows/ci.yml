@@ -89,3 +89,100 @@ jobs:
           name: fixture-scan-evidence
           path: frostfall-artifacts/
           if-no-files-found: ignore
+
+  action-wrapper:
+    name: Action wrapper (scripts/run.sh)
+    runs-on: ubuntu-latest
+    # `uses: ./` cannot self-test: install.sh needs a release tag ref. This job
+    # builds the binary from the PR and drives the same wrapper the action
+    # runs, with the FF_* variables action.yml sets, so input handling is
+    # exercised on every PR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build frostfall onto PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/frostfall" ./cmd/frostfall
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Wrapper input handling
+        # The fixture exits 1 under its enforcing profile (planted
+        # violations), so exit 1 is the expected scan result here; any other
+        # code means the wrapper or the scan broke. GITHUB_ACTIONS=true on
+        # runners, so screenshots default on unless the input turns them off.
+        run: |
+          set -u
+          export GITHUB_ACTIONS=true
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          # run_wrapper EXPECTED_CODE [VAR=value ...]: runs scripts/run.sh
+          # with a clean FF_* environment and a fresh GITHUB_OUTPUT file
+          # (path left in $OUT), and checks the exit code.
+          run_wrapper() {
+            local want="$1"; shift
+            OUT="$(mktemp)"
+            local code=0
+            env -u FF_SERVE -u FF_BASE_URL -u FF_BASELINE -u FF_OUTPUT \
+              -u FF_GH_ISSUES -u FF_PROFILE -u FF_ID -u FF_PATH \
+              -u FF_DISCOVER -u FF_SCREENSHOTS -u GITHUB_STEP_SUMMARY \
+              FF_CONFIG=testdata/static/frostfall.yml FF_FORMAT=html \
+              GITHUB_OUTPUT="$OUT" "$@" ./scripts/run.sh > "$OUT.log" 2>&1 || code=$?
+            cat "$OUT.log"
+            [ "$code" -eq "$want" ] || fail "expected exit $want, got $code ($*)"
+          }
+
+          echo "::group::json, no output: CLI default file"
+          rm -f frostfall.json frostfall-report.html
+          run_wrapper 1 FF_FORMAT=json
+          [ -f frostfall.json ] || fail "frostfall.json was not written"
+          jq -e . frostfall.json > /dev/null || fail "frostfall.json is not valid JSON"
+          grep -qx 'report-file=frostfall.json' "$OUT" || fail "report-file output: $(cat "$OUT")"
+          [ ! -e frostfall-report.html ] || fail "json run wrote frostfall-report.html"
+          echo "::endgroup::"
+
+          echo "::group::junit, no output: CLI default file"
+          rm -f frostfall-junit.xml
+          run_wrapper 1 FF_FORMAT=junit
+          [ -f frostfall-junit.xml ] || fail "frostfall-junit.xml was not written"
+          grep -qx 'report-file=frostfall-junit.xml' "$OUT" || fail "report-file output: $(cat "$OUT")"
+          echo "::endgroup::"
+
+          echo "::group::html, no output: unchanged default"
+          rm -f frostfall-report.html
+          run_wrapper 1
+          [ -f frostfall-report.html ] || fail "frostfall-report.html was not written"
+          grep -qx 'report-file=frostfall-report.html' "$OUT" || fail "report-file output: $(cat "$OUT")"
+          echo "::endgroup::"
+
+          echo "::group::screenshots: empty keeps the Actions default, false turns them off"
+          rm -rf frostfall-artifacts
+          run_wrapper 1
+          [ -n "$(find frostfall-artifacts -name '*.png' 2> /dev/null)" ] \
+            || fail "no screenshots with the default in Actions (the check below would prove nothing)"
+          rm -rf frostfall-artifacts
+          run_wrapper 1 FF_SCREENSHOTS=false
+          [ -z "$(find frostfall-artifacts -name '*.png' 2> /dev/null)" ] \
+            || fail "FF_SCREENSHOTS=false still wrote screenshots"
+          grep -qx 'tests-run=2' "$OUT" || fail "the scan did not complete: $(cat "$OUT")"
+          echo "::endgroup::"
+
+          echo "::group::id filter"
+          run_wrapper 1 FF_ID=fixture-initial
+          grep -qx 'tests-run=1' "$OUT" || fail "FF_ID=fixture-initial: $(cat "$OUT")"
+          echo "::endgroup::"
+
+          echo "::group::invalid screenshots and discover values stop before a scan"
+          rm -f frostfall-report.html
+          run_wrapper 2 FF_SCREENSHOTS=bogus
+          grep -q "input 'screenshots' must be" "$OUT.log" || fail "no screenshots validation message"
+          [ ! -s "$OUT" ] || fail "a scan ran: $(cat "$OUT")"
+          [ ! -e frostfall-report.html ] || fail "a report was written"
+          run_wrapper 2 FF_DISCOVER=yes
+          grep -q "input 'discover' must be" "$OUT.log" || fail "no discover validation message"
+          [ ! -s "$OUT" ] || fail "a scan ran: $(cat "$OUT")"
+          echo "::endgroup::"

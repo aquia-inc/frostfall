@@ -616,15 +616,21 @@ binary for the runner OS/arch (cached via tool-cache).
     serve: ./dist                 # optional: static mode override
     base-url: ""                  # optional: attach mode override
     baseline: .frostfall-baseline.json
-    format: sarif                 # default in CI
-    output: frostfall.sarif
+    format: sarif                 # default: html
+    output: ""                    # default: the format's file (frostfall.sarif for sarif)
+    profile: ""                   # empty = no flag (ci applies automatically); "none" = base config
+    id: ""                        # --id regex
+    path: ""                      # --path regex
+    discover: ""                  # "true" = --discover
+    screenshots: ""               # "" = CLI default (on in Actions); "true"/"false" = --screenshots/--no-screenshots
 - uses: github/codeql-action/upload-sarif@v3
   if: always()
   with:
     sarif_file: frostfall.sarif
 ```
 
-Inputs map 1:1 onto CLI flags. Unlike Emberfall, no inline-config-string input in v1: a11y configs
+Inputs map 1:1 onto CLI flags; `scripts/run.sh` builds the argument list from `FF_*` env vars, never from
+a script body. Unlike Emberfall, no inline-config-string input in v1: a11y configs
 reference steps and auth and belong in a file; inline configs also created Emberfall's runs-twice
 footgun when both were passed.
 
