@@ -1225,7 +1225,7 @@ them empty, so the examples below upload explicit file paths rather than
 
 | input | default | meaning |
 |-------|---------|---------|
-| `config` | `.frostfall.yml` | path to the config file |
+| `config` | empty | path to the config file; empty looks for `.frostfall.yml`, then `frostfall.yml` |
 | `serve` | - | static mode: serve this build directory (overrides the config's `server` block) |
 | `base-url` | - | attach mode: scan an already-running server (overrides the config's `server` block) |
 | `baseline` | - | path to the baseline file. Empty uses the config's `baseline:`, and falls back to `.frostfall-baseline.json` when that file exists (the pickup is announced on stderr). `none` ignores any baseline file |

@@ -11,8 +11,8 @@ branding:
 
 inputs:
   config:
-    description: Path to the Frostfall config file.
-    default: .frostfall.yml
+    description: "Path to the Frostfall config file. Empty lets the CLI look for .frostfall.yml, then frostfall.yml."
+    default: ""
   serve:
     description: "Static mode override: serve this build directory."
     default: ""

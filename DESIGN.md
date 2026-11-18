@@ -612,7 +612,7 @@ binary for the runner OS/arch (cached via tool-cache).
 ```yaml
 - uses: aquia-inc/frostfall@v1
   with:
-    config: .frostfall.yml        # default
+    config: .frostfall.yml        # default: empty (CLI finds .frostfall.yml, then frostfall.yml)
     serve: ./dist                 # optional: static mode override
     base-url: ""                  # optional: attach mode override
     baseline: .frostfall-baseline.json
