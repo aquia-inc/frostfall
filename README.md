@@ -421,6 +421,7 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--discover` | off | crawl same-origin links from `/` and scan discovered pages in addition to configured tests |
 | `--dry-run` | off | with `--discover`: print the discovered paths, one per line, and scan nothing |
 | `--screenshots` | off locally, **on in GitHub Actions** | capture an element-cropped PNG of each new violation |
+| `--no-screenshots` | off | disable screenshots even where they default on (GitHub Actions) |
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
 | `--browser-path PATH` | auto-detect | use this Chrome/Chromium binary instead of detection |
@@ -1215,19 +1216,63 @@ The action writes the HTML report by default and exposes job outputs
   run: echo "::warning::${{ steps.frostfall.outputs.new-violations }} new accessibility violations"
 ```
 
-For code scanning alerts, run a second step with `format: sarif` and upload:
+The outputs, `report-file` included, are written only when the scan completes.
+A run that fails before scanning (a bad config, an unreachable server) leaves
+them empty, so the examples below upload explicit file paths rather than
+`steps.<id>.outputs.report-file`.
+
+### Inputs
+
+| input | default | meaning |
+|-------|---------|---------|
+| `config` | empty | path to the config file; empty looks for `.frostfall.yml`, then `frostfall.yml` |
+| `serve` | - | static mode: serve this build directory (overrides the config's `server` block) |
+| `base-url` | - | attach mode: scan an already-running server (overrides the config's `server` block) |
+| `baseline` | - | path to the baseline file. Empty uses the config's `baseline:`, and falls back to `.frostfall-baseline.json` when that file exists (the pickup is announced on stderr). `none` ignores any baseline file |
+| `format` | `html` | report format: `text`, `html`, `sarif`, `json` or `junit` |
+| `output` | per format | where to write the report. Empty uses the CLI default for the format: `frostfall-report.html`, `frostfall.sarif`, `frostfall.json` or `frostfall-junit.xml` |
+| `profile` | - | config profile to apply. Empty passes no flag, so the `ci` profile still applies automatically when the config defines one. `none` forces the base config |
+| `id` | - | run only tests whose id matches this Go regex |
+| `path` | - | run only tests whose path matches this Go regex (combines with `id`) |
+| `discover` | - | `true` crawls same-origin links from `/` and scans the pages it finds in addition to configured tests. Anything other than `true`, `false` or empty fails the step |
+| `screenshots` | - | empty keeps the default, which is on in Actions. `true` forces screenshots on, `false` turns them off. Anything else fails the step |
+| `gh-issues` | `false` | `true` files and maintains GitHub issues for failing violations (the workflow needs `issues: write`). Only `true`, `false` or empty are accepted; anything else fails the step |
+
+Each input maps to the CLI flag of the same name; see the
+[command-line reference](#command-line-reference). The step exits with
+frostfall's own exit code. Values may not contain line breaks: a value with a
+CR or LF fails the step before any scan runs, which catches the trailing newline
+a YAML `|` block adds. Within a line, values are passed verbatim with no
+trimming, so leading or trailing spaces stay part of the value.
+
+### Code scanning (SARIF)
+
+For code scanning alerts, run a step with `format: sarif` and upload the file.
+With no `output`, the report is written to `frostfall.sarif`. The upload needs
+`security-events: write`:
 
 ```yaml
-- uses: aquia-inc/frostfall@v1
-  with:
-    serve: ./dist
-    format: sarif
-    output: frostfall.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  if: always()
-  with:
-    sarif_file: frostfall.sarif
+permissions:
+  contents: read
+  security-events: write
+steps:
+  - uses: aquia-inc/frostfall@v1
+    id: frostfall
+    with:
+      serve: ./dist
+      format: sarif
+  - uses: github/codeql-action/upload-sarif@v3
+    if: always() && steps.frostfall.outputs.report-file != ''
+    with:
+      sarif_file: frostfall.sarif
 ```
+
+The SARIF file and the `report-file` output are both written only when the
+scan completes, and that includes a scan that finds violations and exits 1. The
+upload is gated on the output rather than on the file, so a run that stopped
+early (a bad config, an unreachable server) has no output and skips the upload,
+and a leftover `frostfall.sarif` from an earlier run is never uploaded. The
+failed run reports its own error instead of a second one from the upload step.
 
 Violations land in the **Security tab** as code scanning alerts (scanning
 rendered pages, there is no source line to annotate, so no inline PR
@@ -1237,6 +1282,55 @@ churning. Baselined violations are omitted from the upload: known debt opens
 no alerts, and baselining an existing violation closes its alert on the next
 upload. In report mode the check stays green; add an `expect` block (or a
 `ci` profile) when you want red builds.
+
+### JUnit results
+
+`format: junit` writes `frostfall-junit.xml` for CI test dashboards. Upload it
+as an artifact so it survives a failing scan:
+
+```yaml
+- uses: aquia-inc/frostfall@v1
+  with:
+    serve: ./dist
+    format: junit
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: frostfall-junit
+    path: frostfall-junit.xml
+    if-no-files-found: ignore
+```
+
+### Profiles
+
+```yaml
+- uses: aquia-inc/frostfall@v1
+  with:
+    serve: ./dist
+    profile: staging
+```
+
+Leave `profile` empty to keep the automatic behavior: in Actions the `ci`
+profile applies when the config defines one. `profile: none` forces the base
+config even then.
+
+### Running a subset
+
+On pull requests, a fast pass over the tests whose id starts with `smoke-`:
+
+```yaml
+- uses: aquia-inc/frostfall@v1
+  if: github.event_name == 'pull_request'
+  with:
+    serve: ./dist
+    id: '^smoke-'
+```
+
+`id` and `path` are unanchored Go regexes (use `^` and `$` to anchor them); both apply when both are set. Set
+`screenshots: 'false'` to skip the violation screenshots that Actions
+captures by default.
+
+### Versions and runners
 
 Pin `@v1`. The action version is the tool version - there is no separate
 version input to drift. `@v1` resolves to the newest release under that major

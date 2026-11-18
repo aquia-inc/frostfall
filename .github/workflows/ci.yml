@@ -89,3 +89,338 @@ jobs:
           name: fixture-scan-evidence
           path: frostfall-artifacts/
           if-no-files-found: ignore
+
+  action-wrapper:
+    name: Action wrapper (scripts/run.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `uses: ./` cannot self-test: install.sh needs a release tag ref. This job
+    # builds the binary from the PR and drives the same wrapper the action
+    # runs, with the FF_* variables action.yml sets, so input handling is
+    # exercised on every PR.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build frostfall onto PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/frostfall" ./cmd/frostfall
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Wiring (action.yml and scripts/run.sh agree)
+        # No network and no scan: a new input, or a variable run.sh reads, must
+        # be wired through action.yml's env block, and the run lines must call
+        # the scripts through bash with a quoted path (no exec bit needed, no
+        # input interpolated into a script body).
+        run: |
+          set -u
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          read_vars="$(grep -oE 'FF_[A-Z][A-Z_]*' scripts/run.sh | sort -u)"
+          env_vars="$(grep -oE '^ +FF_[A-Z_]+:' action.yml | tr -d ' :' | sort -u)"
+          [ "$read_vars" = "$env_vars" ] || fail "FF_* read by run.sh and set in action.yml differ:
+          read by run.sh:
+          $read_vars
+          set in action.yml:
+          $env_vars"
+
+          inputs="$(awk '/^inputs:/{f=1;next} /^[a-z]/{f=0} f && /^  [a-z][a-z-]*:/{sub(/:.*/,"");gsub(/ /,"");print}' action.yml)"
+          [ -n "$inputs" ] || fail "no inputs found in action.yml"
+          # The expression opener is built in pieces: GitHub expands it inside
+          # a run: body before bash starts, backslash or not.
+          open='$'; open="$open{{"
+          for name in $inputs; do
+            var="FF_$(echo "$name" | tr 'a-z-' 'A-Z_')"
+            want="        $var: $open inputs.$name }}"
+            grep -qxF "$want" action.yml || fail "input '$name' is not mapped to $var"
+          done
+          # Defaults that must stay empty: a non-empty output default sends
+          # every format's report into one file name, and a non-empty config
+          # default stops the CLI finding frostfall.yml.
+          for name in output config; do
+            got="$(awk -v n="  $name:" '/^inputs:/{f=1;next} /^[a-z]/{f=0} f&&$0==n{g=1;next} g&&/^  [a-z]/{g=0} g&&/^    default:/{print;exit}' action.yml)"
+            [ "$got" = '    default: ""' ] || fail "input '$name' default must be empty, found: $got"
+          done
+          [ "$(echo "$inputs" | wc -l)" -eq "$(echo "$env_vars" | wc -l)" ] \
+            || fail "input count and FF_* count differ"
+
+          for script in install run; do
+            [ "$(grep -cxF "      run: bash \"\$GITHUB_ACTION_PATH/scripts/$script.sh\"" action.yml)" -eq 1 ] \
+              || fail "action.yml must run $script.sh as: bash \"\$GITHUB_ACTION_PATH/scripts/$script.sh\""
+          done
+          ! grep -E '^ +run:.*[$][{][{]' action.yml || fail "a run line interpolates an expression"
+          echo "wiring ok: $(echo "$inputs" | tr '\n' ' ')"
+
+      - name: Wrapper input handling
+        # The fixture exits 1 under its enforcing profile (planted
+        # violations), so exit 1 is the expected scan result here; any other
+        # code means the wrapper or the scan broke. GITHUB_ACTIONS=true on
+        # runners, so screenshots default on unless the input turns them off.
+        run: |
+          set -u
+          export GITHUB_ACTIONS=true
+          REPO="$PWD"
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          # run_wrapper EXPECTED_CODE [VAR=value ...]: runs scripts/run.sh
+          # from $RUN_DIR (default: the repo) with a clean FF_* environment
+          # and a fresh GITHUB_OUTPUT file (path left in $OUT), checks the
+          # exit code, and prints the log with lines that start with :: made
+          # inert so the negative cases leave no annotations on a green run.
+          # The raw log stays in $OUT.log for assertions.
+          run_wrapper() {
+            local want="$1"; shift
+            OUT="$(mktemp)"
+            local code=0
+            (
+              cd "${RUN_DIR:-$REPO}" &&
+              env -u FF_SERVE -u FF_BASE_URL -u FF_BASELINE -u FF_OUTPUT \
+                -u FF_GH_ISSUES -u FF_PROFILE -u FF_ID -u FF_PATH \
+                -u FF_DISCOVER -u FF_SCREENSHOTS -u GITHUB_STEP_SUMMARY \
+                FF_CONFIG=testdata/static/frostfall.yml FF_FORMAT=html \
+                GITHUB_OUTPUT="$OUT" "$@" "$REPO/scripts/run.sh"
+            ) > "$OUT.log" 2>&1 || code=$?
+            sed 's/^::/: :/' "$OUT.log"
+            [ "$code" -eq "$want" ] || fail "expected exit $want, got $code ($*)"
+          }
+          has_output() { grep -qx "$1" "$OUT" || fail "GITHUB_OUTPUT lacks $1: $(cat "$OUT")"; }
+          has_log() { grep -q "$1" "$OUT.log" || fail "log lacks \"$1\""; }
+          no_pngs() { [ -z "$(find frostfall-artifacts -name '*.png' 2> /dev/null)" ]; }
+
+          echo "::group::json, no output: CLI default file"
+          rm -f frostfall.json frostfall-report.html
+          run_wrapper 1 FF_FORMAT=json
+          [ -f frostfall.json ] || fail "frostfall.json was not written"
+          jq -e . frostfall.json > /dev/null || fail "frostfall.json is not valid JSON"
+          has_output 'report-file=frostfall.json'
+          [ ! -e frostfall-report.html ] || fail "json run wrote frostfall-report.html"
+          echo "::endgroup::"
+
+          echo "::group::junit, no output: CLI default file"
+          rm -f frostfall-junit.xml
+          run_wrapper 1 FF_FORMAT=junit
+          [ -f frostfall-junit.xml ] || fail "frostfall-junit.xml was not written"
+          has_output 'report-file=frostfall-junit.xml'
+          echo "::endgroup::"
+
+          echo "::group::html, no output: unchanged default"
+          rm -f frostfall-report.html
+          run_wrapper 1
+          [ -f frostfall-report.html ] || fail "frostfall-report.html was not written"
+          has_output 'report-file=frostfall-report.html'
+          echo "::endgroup::"
+
+          echo "::group::output: an explicit path wins (flat name: the CLI does not create directories)"
+          rm -f frostfall.json custom-report.json
+          run_wrapper 1 FF_FORMAT=json FF_OUTPUT=custom-report.json
+          [ -f custom-report.json ] || fail "custom-report.json was not written"
+          jq -e . custom-report.json > /dev/null || fail "custom-report.json is not valid JSON"
+          [ ! -e frostfall.json ] || fail "FF_OUTPUT was ignored: frostfall.json was written"
+          has_output 'report-file=custom-report.json'
+          echo "::endgroup::"
+
+          echo "::group::screenshots: empty keeps the Actions default, false turns them off"
+          rm -rf frostfall-artifacts
+          run_wrapper 1
+          no_pngs && fail "no screenshots with the default in Actions (the checks below would prove nothing)"
+          rm -rf frostfall-artifacts
+          run_wrapper 1 FF_SCREENSHOTS=false
+          no_pngs || fail "FF_SCREENSHOTS=false still wrote screenshots"
+          has_output 'tests-run=2'
+          echo "::endgroup::"
+
+          echo "::group::screenshots: true forces them on outside Actions"
+          rm -rf frostfall-artifacts
+          run_wrapper 1 GITHUB_ACTIONS=false
+          no_pngs || fail "screenshots were written outside Actions with no input"
+          run_wrapper 1 GITHUB_ACTIONS=false FF_SCREENSHOTS=true
+          no_pngs && fail "FF_SCREENSHOTS=true wrote no screenshots"
+          echo "::endgroup::"
+
+          echo "::group::id and path filters"
+          run_wrapper 1 FF_ID=fixture-initial
+          has_output 'tests-run=1'
+          run_wrapper 1 FF_ID='^fixture-dialog$'
+          has_output 'tests-run=1'
+          run_wrapper 1 FF_PATH='^/$'
+          has_output 'tests-run=2'
+          run_wrapper 2 FF_PATH='^/no-such-page$'
+          has_log 'no tests match the given filters'
+          echo "::endgroup::"
+
+          echo "::group::profile"
+          # The fixture has no ci profile, so write a copy of it with one. The
+          # base config is enforcing (exit 1); the ci overlay relaxes it to
+          # report-only (exit 0), which makes the profile's effect visible.
+          PROF="$(mktemp -d)"
+          sed "s|serve: testdata/static|serve: $REPO/testdata/static|" testdata/static/frostfall.yml > "$PROF/frostfall.yml"
+          printf '\nprofiles:\n  ci:\n    defaults:\n      expect: {}\n  staging:\n    defaults:\n      expect: {}\n' >> "$PROF/frostfall.yml"
+          run_wrapper 1 FF_CONFIG="$PROF/frostfall.yml" FF_PROFILE=none
+          has_output 'tests-run=2'
+          run_wrapper 0 FF_CONFIG="$PROF/frostfall.yml"
+          has_output 'tests-run=2'
+          run_wrapper 0 FF_CONFIG="$PROF/frostfall.yml" FF_PROFILE=staging
+          run_wrapper 2 FF_PROFILE=no-such-profile
+          has_log 'no-such-profile'
+          [ ! -s "$OUT" ] || fail "a scan ran with an unknown profile: $(cat "$OUT")"
+          echo "::endgroup::"
+
+          # A two-page site: index links to two.html, and the config lists
+          # only the index, so discovery has exactly one page to add.
+          SITE="$(mktemp -d)"
+          page() { printf '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>%s</title></head><body><main><h1>%s</h1>%s</main></body></html>\n' "$1" "$1" "$2" > "$SITE/$3"; }
+          page Home '<a href="/two.html">Second page</a>' index.html
+          page Second '<p>Nothing to find here.</p>' two.html
+          printf 'version: 1\ntests:\n  - id: home\n    path: /\n' > "$SITE/frostfall.yml"
+
+          echo "::group::discover"
+          run_wrapper 0 FF_CONFIG="$SITE/frostfall.yml" FF_SERVE="$SITE"
+          has_output 'tests-run=1'
+          run_wrapper 0 FF_CONFIG="$SITE/frostfall.yml" FF_SERVE="$SITE" FF_DISCOVER=true
+          has_output 'tests-run=2'
+          has_log 'discovered 1 page(s) beyond the configured tests'
+          echo "::endgroup::"
+
+          echo "::group::empty config: the CLI finds frostfall.yml on its own"
+          RUN_DIR="$SITE" run_wrapper 0 FF_CONFIG= FF_SERVE="$SITE"
+          has_output 'tests-run=1'
+          echo "::endgroup::"
+
+          echo "::group::invalid values stop before a scan"
+          rm -f frostfall-report.html
+          for kv in FF_SCREENSHOTS=bogus FF_DISCOVER=yes FF_GH_ISSUES=bogus; do
+            run_wrapper 2 "$kv"
+            name="$(echo "${kv%%=*}" | sed 's/^FF_//' | tr 'A-Z_' 'a-z-')"
+            has_log "input '$name' must be"
+            [ ! -s "$OUT" ] || fail "a scan ran with $kv: $(cat "$OUT")"
+            [ ! -e frostfall-report.html ] || fail "a report was written with $kv"
+          done
+          echo "::endgroup::"
+
+          echo "::group::line breaks in a free-text value are refused"
+          run_wrapper 2 FF_ID=$'a\nb'
+          has_log "input 'id' must not contain line breaks"
+          [ ! -s "$OUT" ] || fail "a scan ran with a line break in id: $(cat "$OUT")"
+          [ "$(grep -c '^::' "$OUT.log")" -eq 1 ] || fail "expected exactly one :: line"
+          grep -q '^::error::' "$OUT.log" || fail "the :: line is not the error"
+          run_wrapper 2 FF_PATH=$'^/\r'
+          has_log "input 'path' must not contain line breaks"
+          echo "::endgroup::"
+
+          echo "::group::an input value cannot inject workflow commands"
+          run_wrapper 2 FF_DISCOVER=$'x\n::set-output name=new-violations::0'
+          has_log "input 'discover' must be"
+          ! grep -q '^::set-output' "$OUT.log" || fail "a newline in an input started a workflow command"
+          [ "$(grep -c '' "$OUT.log")" -eq 1 ] || fail "the error spans more than one line"
+          has_log '%0A::set-output'
+          echo "::endgroup::"
+
+  action-wrapper-macos:
+    name: Action wrapper on bash 3.2 (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # macOS runners ship bash 3.2 as /bin/bash. run.sh must work there, so it
+    # runs under /bin/bash against a stub frostfall that records its arguments.
+    # No Chrome and no scan.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: run.sh under /bin/bash with a stub frostfall
+        run: |
+          set -u
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          ver="$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"')"
+          echo "/bin/bash is $ver"
+          [ "$ver" = 3.2 ] || echo "::warning::/bin/bash is $ver, not 3.2: this run checks $ver, not 3.2"
+
+          REPO="$PWD"
+          STUB="$(mktemp -d)"
+          export STUB_OUT="$STUB/args"
+          cat > "$STUB/frostfall" <<'STUBEOF'
+          #!/bin/sh
+          printf '%s\n' "$@" > "$STUB_OUT"
+          exit "${STUB_EXIT:-0}"
+          STUBEOF
+          chmod +x "$STUB/frostfall"
+
+          # run_wrapper EXPECTED_CODE [VAR=value ...]: runs run.sh under
+          # /bin/bash with a clean FF_* environment. Arguments the stub saw
+          # are in $STUB_OUT (absent when frostfall never ran); the combined
+          # output is in $LOG, with lines that start with :: made inert.
+          run_wrapper() {
+            local want="$1"; shift
+            rm -f "$STUB_OUT"
+            LOG="$STUB/log"
+            local code=0
+            env -u FF_CONFIG -u FF_SERVE -u FF_BASE_URL -u FF_BASELINE \
+              -u FF_FORMAT -u FF_OUTPUT -u FF_GH_ISSUES -u FF_PROFILE \
+              -u FF_ID -u FF_PATH -u FF_DISCOVER -u FF_SCREENSHOTS \
+              PATH="$STUB:$PATH" "$@" /bin/bash "$REPO/scripts/run.sh" > "$LOG" 2>&1 || code=$?
+            sed 's/^::/: :/' "$LOG"
+            [ "$code" -eq "$want" ] || fail "expected exit $want, got $code ($*)"
+          }
+          # args_are WANT...: the stub saw exactly these arguments, in order.
+          args_are() {
+            [ -f "$STUB_OUT" ] || fail "frostfall did not run"
+            printf '%s\n' "$@" > "$STUB/want"
+            diff "$STUB/want" "$STUB_OUT" || fail "argv differs from the expected one"
+          }
+
+          echo "::group::every input, in order, one argument each"
+          run_wrapper 0 FF_CONFIG=cfg.yml FF_SERVE=./dist FF_BASE_URL=http://localhost:3000 \
+            FF_BASELINE=base.json FF_FORMAT=sarif FF_OUTPUT=out.sarif FF_PROFILE=staging \
+            FF_ID='smoke-.*|a b' FF_PATH='^/a b$' FF_DISCOVER=true FF_GH_ISSUES=true \
+            FF_SCREENSHOTS=true
+          args_are --format sarif --config cfg.yml --serve ./dist --base-url http://localhost:3000 \
+            --baseline base.json --output out.sarif --profile staging --id 'smoke-.*|a b' \
+            --path '^/a b$' --discover --gh-issues --screenshots
+          echo "::endgroup::"
+
+          echo "::group::empty inputs add no flags, and an empty format means html"
+          run_wrapper 0 FF_CONFIG= FF_FORMAT=
+          args_are --format html
+          echo "::endgroup::"
+
+          echo "::group::screenshots false"
+          run_wrapper 0 FF_SCREENSHOTS=false
+          args_are --format html --no-screenshots
+          echo "::endgroup::"
+
+          echo "::group::frostfall's exit code is the step's"
+          run_wrapper 1 STUB_EXIT=1
+          args_are --format html
+          echo "::endgroup::"
+
+          echo "::group::an invalid bool exits 2 before frostfall runs"
+          run_wrapper 2 FF_DISCOVER=yes
+          grep -q "input 'discover' must be" "$LOG" || fail "no validation message"
+          [ ! -e "$STUB_OUT" ] || fail "frostfall ran"
+          echo "::endgroup::"
+
+          echo "::group::line breaks are refused"
+          run_wrapper 2 FF_ID=$'a\nb'
+          grep -q "input 'id' must not contain line breaks" "$LOG" || fail "no line-break message"
+          [ ! -e "$STUB_OUT" ] || fail "frostfall ran"
+          [ "$(grep -c '^::' "$LOG")" -eq 1 ] || fail "expected exactly one :: line"
+          run_wrapper 2 FF_CONFIG=$'cfg.yml\r'
+          grep -q "input 'config' must not contain line breaks" "$LOG" || fail "no CR message"
+          [ ! -e "$STUB_OUT" ] || fail "frostfall ran"
+          echo "::endgroup::"
+
+          echo "::group::an error message cannot inject workflow commands"
+          run_wrapper 2 FF_SCREENSHOTS=$'x\n::set-output name=new-violations::0'
+          ! grep -q '^::set-output' "$LOG" || fail "a newline in an input started a workflow command"
+          [ "$(grep -c '' "$LOG")" -eq 1 ] || fail "the error spans more than one line"
+          grep -q '%0A::set-output' "$LOG" || fail "the newline was not escaped"
+          echo "::endgroup::"
