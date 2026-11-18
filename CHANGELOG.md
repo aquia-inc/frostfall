@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.10.0](https://github.com/aquia-inc/frostfall/compare/v1.9.0...v1.10.0) (2026-11-18)
+
+### Features
+
+* **action:** add profile, id, path, discover and screenshots inputs, and fix the install step ([#72](https://github.com/aquia-inc/frostfall/issues/72)) ([8d2108a](https://github.com/aquia-inc/frostfall/commit/8d2108a288026e0fae24d434cd38749a7ac0b099))
+
 ## [1.9.0](https://github.com/aquia-inc/frostfall/compare/v1.8.0...v1.9.0) (2026-11-16)
 
 ### Features
