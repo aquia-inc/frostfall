@@ -44,7 +44,7 @@ inputs:
     description: 'Violation screenshots. Empty keeps the CLI default (on in Actions). "true" forces them on, "false" disables them.'
     default: ""
   gh-issues:
-    description: Set "true" to file/maintain GitHub issues for failing violations (workflow needs issues write permission).
+    description: 'Set "true" to file/maintain GitHub issues for failing violations (workflow needs issues write permission). Only "true", "false" or empty are accepted.'
     default: "false"
 
 outputs:
@@ -71,7 +71,7 @@ runs:
       shell: bash
       # The action version IS the tool version: this ref-pinned script resolves
       # the release matching the action's own tag, so @v1 can never drift.
-      run: ${{ github.action_path }}/scripts/install.sh
+      run: bash "$GITHUB_ACTION_PATH/scripts/install.sh"
       env:
         FROSTFALL_ACTION_REF: ${{ github.action_ref }}
 
@@ -94,4 +94,4 @@ runs:
         FF_PATH: ${{ inputs.path }}
         FF_DISCOVER: ${{ inputs.discover }}
         FF_SCREENSHOTS: ${{ inputs.screenshots }}
-      run: ${{ github.action_path }}/scripts/run.sh
+      run: bash "$GITHUB_ACTION_PATH/scripts/run.sh"

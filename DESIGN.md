@@ -600,7 +600,7 @@ that speak nothing else.
 **GitHub extras** (auto-enabled when `GITHUB_ACTIONS=true`): a markdown table to
 `$GITHUB_STEP_SUMMARY` (new violations, top rules, fixable-debt count); job outputs written via
 `$GITHUB_OUTPUT`: `new-violations`, `baselined-violations`, `stale-baseline-entries`, `tests-run`,
-`sarif-file`.
+`report-file`.
 
 ## 10. GitHub Action (frozen interface)
 
