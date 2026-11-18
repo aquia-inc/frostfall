@@ -1825,3 +1825,147 @@ func TestWriteReportFileErrorNamesTheOutputPath(t *testing.T) {
 		t.Errorf("%s was replaced or removed: %v %v", full, fi, serr)
 	}
 }
+
+// reportTargets reads a json report and returns "testId ruleId target" for
+// every violation in it, sorted.
+func reportTargets(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep struct {
+		Tests []struct {
+			ID         string `json:"id"`
+			ScanPoints []struct {
+				Violations []struct {
+					RuleID string `json:"ruleId"`
+					Target string `json:"target"`
+				} `json:"violations"`
+			} `json:"scanPoints"`
+		} `json:"tests"`
+	}
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	out := []string{}
+	for _, tc := range rep.Tests {
+		for _, sp := range tc.ScanPoints {
+			for _, v := range sp.Violations {
+				out = append(out, tc.ID+" "+v.RuleID+" "+v.Target)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// The static fixture's frames page through the real entry point: the planted
+// violations inside its same-origin and cross-site frames are reported with
+// frame-qualified targets, and each gets a screenshot of its frame in the top
+// document (the node's own selector means nothing there).
+func TestFixtureFramesReported(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	t.Chdir("../..")
+	dir := t.TempDir()
+	out := filepath.Join(dir, "report.json")
+	shots := filepath.Join(dir, "shots")
+	code, stderr := runCaptured(t, "--config", "testdata/static/frostfall.yml", "--id", "^fixture-frames$",
+		"--format", "json", "--output", out, "--screenshots", "--screenshot-dir", shots, "--baseline", "none")
+	if code != exitViolations {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitViolations, stderr)
+	}
+	want := []string{
+		"fixture-frames image-alt #same-frame |> img",
+		"fixture-frames label #cross-frame |> #cross-unlabeled",
+	}
+	if got := reportTargets(t, out); !slices.Equal(got, want) {
+		t.Errorf("violations = %q, want %q", got, want)
+	}
+	pngs, _ := filepath.Glob(filepath.Join(shots, "*.png"))
+	if len(pngs) != 2 {
+		t.Errorf("screenshots = %q, want one per frame violation", pngs)
+	}
+	if strings.Contains(stderr, "warning:") {
+		t.Errorf("unexpected warning: %s", stderr)
+	}
+}
+
+// frames: false keeps a test's scans in the top document, and
+// defaults.frames: false does so for every test without its own setting
+// (discovered ones included); the frames page's top document is clean.
+func TestFramesOptOut(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	write := func(name, defaults, test string) string {
+		cfg := filepath.Join(dir, name)
+		body := "version: 1\nserver:\n  serve: " + filepath.Join(root, "testdata/static") + "\n" +
+			defaults + "tests:\n  - id: frames\n    path: /frames.html\n" + test
+		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	cases := []struct {
+		name string
+		cfg  string
+		want int
+	}{
+		{"test off", write("test-off.yml", "", "    frames: false\n"), 0},
+		{"default off", write("default-off.yml", "defaults:\n  frames: false\n", ""), 0},
+		{"default off, test on", write("test-on.yml", "defaults:\n  frames: false\n", "    frames: true\n"), 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(dir, tc.name+".json")
+			if code, stderr := runCaptured(t, "--config", tc.cfg, "--format", "json", "--output", out, "--no-screenshots", "--baseline", "none"); code != exitOK {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+			}
+			if got := reportTargets(t, out); len(got) != tc.want {
+				t.Errorf("violations = %q, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A signed-in run scans the auth fixture's cross-site frame and prints its
+// violation's target with the attribute values dropped in every frame level:
+// the frame's own title and the link's href (a stand-in for an account token)
+// appear nowhere.
+func TestSignedInFrameTargetScrubbed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	t.Chdir("../..")
+	out := filepath.Join(t.TempDir(), "report.json")
+	code, stdout, stderr := runBoth(t, "--config", "testdata/auth/frostfall.yml", "--verbose", "--format", "json", "--output", out, "--no-screenshots", "--baseline", "none")
+	if code != exitViolations {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitViolations, stderr)
+	}
+	want := []string{
+		"protected image-alt img",
+		"protected link-name iframe[title] |> a[href]",
+	}
+	if got := reportTargets(t, out); !slices.Equal(got, want) {
+		t.Errorf("violations = %q, want %q", got, want)
+	}
+	report, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"FRAMESECRET42", "Account widget"} {
+		for name, haystack := range map[string]string{"stdout": stdout, "stderr": stderr, "report": string(report)} {
+			if strings.Contains(haystack, secret) {
+				t.Errorf("%q reached the %s", secret, name)
+			}
+		}
+	}
+}

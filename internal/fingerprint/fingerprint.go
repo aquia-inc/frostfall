@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"regexp"
 	"strings"
+
+	"github.com/aquia-inc/frostfall/internal/engine"
 )
 
 // Fingerprint returns the identity hash: first 16 bytes of
@@ -35,7 +37,7 @@ var (
 	// Generated-looking ids: a run of 8+ hex chars, a purely numeric suffix
 	// of 4+ digits, or a React useId (":r1a:", seen with CSS escaping
 	// stripped). CSS-module hashes and React ids regenerate per build/session.
-	generatedIDRe     = regexp.MustCompile(GeneratedIDPattern)
+	generatedIDRe = regexp.MustCompile(GeneratedIDPattern)
 	// Hash-like class names that churn between builds.
 	hashClassRes = []*regexp.Regexp{
 		// Emotion/MUI: css-10u3qtx and css-10u3qtx-MuiChip-root. The Mui*
@@ -60,7 +62,61 @@ var (
 //     feature (id, surviving class, attribute, role)
 //   - if a segment within the last 4 carries a non-generated id, the path is
 //     truncated to start there (everything above an anchor id is noise)
+//
+// A frame-qualified target (frame levels joined by engine.FrameSeparator) is
+// normalized one frame level at a time, and the levels are joined again with
+// the separator. An anchor id inside a frame therefore truncates only that
+// frame's level, never the path to the frame. A target with one level, which
+// is every target in the top document, takes the single-level path exactly as
+// it did before frames were supported, so its fingerprint is unchanged.
 func StableTarget(raw string) string {
+	levels := SplitFrames(raw)
+	if len(levels) == 1 {
+		return stablePath(raw)
+	}
+	for i, level := range levels {
+		levels[i] = stablePath(level)
+	}
+	return strings.Join(levels, engine.FrameSeparator)
+}
+
+// SplitFrames splits a target into its frame levels at engine.FrameSeparator,
+// top document first. The separator counts only outside attribute brackets
+// and quotes: an attribute value (kept in an unsigned run) may contain the
+// separator's text, and must not split there. A backslash escapes the next
+// byte. A target with no separator is one level, returned as it is.
+func SplitFrames(target string) []string {
+	var levels []string
+	depth, start := 0, 0
+	var quote byte
+	for i := 0; i < len(target); i++ {
+		c := target[i]
+		switch {
+		case c == '\\':
+			i++
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '[':
+			depth++
+		case c == ']':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0 && strings.HasPrefix(target[i:], engine.FrameSeparator):
+			levels = append(levels, target[start:i])
+			i += len(engine.FrameSeparator) - 1
+			start = i + 1
+		}
+	}
+	return append(levels, target[start:])
+}
+
+// stablePath normalizes one frame level of a target.
+func stablePath(raw string) string {
 	segments := splitPath(raw)
 	for i, seg := range segments {
 		segments[i] = normalizeSegment(seg)

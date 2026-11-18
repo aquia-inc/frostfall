@@ -19,7 +19,7 @@ The end-to-end check scans a fixture page with planted violations:
 
 ```bash
 go run ./cmd/frostfall --config testdata/static/frostfall.yml
-# exits 1 by design - the fixture's enforcing config finds 4 violations
+# exits 1 by design - the fixture's enforcing config finds 8 violations
 ```
 
 ## The contracts

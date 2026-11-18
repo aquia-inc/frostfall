@@ -18,6 +18,19 @@
     <!-- planted: image-alt (critical). Reaching this page is what the
          expected exit 1 proves: a scan of the login page finds nothing. -->
     <img src="logo.png">
+
+    <!-- A cross-site frame with a planted violation of its own (frame.html).
+         127.0.0.1 and localhost are different sites; the src is set from
+         script because the fixture server's port is ephemeral. The empty
+         second frame makes axe tell the two apart by an attribute value, so
+         the frame level of the target has a value to drop as well. -->
+    <iframe title="Account widget"></iframe>
+    <iframe title="Help panel" src="about:blank"></iframe>
+    <script>
+      const other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      document.querySelector('iframe[title="Account widget"]').src =
+        location.protocol + '//' + other + ':' + location.port + '/frame.html';
+    </script>
   </main>
 </body>
 </html>

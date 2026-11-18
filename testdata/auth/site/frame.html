@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Auth fixture: embedded account widget</title>
+</head>
+<body>
+  <main>
+    <p>A cross-site widget embedded in the protected page, the way an
+    identity provider's or payment processor's frame would be.</p>
+    <!-- planted: link-name (serious). axe can tell the two links apart only
+         by their href, so the violation's selector carries the href value,
+         a stand-in for a token. A signed-in run must print it without. -->
+    <a href="/statement?acct=FRAMESECRET42"></a>
+    <a href="/help">Help</a>
+  </main>
+</body>
+</html>

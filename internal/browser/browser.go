@@ -27,13 +27,33 @@ type Browser struct {
 	launcher *launcher.Launcher
 }
 
+// LaunchOptions adjusts how the browser is started.
+type LaunchOptions struct {
+	// SiteIsolation runs cross-site frames in renderer processes of their
+	// own, as desktop Chrome does for its users; each is then a separate CDP
+	// target (an out-of-process frame). rod's launcher turns site isolation
+	// off by default, and Launch keeps that: frames of every origin then
+	// share the page's process. Scans reach frames either way.
+	SiteIsolation bool
+}
+
 // Launch finds a system Chrome (GitHub runners and most dev machines have
 // one) or lets rod's launcher download a managed Chromium, then connects.
 func Launch(browserPath string) (*Browser, error) {
+	return LaunchWith(browserPath, LaunchOptions{})
+}
+
+// LaunchWith is Launch with options.
+func LaunchWith(browserPath string, o LaunchOptions) (*Browser, error) {
 	// disable-dev-shm-usage: containers default /dev/shm to 64MB and Chromium
 	// crashes tabs when it fills on large pages; writing shared memory to
 	// /tmp instead is the standard CI mitigation and harmless elsewhere.
 	l := launcher.New().Headless(true).Set("disable-dev-shm-usage")
+	if o.SiteIsolation {
+		// rod's defaults disable site-per-process and TranslateUI in one
+		// flag; keep the second.
+		l = l.Set("disable-features", "TranslateUI").Delete("disable-site-isolation-trials")
+	}
 	if browserPath != "" {
 		l = l.Bin(browserPath)
 	} else if path, ok := launcher.LookPath(); ok {
@@ -76,6 +96,10 @@ type Session struct {
 	// other secrets; set for authenticated runs only, so a config without
 	// auth reports exactly what it always did.
 	redact bool
+	// detach releases the contexts of out-of-process frames this session
+	// attached to (see attachFrame); outOfProcess counts those attaches.
+	detach       []context.CancelFunc
+	outOfProcess int
 }
 
 // setTimeout restarts the session's time budget at d.
@@ -138,6 +162,9 @@ func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) 
 func (s *Session) Close() {
 	s.page.CancelTimeout().Close()
 	s.ctx.Close()
+	for _, cancel := range s.detach {
+		cancel()
+	}
 }
 
 // dropSeed stops the auth storage script from running on later documents.
@@ -462,25 +489,9 @@ func (s *Session) BackendNodeID(selector string) (proto.DOMBackendNodeID, error)
 
 // Eval implements engine.Page.
 func (s *Session) Eval(js string, args ...any) (json.RawMessage, error) {
-	res, err := s.page.Eval(js, args...)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(res.Value.JSON("", "")), nil
+	return evalJSON(s.page, js, args...)
 }
 
 // InjectScript implements engine.Page, idempotently: engines guard their own
 // globals, and axe re-evaluation is harmless but slow, so skip when present.
-func (s *Session) InjectScript(src string) error {
-	present, err := s.page.Eval("() => !!window.axe")
-	if err == nil && present.Value.Bool() {
-		return nil
-	}
-	_, err = s.page.Eval(src)
-	if err != nil {
-		// axe.min.js is a bare script, not an expression; evaluate via a
-		// function wrapper.
-		_, err = s.page.Eval(fmt.Sprintf("() => { %s }", src))
-	}
-	return err
-}
+func (s *Session) InjectScript(src string) error { return inject(s.page, src) }

@@ -214,6 +214,7 @@ defaults:                        # applied to every test unless overridden
   keyboard: true                 # keyboard-audit every test's initial state,
                                  # discovered ones included (default off;
                                  # a test opts out with keyboard: false)
+  frames: true                   # scan inside iframes (default true; see Iframes)
   expect:                        # ABSENT = report-only, always exit 0
     severity: serious            # fail on new violations at this impact or worse:
                                  #   minor | moderate | serious | critical
@@ -269,6 +270,8 @@ tests:
                                  # the initial state (default false)
     auth: false                  # run without the configured auth: no session,
                                  # no login guard (public pages, signed-out states)
+    frames: false                # keep this test's scans out of iframes
+                                 # (default: defaults.frames, else true)
     expect:                      # per-test enforcement override
       severity: critical
     steps: []                    # see the step table below
@@ -401,6 +404,41 @@ actually is:
       - press: Escape
       - expectFocus: { label: closed, name: Delete }            # and came back
 ```
+
+### Iframes
+
+Scans reach into iframes. axe runs in the page and in every frame below it,
+same-origin and cross-origin, nested frames included, and the results merge
+into one set per scan point, so baselines, reports and `--gh-issues` treat a
+violation inside a frame like any other. A finding's target names the path
+to it, one selector per frame level joined with ` |> `:
+
+```text
+label at #payment-frame |> #card-number
+```
+
+The part before the first ` |> ` is the frame's element in the page; the
+last part is the element inside the frame. Targets in the page itself are
+unchanged, and so are their fingerprints: upgrading only adds findings for
+content inside frames. A screenshot of a finding inside a frame shows the
+frame's element in the page.
+
+Turn it off for a test whose frames are out of your hands (a third-party
+chat widget that only produces noise) with `frames: false`, or for every
+test without a setting of its own, discovered ones included, with
+`defaults: { frames: false }`. A test's own `frames` wins over the default.
+
+- `scope` is a selector in the page, not inside a frame. A frame within the
+  scope is scanned in full.
+- A frame that cannot be reached, or does not answer within its own deadline
+  (10 seconds, cut short by the test's `timeout`), is left out with a warning
+  naming it, and the rest of the page is still scanned. Such a scan does not
+  count as having checked the test's page, so its baselined findings are not
+  marked stale and their issues stay open. For a signed-in test the warning
+  names the frame with attribute values dropped and without the error text. A frame that hangs the page itself (one running in the page's
+  process) still uses up the test's `timeout`.
+- Keyboard audits, screen reader transcripts and `expectFocus` stay in the
+  page and do not enter frames yet.
 
 ## Command-line reference
 

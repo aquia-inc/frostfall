@@ -316,6 +316,7 @@ func run(args []string) int {
 		ScreenshotDir: shotDir,
 		Verbose:       *verbose,
 		Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
+		Warn:          func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) },
 	}
 	if *discoverFlag {
 		if w := discoverAuthWarning(cfg); w != "" {
