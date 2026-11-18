@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.11.0](https://github.com/aquia-inc/frostfall/compare/v1.10.0...v1.11.0) (2026-11-18)
+
+### Features
+
+* **axe:** scan iframe content with axe runPartial/finishRun ([#76](https://github.com/aquia-inc/frostfall/issues/76)) ([4603f77](https://github.com/aquia-inc/frostfall/commit/4603f77e0cf58d94d82616a9f7c014513f6ea15f)), closes [#73](https://github.com/aquia-inc/frostfall/issues/73)
+
 ## [1.10.0](https://github.com/aquia-inc/frostfall/compare/v1.9.0...v1.10.0) (2026-11-18)
 
 ### Features
