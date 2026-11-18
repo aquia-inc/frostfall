@@ -28,6 +28,23 @@ jobs:
       - name: Unit tests
         run: go test -timeout 15m ./...
 
+      - name: Headed attach focus test (virtual display)
+        # Attach mode runs tests in the user's own headed Chrome, where
+        # Frostfall's window is often not the focused one. This opens a headed
+        # Chrome on a virtual display and checks that focus emulation keeps
+        # document.hasFocus() true on Frostfall's pages while another window
+        # has focus, after a page without emulation has shown that focus really
+        # moved. Xvfb alone has no window manager to hand focus to a new
+        # window, so fluxbox runs in it, as a desktop would. FF_REQUIRE_HEADED
+        # turns "no display" and "focus never moved" into failures instead of
+        # the skips a run without a display gets.
+        env:
+          FF_REQUIRE_HEADED: "1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fluxbox
+          xvfb-run -a sh -c 'fluxbox > /dev/null 2>&1 & sleep 2; go test -count=1 -run "^TestAttachedPagesKeepFocusInAHeadedBrowser$" -v ./internal/browser/'
+
       - name: Integration test (fixture scan)
         # Runners ship Chrome; the fixture has 8 planted violations (2 of them
         # inside frames on frames.html), so the enforcing profile of this

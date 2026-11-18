@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 
 	"github.com/aquia-inc/frostfall/internal/config"
@@ -70,6 +71,10 @@ type AuthOptions struct {
 	// Warn receives findings that do not stop the run but should always be
 	// seen, such as a setup that left no session behind.
 	Warn func(format string, args ...any)
+	// Note receives facts about the session that should always be seen, such
+	// as which origins' sessions were taken from an attached browser (counts
+	// only, never a name or value).
+	Note func(format string, args ...any)
 	// FirstTest is the path (or absolute URL) of the first explicit test that
 	// uses auth. The startup probe loads it signed out too, since that is the
 	// page the guard will be judging first. Empty to probe the rest only.
@@ -86,8 +91,9 @@ type Auth struct {
 	defaults config.Defaults
 	opts     AuthOptions
 
-	// state is restored into every context: the file's, or what the one
-	// setup run captured. Nil when setup runs per context.
+	// state is restored into every context: the file's, what the one setup
+	// run captured, or what was read from the attached browser. Nil when
+	// setup runs per context.
 	state *State
 	// setup is the login flow each context runs for itself (reuse: false).
 	setup *config.AuthSetup
@@ -110,9 +116,10 @@ type Auth struct {
 }
 
 // NewAuth prepares the config's auth block: it loads a storage-state file's
-// contents or, with setup and reuse, runs the login flow once now, before any
-// test, in a context of its own. It returns nil for a config without auth. A
-// setup failure is an environment error.
+// contents, reads the session of an attached browser (attach: true, with b
+// from Connect), or, with setup and reuse, runs the login flow once now,
+// before any test, in a context of its own. It returns nil for a config
+// without auth. A setup failure is an environment error.
 func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (*Auth, error) {
 	if cfg.Auth == nil {
 		return nil, nil
@@ -162,6 +169,11 @@ func NewAuth(b *Browser, cfg *config.Config, baseURL string, opts AuthOptions) (
 	}
 
 	switch {
+	case cfg.Auth.Attach:
+		// First: an attach block has no setup, and ReuseSetup would read true.
+		if a.state, err = a.captureAttached(b); err != nil {
+			return nil, err
+		}
 	case cfg.Auth.State != nil:
 		if a.state, err = stateFromFile(cfg.Auth.State); err != nil {
 			return nil, fmt.Errorf("auth storageState: %w", err)
@@ -373,6 +385,12 @@ func (s *Session) landedLoosely() (*url.URL, error) {
 func (a *Auth) logf(format string, args ...any) {
 	if a.opts.Log != nil {
 		a.opts.Log(format, args...)
+	}
+}
+
+func (a *Auth) notef(format string, args ...any) {
+	if a.opts.Note != nil {
+		a.opts.Note(format, args...)
 	}
 }
 
@@ -752,8 +770,11 @@ type storageSnapshot struct {
 	Session [][2]string `json:"session"`
 }
 
-func (s *Session) snapshotStorage() (*storageSnapshot, error) {
-	raw, err := s.Eval(`() => {
+func (s *Session) snapshotStorage() (*storageSnapshot, error) { return snapshotPage(s.page) }
+
+// snapshotPage is snapshotStorage for any page.
+func snapshotPage(p *rod.Page) (*storageSnapshot, error) {
+	res, err := p.Eval(`() => {
 		const dump = (name) => {
 			try { const s = window[name]; return Object.keys(s).map(k => [k, s.getItem(k)]) }
 			catch (e) { return [] }
@@ -764,7 +785,7 @@ func (s *Session) snapshotStorage() (*storageSnapshot, error) {
 		return nil, err
 	}
 	var snap storageSnapshot
-	if err := json.Unmarshal(raw, &snap); err != nil {
+	if err := json.Unmarshal([]byte(res.Value.JSON("", "")), &snap); err != nil {
 		return nil, err
 	}
 	return &snap, nil
@@ -816,15 +837,7 @@ func (a *Auth) capture(s *Session, visited []string) (*State, error) {
 		return nil, err
 	}
 	for _, c := range cookies {
-		p := &proto.NetworkCookieParam{
-			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
-			Secure: c.Secure, HTTPOnly: c.HTTPOnly, SameSite: c.SameSite,
-			Priority: c.Priority, PartitionKey: c.PartitionKey,
-		}
-		if !c.Session {
-			p.Expires = c.Expires
-		}
-		st.cookies = append(st.cookies, p)
+		st.cookies = append(st.cookies, cookieParam(c))
 	}
 	return st, nil
 }

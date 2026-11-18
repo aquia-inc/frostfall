@@ -84,7 +84,7 @@ bind mount (the image's own user cannot write host-owned directories):
 ```bash
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" \
   ghcr.io/aquia-inc/frostfall:v1 --serve dist --format html
-# attach mode against a server on your host needs host networking:
+# running-server mode against a server on your host needs host networking:
 docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" \
   ghcr.io/aquia-inc/frostfall:v1 --base-url http://localhost:5173
 ```
@@ -112,7 +112,7 @@ server mode:
 ```yaml
 server:
   serve: ./dist                      # A: Frostfall serves a static build itself
-  # baseUrl: http://localhost:5173   # B: attach to a server you already run
+  # baseUrl: http://localhost:5173   # B: scan a server you already run
   # command: yarn dev                # C: (planned) Frostfall starts the dev server
 ```
 
@@ -197,7 +197,7 @@ name: my-app                     # optional: app identity for report headers.
 server:                          # where the app comes from - exactly one mode
   serve: ./dist                  # serve this directory on an ephemeral port
   spaFallback: true              # serve mode: unknown paths fall back to index.html
-  baseUrl: http://localhost:5173 # or: attach to an already-running server
+  baseUrl: http://localhost:5173 # or: scan an already-running server
   command: yarn dev              # or: spawn the dev server (planned, not yet implemented)
 
 defaults:                        # applied to every test unless overridden
@@ -233,6 +233,8 @@ auth:                            # optional: sign in before testing (see Auth be
                                  # signed-in page and on no login page
   reuse: true                    # log in once, restore into every test (default)
   # storageState: .auth/state.json   # or: a Playwright storage-state file
+  # attach: true                 # or: the session of your own signed-in Chrome,
+                                 # with --browser-url (local runs only)
   # loginPath: /login            # optional, no default: the login URL, for clearer
                                # messages and so discovery skips it
   # allowedOrigins: ["https://login.example.com"]   # SSO providers a setup flow
@@ -469,7 +471,7 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | flag | default | meaning |
 |------|---------|---------|
 | `--config PATH` | `.frostfall.yml`, then `frostfall.yml` | config file to use |
-| `--base-url URL` | - | attach mode: scan an already-running server (overrides the config's `server` block) |
+| `--base-url URL` | - | running-server mode: scan an already-running server (overrides the config's `server` block) |
 | `--serve DIR` | - | static mode: serve DIR with the embedded file server (overrides `server`) |
 | `--baseline PATH` | value of `baseline:` in config | baseline file location |
 | `--update-baseline` | off | accept all current violations into the baseline and exit 0 |
@@ -482,6 +484,7 @@ frostfall init             detect the project and write a starter .frostfall.yml
 | `--screenshot-dir DIR` | `frostfall-artifacts` | where screenshots are written |
 | `--profile NAME` | `ci` in CI when defined, else none | apply a named profile overlay from the config; `none` forces the base config even in CI |
 | `--browser-path PATH` | auto-detect | use this Chrome/Chromium binary instead of detection |
+| `--browser-url URL` | - | scan with the session of a Chrome you started with `--remote-debugging-port` and signed in to: its DevTools address (`http://localhost:9222`) or `ws://` browser URL, on this machine only. Needs `auth.attach: true`; cannot be combined with `--browser-path`. See [Attach to your own Chrome](#attach-to-your-own-chrome) |
 | `--format NAME` | `text` | report format: `text` (terminal), `html` (single-file report), `sarif` (GitHub code scanning), `json` (structured results), or `junit` (CI test dashboards). Text is always printed; the others are also written to `--output` |
 | `--output PATH` | `frostfall-report.html` / `frostfall.sarif` / `frostfall.json` / `frostfall-junit.xml` | where to write the formatted report |
 | `--gh-issues` | off | file/maintain GitHub issues for failing violations (CI; needs `GITHUB_TOKEN`, `GITHUB_REPOSITORY`) |
@@ -501,8 +504,9 @@ PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
 |------|---------|
 | 0 | ran to completion, nothing broke the enforcement contract (report-only mode always exits 0) |
 | 1 | new violations broke the configured `expect` contract |
-| 2 | invalid config, including an `auth` block that is wrong (no `signedIn`, both `setup` and `storageState`, a missing or malformed storage-state file, a `url:` test off the app's origin without `auth: false`) and an unset `${VAR}` |
-| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, and a failed login flow |
+| 2 | invalid config, including an `auth` block that is wrong (no `signedIn`, more than one of `setup`, `storageState` and `attach`, a missing or malformed storage-state file, a `url:` test off the app's origin without `auth: false`) and an unset `${VAR}`; also a `--browser-url` that is not on this machine, `--browser-url` with `--browser-path`, `--browser-url` without `auth.attach: true` or the reverse, an empty `--browser-url`, and any argument that starts with `-rod` |
+| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, a failed login flow, and a `--browser-url` that nothing answers on |
+| 129, 130, 131, 143 | attach mode only (`--browser-url`): the run was interrupted by SIGHUP, SIGINT (Ctrl-C), SIGQUIT or SIGTERM, and exited after closing what it had opened in the attached browser. The code is 128 plus the signal number, as a shell reports a process that signal killed; no report is written. A run without `--browser-url` keeps the default signal behavior |
 
 Distinct codes mean CI can tell "the pages are broken" from "the tool couldn't
 run".
@@ -680,13 +684,13 @@ Standard JUnit XML for CI test dashboards: one `testsuite` per test, one
 
 ## Profiles: one config, different environments
 
-Local runs and CI runs legitimately differ - attach to a dev server locally,
+Local runs and CI runs legitimately differ - scan a running dev server locally,
 serve the production build in CI; report-only locally, enforce in CI. Profiles
 express that in one file:
 
 ```yaml
 server:
-  baseUrl: http://localhost:5173   # local default: attach to your dev server
+  baseUrl: http://localhost:5173   # local default: scan your running dev server
 
 profiles:
   ci:
@@ -751,8 +755,9 @@ tests:
 Run it with `A11Y_USER` and `A11Y_PASS` in the environment (an unset `${VAR}` fails
 the run with exit 2, which matters for pull requests from forks, where secrets are
 not passed). The rest of this section explains each part. A config sets exactly
-one of `setup` and `storageState` (both or neither is exit 2), and always sets
-`signedIn`.
+one of `setup`, `storageState` and `attach` (more than one, or none, is exit 2),
+and always sets `signedIn`. `attach` takes the session from a Chrome you signed
+in to by hand; see [Attach to your own Chrome](#attach-to-your-own-chrome).
 
 **`signedIn` (required).** A selector for something that exists on every
 signed-in page and on no login page, such as `[data-testid=account-menu]`. After
@@ -838,8 +843,8 @@ reads (it does not read `sessionStorage` or IndexedDB from the file).
 
 #### Setup locally, storageState in CI
 
-A config sets one of `setup` and `storageState`, but a [profile](#profiles-one-config-different-environments)
-can swap one for the other: log in with the flow on a laptop and inject a file
+A config sets one of `setup`, `storageState` and `attach`, but a [profile](#profiles-one-config-different-environments)
+can swap one for another: log in with the flow on a laptop and inject a file
 captured by an earlier CI step, from one config and one test list.
 
 ```yaml
@@ -1083,11 +1088,195 @@ credentials`). Without auth discovery output is unchanged.
 Signed in it caps page loads, dropped pages included, since each load can cost a
 login and a crawl whose pages keep being dropped must still stop.
 
+### Attach to your own Chrome
+
+This is a different thing from `--base-url`, which points Frostfall at a server
+that is already running (running-server mode): attaching hands Frostfall a
+browser that is already running, with you signed in.
+
+Some logins cannot be scripted: MFA prompts, PIV or CAC smart cards,
+Login.gov. Some apps are only reachable from inside an agency network. For
+those, sign in by hand in a Chrome window and let Frostfall scan with that
+window's session. This is for local runs; CI keeps using `setup` or
+`storageState`, and the GitHub Action has no input for it.
+
+> **Tests act on your real account.** Every test runs signed in as you. A test
+> that clicks "sign out", or a `--discover` crawl that reaches a logout route the
+> built-in exclusion misses, ends your own session, and an app that rotates
+> refresh tokens may invalidate the one your window holds. Anything a test
+> submits is submitted as you. Use a test account where you can.
+
+**1. Start Chrome with a debugging port and a separate profile directory.**
+
+```bash
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.frostfall-chrome"
+
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 --user-data-dir="$HOME/.frostfall-chrome"
+```
+
+```powershell
+# Windows (PowerShell). Start-Process finds Chrome wherever it is installed
+# (Program Files, Program Files (x86), or %LOCALAPPDATA% for a per-user install).
+Start-Process chrome -ArgumentList '--remote-debugging-port=9222', "--user-data-dir=$env:USERPROFILE\.frostfall-chrome"
+```
+
+The separate `--user-data-dir` is required: since Chrome 136,
+`--remote-debugging-port` is ignored when Chrome runs on its default profile
+directory ([Chrome's announcement](https://developer.chrome.com/blog/remote-debugging-port)).
+It also keeps your everyday profile, and every site you are signed in to there,
+out of reach. The directory is a profile of its own: the first time it is
+empty, and it keeps your sign-ins for the next run.
+
+*Microsoft Edge* is built on Chromium and is expected to work the same way,
+separate profile directory included, but it has not been tested with Frostfall
+yet:
+
+```bash
+# macOS
+open -na "Microsoft Edge" --args --remote-debugging-port=9222 --user-data-dir="$HOME/.frostfall-edge"
+```
+
+```powershell
+# Windows (PowerShell)
+Start-Process msedge -ArgumentList '--remote-debugging-port=9222', "--user-data-dir=$env:USERPROFILE\.frostfall-edge"
+```
+
+**2. Sign in to the app in that window**, MFA and all.
+
+**3. Configure attach and run.**
+
+```yaml
+auth:
+  attach: true
+  signedIn: "[data-testid=account-menu]"   # required, as for every auth source
+  loginPath: /login                         # optional, as for every auth source
+```
+
+```bash
+frostfall --browser-url http://localhost:9222
+```
+
+What happens: Frostfall connects to that Chrome and reads the session once,
+from the browser's own profile, through one background tab that it closes
+afterwards. It never reads, navigates or closes your own tabs.
+
+- *The visit.* Chrome only reads an origin's storage, and only hands over a
+  partitioned cookie, from a page on that origin, so the tab opens the app's
+  base URL and each `allowedOrigins` root. Frostfall answers that request
+  itself with an empty page, blocks every other request the tab makes, and
+  bypasses any service worker the app registered: nothing is sent to the app,
+  its code never runs, and nothing can redirect. Chrome still records the
+  visit as a hidden history entry, left out of `chrome://history` and the
+  address bar's suggestions; the empty page has no title, so an entry you
+  already have for that URL keeps its name.
+- *Cookies.* Chrome is asked for the cookies it would send to the base URL
+  and to each `allowedOrigins` root, so no other site's cookies are read.
+  Frostfall checks them again by domain (a parent-domain cookie such as
+  `.agency.gov` counts), path and `Secure` (only for an `https` origin). A
+  partitioned cookie (CHIPS) is kept when its partition is that origin's own
+  site, never one set while the app was embedded in another site. A cookie
+  scoped to a deeper path is not sent to those URLs and is not carried over:
+  for example Keycloak's `KEYCLOAK_IDENTITY` on `/realms/<realm>/`, or an app
+  cookie on `/app/api` when the base URL is `/app`. If a session depends on
+  one, use `setup` or `storageState`.
+- *localStorage* is read from the same page. If an origin's storage cannot be
+  read, a `warning:` line names it and the run goes on without it.
+
+One line on stderr says what was taken, as counts:
+`attach: using the session for https://app.agency.gov, https://login.agency.gov (5 cookies, 2 localStorage keys) from the browser at http://127.0.0.1:9222`.
+From there a run is the same as with `storageState`: each test gets its own
+private (incognito) context seeded with that session, and the `signedIn` guard,
+the startup probe and URL and selector redaction all apply, so an expired
+session stops the run with exit 3 instead of scanning the login page.
+
+The test contexts open as windows in that Chrome while the run lasts. They may
+sit behind your own window; Frostfall turns on Chrome's focus emulation in them,
+so the keyboard audit and `expectFocus` see a focused page either way. Pages
+present that Chrome's own user-agent, the one you signed in with. When the
+tests finish, or when the run is interrupted (Ctrl-C, a closed terminal,
+SIGTERM or SIGQUIT), Frostfall closes the windows and the tab it opened and
+disconnects. Chrome stays open and signed in. An interrupted attached run exits
+with 128 plus the signal number (130 for Ctrl-C) and writes no report.
+
+**The rules.** `--browser-url` takes `http://localhost:PORT`,
+`http://127.0.0.1:PORT`, `http://[::1]:PORT`, or the `ws://.../devtools/browser/...`
+URL that `/json/version` lists as `webSocketDebuggerUrl`. Only a browser on
+this machine can be attached to; any other host, or an empty value, is exit 2.
+It cannot be combined with `--browser-path` (exit 2). The flag and
+`attach: true` go together, in the auth block in effect after the profile:
+either one without the other is exit 2, except that `--validate` checks an
+`attach: true` config without the flag. An endpoint nothing answers on is exit
+3, with a message that says how to start Chrome. Frostfall refuses any argument
+that starts with `-rod` (exit 2): the go-rod library reads such arguments as
+its own debug options, and one of those logs every cookie the browser holds.
+
+**Is remote debugging allowed?** Managed Chrome can turn it off with the
+[`RemoteDebuggingAllowed`](https://chromeenterprise.google/policies/#RemoteDebuggingAllowed)
+policy. Start Chrome as in step 1 and open
+[http://localhost:9222/json/version](http://localhost:9222/json/version) in any
+browser. If it returns JSON, remote debugging is allowed. If nothing answers,
+check `chrome://policy` (`edge://policy` in Edge) in that window, or ask
+whoever manages your browser.
+
+**Troubleshooting.**
+
+- *The port never opens.* If a Chrome is already running on that
+  `--user-data-dir`, the new command hands its window to that one, which was not
+  started with the port, and exits. Close every window of that profile (or use
+  another directory) and start it again. The exit 3 message says this too.
+- *Private windows are disabled.* Each test runs in a private (incognito)
+  context, so a policy that disables incognito or InPrivate
+  (`IncognitoModeAvailability`) may stop the run from creating them. This is
+  expected but not verified.
+
+**Security.** While that Chrome runs with the debugging port open, any program
+on this machine can control it, signed-in session included, with no password.
+Chrome listens on localhost only by default; do not add
+`--remote-debugging-address`. Use the dedicated profile only for scanning, and
+close that Chrome when you are done. The `ws://` URL contains the browser's id,
+which is as good as a key to it, so Frostfall prints only `ws://host:port` in
+errors, `--verbose` logs and reports.
+
+**What does not carry over.** `sessionStorage` belongs to a single tab, and
+Frostfall does not read your tabs, so an app that keeps its session only in
+`sessionStorage` (MSAL configured with `cacheLocation: "sessionStorage"`, for
+example) starts every test signed out, and the guard stops the run with exit 3.
+Use `setup` for such an app, or switch it to `localStorage`. IndexedDB is not
+read either. A `Secure` session cookie on an app served over plain
+`http://localhost` is not taken, and neither is a cookie scoped below the base
+URL's path (see Cookies above); such an app starts signed out too, so serve it
+over https or use `setup`.
+
+**Attach locally, storageState in CI.** A profile can switch the auth source,
+so one config attaches on a laptop and injects a state file in CI:
+
+```yaml
+auth:                                # local: your own signed-in Chrome
+  attach: true
+  signedIn: "[data-testid=account-menu]"
+
+profiles:
+  ci:
+    auth:                            # CI: replaces the block above entirely
+      storageState: .auth/state.json
+      signedIn: "[data-testid=account-menu]"
+```
+
+Locally, run `frostfall --browser-url http://localhost:9222`. In GitHub Actions
+the `ci` profile applies on its own and no browser URL is involved; passing
+`--browser-url` while the `ci` profile is active is exit 2, because that block
+does not attach.
+
 ### The startup probe
 
 Before anything is scanned, Frostfall loads these pages in fresh contexts with no
 session and no storage: the base URL, `loginPath` (when set), the setup page (in
-setup mode), and the first explicit test that uses auth. They load in parallel
+setup mode), and the first explicit test that uses auth. With `attach: true`
+the contexts are private ones in the attached Chrome, so your own session plays
+no part in the probe. They load in parallel
 with `load` readiness whatever `defaults.waitFor` is (waiting for the network to
 go idle would run out the timeout on an identity provider's page that keeps a
 request open), and the marker is waited for the same way the guard waits for it.
@@ -1284,7 +1473,7 @@ them empty, so the examples below upload explicit file paths rather than
 |-------|---------|---------|
 | `config` | empty | path to the config file; empty looks for `.frostfall.yml`, then `frostfall.yml` |
 | `serve` | - | static mode: serve this build directory (overrides the config's `server` block) |
-| `base-url` | - | attach mode: scan an already-running server (overrides the config's `server` block) |
+| `base-url` | - | running-server mode: scan an already-running server (overrides the config's `server` block) |
 | `baseline` | - | path to the baseline file. Empty uses the config's `baseline:`, and falls back to `.frostfall-baseline.json` when that file exists (the pickup is announced on stderr). `none` ignores any baseline file |
 | `format` | `html` | report format: `text`, `html`, `sarif`, `json` or `junit` |
 | `output` | per format | where to write the report. Empty uses the CLI default for the format: `frostfall-report.html`, `frostfall.sarif`, `frostfall.json` or `frostfall-junit.xml` |

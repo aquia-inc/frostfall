@@ -22,7 +22,7 @@ Goals:
 - Declarative YAML config in the Emberfall style: a list of tests, an `expect` block, sane defaults.
 - Scans real rendered DOM, including interaction states (modals, dropdowns, post-validation forms),
   not just initial page loads.
-- Works in three server modes without the user thinking about it: attach to a running dev server,
+- Works in three server modes without the user thinking about it: scan a running dev server,
   spawn one, or serve a static build directory itself.
 - Adoptable on day one in a codebase with hundreds of existing violations, via a baseline file with
   "accept current, fail on new" semantics.
@@ -47,7 +47,7 @@ Non-goals (v1):
 │ frostfall (Go binary)                                  │
 │                                                        │
 │  config loader ─▶ server manager ─▶ runner             │
-│                    (attach|spawn|serve)                │
+│                    (running|spawn|serve)               │
 │                                       │ per test       │
 │                                       ▼                │
 │                    browser session (go-rod / CDP)      │
@@ -80,7 +80,7 @@ Key decisions, carried over from the brainstorm:
 frostfall [flags]
 
   --config PATH        config file (default: .frostfall.yml, then frostfall.yml)
-  --base-url URL       attach mode: scan an already-running server
+  --base-url URL       running-server mode: scan an already-running server
   --serve DIR          static mode: serve DIR with the embedded file server
   --baseline PATH      baseline file (default: value from config, else none)
   --update-baseline    rewrite the baseline to match current results, exit 0
@@ -92,12 +92,14 @@ frostfall [flags]
   --discover           crawl same-origin from the root path, respecting discover config (§7.6)
   --dry-run            with --discover: print the discovered paths (one per line, sorted) and scan nothing
   --browser-path PATH  use this Chrome/Chromium instead of auto-detection
+  --browser-url URL    attach to a running, signed-in Chrome (loopback DevTools address; needs
+                       auth.attach: true; exclusive with --browser-path) (§7.5)
   --verbose            per-step logging
   --version / --help
 ```
 
 Precedence: flags override config. `--base-url` and `--serve` each override the config's `server`
-block entirely (attach and static mode respectively).
+block entirely (running-server and static mode respectively).
 
 ### Exit codes (frozen)
 
@@ -107,6 +109,11 @@ block entirely (attach and static mode respectively).
 | 1 | new violations breaking a configured `expect` contract |
 | 2 | config invalid (schema error, unknown key, bad regex) |
 | 3 | environment failure (browser launch, server never became ready, page load timeout, step failure) |
+
+Outside the contract, attach mode only (`--browser-url`, §7.5): an attached run interrupted by
+SIGHUP, SIGINT, SIGQUIT or SIGTERM exits 129, 130, 131 or 143 after closing what it opened in the
+user's browser, which is what a shell reports for a process killed by that signal. It is not a run
+outcome, writes no report, and a run without `--browser-url` keeps the default signal behavior.
 
 Emberfall collapses everything into 0/1; separating "your pages are broken" from "the tool couldn't
 run" is what lets CI gate correctly and lets `continue-on-error` users tell the cases apart.
@@ -134,7 +141,7 @@ server:
   # Mode 3 — static build, mutually exclusive with command:
   # serve: ./dist
   # spaFallback: true          # serve index.html for unknown paths (SPA routing); default true
-  # Mode 1 — attach, mutually exclusive with both:
+  # Mode 1 — running server, mutually exclusive with both:
   # baseUrl: http://localhost:5173
 
 defaults:
@@ -169,6 +176,8 @@ auth:                          # optional; see §7.5
       - waitFor: "[data-testid=account-menu]"
   reuse: true                  # persist cookies+storage once, restore per test (default true)
   # storageState: .auth/state.json   # alternative: inject pre-captured state, skip setup
+  # attach: true               # alternative: the session of a Chrome the user signed in to, via
+                               # --browser-url (local runs only)
   signedIn: "[data-testid=account-menu]"   # REQUIRED: present on every signed-in page, on no login page
   # loginPath: /login            # optional, no default: where a signed-out visitor lands, relative to
                                # the base URL
@@ -330,7 +339,7 @@ Semantics:
 
 ### 7.1 Server modes
 
-- **Attach** (`baseUrl` / `--base-url`): probe once for a non-5xx response before starting; if
+- **Running server** (`baseUrl` / `--base-url`): probe once for a non-5xx response before starting; if
   unreachable, exit 3 with a message that says which URL and suggests the other two modes.
 - **Spawn** (`command`): start via shell in its own process group; on any exit path (including
   SIGINT) kill the group, not just the child — `yarn dev` wraps the real server. Readiness per
@@ -397,8 +406,8 @@ stays off.
 
 ### 7.5 Auth
 
-Exactly one of `setup` and `storageState` is set (both or neither is exit 2), and `signedIn` is
-always set. The whole block is validated at load: every mistake in it is a config error, because
+Exactly one of `setup`, `storageState` and `attach` is set (more than one, or none, is exit 2),
+and `signedIn` is always set. The whole block is validated at load: every mistake in it is a config error, because
 silently ignoring auth means scanning a login page and passing. A `storageState` file is read at
 load, so `--validate` needs it to exist.
 
@@ -474,6 +483,87 @@ config file's directory; a missing or malformed file is a config error (the erro
 cookie or storage value). `expires: -1` maps to a session cookie and `sameSite` Strict/Lax/None to
 the CDP enum. Cookies already expired are left out; Chrome silently drops an expired cookie from
 `Storage.setCookies` without failing the batch, so skipping them changes no outcome.
+
+**Attach.** `attach: true` takes the session from a Chrome the user started with
+`--remote-debugging-port` (and, since Chrome 136, a non-default `--user-data-dir`) and signed in to
+by hand, for logins that cannot be scripted (MFA, smart cards) and apps reachable only from inside
+a network. It is a local workflow: the action has no input for it. The key and `--browser-url` are
+paired strictly on the resolved block: the flag with any other block (or none) is exit 2, and so is
+the key without the flag, except under `--validate`, which checks the config alone. `--discover
+--dry-run` connects a browser and needs the flag like any run.
+
+- *Endpoint.* `browser.ParseBrowserURL` accepts `http://` (resolved by reading `/json/version`
+  with Frostfall's own client: loopback-only dialing, no redirect followed, a 64 KB body cap and
+  one deadline, where go-rod's `launcher.ResolveURL` follows redirects to any host and has no
+  bound; the answer must be a browser `ws://` URL, whose host is replaced with the given one) or a
+  `ws://.../devtools/browser/...` URL, on a loopback host only (`localhost`, 127.0.0.0/8, ::1) with an explicit port; anything else
+  is exit 2. The WebSocket dial refuses a connection whose remote address is not loopback, so a
+  `localhost` that resolves elsewhere fails too. A `ws://` path is the browser's GUID, which is a
+  control token: `Endpoint` prints as `scheme://host:port`, and connection errors are built from
+  fixed phrases (a refused dial, a timeout), never from a `url.Error` or handshake error that would
+  carry the URL. An endpoint that does not answer is exit 3 with a hint naming
+  `--remote-debugging-port`, `--user-data-dir` (and that another Chrome already on that directory
+  keeps the port from opening) and the `RemoteDebuggingAllowed` policy. `--browser-url=` (empty)
+  is exit 2, and `Endpoint` formats with value receivers so a copied value prints the same.
+- *Lifecycle.* The dial deadline stays on the socket through go-rod's first DevTools exchange, so a
+  server that accepts the WebSocket and then stays silent fails within the connect timeout.
+  `browser.Connect` owns the WebSocket, and `Browser.Close` in attach mode never sends
+  `Browser.close` (that would quit the user's Chrome): it disposes the contexts and closes the tab
+  Frostfall created that are still open, then drops the connection. Test contexts are created with
+  `Target.createBrowserContext{disposeOnDetach: true}`, verified to make Chrome dispose them when the
+  connection drops, so a crash or kill leaves no seeded context behind; a SIGINT or SIGTERM also
+  runs `Close` before exiting (130 or 143). `Session.Close` refuses to close a handle with no context
+  id, which would be the browser itself.
+- *Capture* (`Auth.captureAttached`, the attach case of `NewAuth`, which sets `a.state` so seeding,
+  the guard and redaction are unchanged). The user's tabs are never read, navigated or closed. One
+  background tab in the default context does it all; it is created and registered under the
+  registry lock that `Close` takes, so an interrupt cannot fall between the two. Chrome reads an
+  origin's `localStorage` only through a frame of that origin (`DOMStorage.getDOMStorageItems`
+  from about:blank answers "Frame not found for the given storage id", checked against Chrome
+  154), and `Network.getCookies` from about:blank leaves out a first-party partitioned (CHIPS)
+  cookie that it returns from a page on the origin. So the tab visits the app's base URL and each
+  allowed origin's root, and nothing of that visit reaches the app:
+  `Network.setBypassServiceWorker` is on for the tab (a registered worker would otherwise answer
+  the navigation with the real app shell and fetch with the user's cookies, which a test
+  reproduced), and every request is intercepted (`Fetch`) for the whole life of the tab: the
+  document is fulfilled with an empty, untitled page and anything else failed. Fetch is never
+  disabled while the tab is open, since disabling it releases a paused request to the network (a
+  test reproduced that too); a request still paused at the end is aborted when the tab closes.
+  The page checks `location.origin` itself before returning storage. The navigation is sent as
+  `auto_subframe`, which Chrome records as a hidden, never-typed history row (`hidden=1`,
+  `typed_count=0`; every other transition type tried left a visible or typed row), and the empty
+  page has no title, so an existing row keeps its own (with a title, Chrome renamed it). On each
+  origin's page, `Network.getCookies` for that URL does the matching, so no other site's cookie
+  enters memory, and `attachedCookies` checks again (RFC 6265 domain match including parent-domain
+  cookies and bracketed IPv6 literals, the cookie's path covering the scope's, `Secure` only for
+  https, a partitioned cookie only when its partition is the scope's own site). A cookie scoped to
+  a deeper path than the URL asked for (Keycloak's `KEYCLOAK_IDENTITY` on `/realms/<realm>/`) is
+  not returned and not carried; the paths are unknown, and reading the whole profile with
+  `Storage.getCookies` to find them was ruled out. An origin whose storage cannot be read is
+  skipped with a warning. `sessionStorage` is per tab and is not carried over. One stderr line
+  always names the origins and the cookie and key counts; an empty capture also warns, and the
+  guard then stops the run.
+- *Headed browser.* The user's Chrome is headed and a test window is often not the focused one. An
+  unfocused page reports `document.hasFocus()` false (measured: always, when another window keeps
+  taking focus), and `FocusedAX` then returns no element, which produced a false
+  `frostfall/focus-expectation` on a page that moves focus correctly in one run of four. Attach mode
+  enables `Emulation.setFocusEmulationEnabled` on every test page, which made `hasFocus()` true in
+  every case and removed that finding. The testdata keyboard and transcript fixtures gave the same
+  findings headless, attached headless and attached headed, with or without focus being taken away.
+  The attach connection also turns off go-rod's default device emulation, which would present an
+  emulated user-agent instead of the one the user signed in with; the viewport is set per test.
+- *Interrupts.* In attach mode SIGHUP, SIGINT, SIGQUIT and SIGTERM are caught: the handler sets
+  an `interrupted` flag, runs `Close`, and exits 129, 130, 131 or 143 (128 plus the signal number,
+  what a shell reports for a process killed by it; see §3). Once the flag is set the main
+  goroutine's failure paths park instead of printing an error or writing a report, so the
+  handler's exit is the outcome. As soon as the tests have run the browser is released and then
+  the handler stopped; stopping honours a signal that arrived meanwhile (exit 128+n, no report),
+  and after that an interrupt while reports are written behaves as in launch mode.
+- *go-rod's own flags.* go-rod reads `-rod=...` (or `-rod <opts>`) from anywhere in `os.Args` in a
+  package init, before `main`; its `cdp` option logs every CDP message, which in attach mode
+  includes every cookie of the user's profile. `run` refuses any argument matching `^--?rod(=|$)`
+  with exit 2 before anything connects. (An unknown option there makes go-rod panic during init,
+  before Frostfall can say anything.)
 
 **Landing check** (`Session.CheckLanding`). After each test's initial navigation and readiness, and
 again before and after every `scan`, `keyboard`, `transcript` and `expectFocus` step (so a `goto`
@@ -586,7 +676,7 @@ parsing is future work, §10.)
 
 ### 7.7 Watch mode
 
-`--watch` implies attach mode. Initial full run establishes the session's "seen" set (baseline +
+`--watch` implies running-server mode. Initial full run establishes the session's "seen" set (baseline +
 first-run results); on file change under the watched dir (default: cwd) or on Enter, rescan and print
 only violations not in the seen set. Fixed violations are announced. Exit code irrelevant; this is
 the inner-loop tool that earns adoption, not a gate.
@@ -679,7 +769,7 @@ binary for the runner OS/arch (cached via tool-cache).
   with:
     config: .frostfall.yml        # default: empty (CLI finds .frostfall.yml, then frostfall.yml)
     serve: ./dist                 # optional: static mode override
-    base-url: ""                  # optional: attach mode override
+    base-url: ""                  # optional: running-server mode override
     baseline: .frostfall-baseline.json
     format: sarif                 # default: html
     output: ""                    # default: the format's file (frostfall.sarif for sarif)
@@ -706,7 +796,7 @@ frostfall/
 ├── cmd/frostfall/            # main
 ├── internal/
 │   ├── config/               # schema, validation, env interpolation
-│   ├── server/               # attach / spawn / static
+│   ├── server/               # running / spawn / static
 │   ├── browser/              # rod session, readiness, steps
 │   ├── engine/               # Engine interface
 │   │   └── axe/              # embedded axe.min.js + adapter
