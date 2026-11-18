@@ -58,6 +58,10 @@ func (s *Session) Frame(locate string, arg json.RawMessage) (engine.FramePage, e
 //     content document here; it is its own CDP target, whose id is the frame
 //     id, and it is attached to as one.
 func (s *Session) frame(parent *rod.Page, locate string, arg json.RawMessage) (engine.FramePage, error) {
+	// Locating the child is the child's work, on a deadline of its own: the
+	// parent's started when the parent was opened, and scanning earlier
+	// siblings' subtrees may have used it up.
+	parent = s.frameDeadline(parent)
 	// Evaluate, not ElementByJS: that retries a null until the deadline,
 	// and a frame that has left the page will not come back.
 	res, err := parent.Evaluate(rod.Eval(locate, string(arg)).ByObject())
@@ -76,7 +80,11 @@ func (s *Session) frame(parent *rod.Page, locate string, arg json.RawMessage) (e
 		return nil, fmt.Errorf("describing the frame: %w", err)
 	}
 	if node.ContentDocument != nil {
-		p, err := el.Frame()
+		// rod's frame page keeps the owner element and resolves the frame's
+		// window through it whenever it has none cached (first use, or after
+		// the frame navigated), so the element carries the test's budget,
+		// not this locate's short deadline.
+		p, err := el.Context(s.page.GetContext()).Frame()
 		if err != nil {
 			return nil, err
 		}

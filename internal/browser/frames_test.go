@@ -97,6 +97,16 @@ func TestFixtureFramesInAndOutOfProcess(t *testing.T) {
 				t.Errorf("out-of-process attaches = %d, want %d", s.outOfProcess, wantOOP)
 			}
 
+			// scope is a top-document selector; frames inside it are
+			// scanned in full.
+			scoped, err := axe.New().Audit(t.Context(), s, engine.ScanOptions{Standard: "wcag21aa", Scope: "#frames", Frames: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := targets(scoped); !slices.Equal(got, want) {
+				t.Errorf("scope #frames: violations = %q, want %q", got, want)
+			}
+
 			// A second scan of the same page reuses the attached frame and
 			// finds the same thing.
 			again, err := axe.New().Audit(t.Context(), s, engine.ScanOptions{Standard: "wcag21aa", Frames: true})
@@ -201,5 +211,57 @@ func TestHungOutOfProcessFrameIsSkipped(t *testing.T) {
 	case <-closed:
 	case <-time.After(15 * time.Second):
 		t.Fatal("Session.Close did not return after a frame attach timed out")
+	}
+}
+
+// Each frame's deadline covers its own work. Locating a child is the child's
+// work: a parent frame whose own deadline has passed (scanning earlier
+// siblings' subtrees took it) must still be able to hand out its next child.
+func TestChildLocatedOnItsOwnDeadline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	defer func(d time.Duration) { frameTimeout = d }(frameTimeout)
+	frameTimeout = time.Second
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!DOCTYPE html><html><body><iframe id="outer" src="/outer"></iframe></body></html>`)
+	})
+	mux.HandleFunc("/outer", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!DOCTYPE html><html><body><iframe id="inner" src="/inner"></iframe></body></html>`)
+	})
+	mux.HandleFunc("/inner", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!DOCTYPE html><html><body><p id="deep">deep</p></body></html>`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b, err := Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	s, err := b.NewSession(srv.URL+"/", config.Viewport{Width: 800, Height: 600}, "load", 0, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const locate = `(s) => document.querySelector(JSON.parse(s))`
+	outer, err := s.Frame(locate, []byte(`"#outer"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(frameTimeout + 500*time.Millisecond)
+	inner, err := outer.Frame(locate, []byte(`"#inner"`))
+	if err != nil {
+		t.Fatalf("locating a child after the parent's deadline: %v", err)
+	}
+	raw, err := inner.Eval(`() => document.getElementById('deep').textContent`)
+	if err != nil || string(raw) != `"deep"` {
+		t.Errorf("inner frame eval = %s, %v", raw, err)
 	}
 }

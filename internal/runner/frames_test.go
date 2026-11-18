@@ -40,8 +40,9 @@ func TestPartialScanDoesNotCover(t *testing.T) {
 }
 
 // A frame that could not be scanned is a warning, printed whether or not the
-// run is verbose. A signed-in test names it with attribute values dropped and
-// leaves out the error, whose text can carry the frame's URL; a test without
+// run is verbose. A signed-in test names it with attribute values dropped. A
+// run with auth configured leaves the error out for every test, auth: false
+// ones included, since its text can carry the frame's URL; a run without
 // auth prints both as they are.
 func TestFrameWarning(t *testing.T) {
 	const frame = `main > iframe[src="https://idp.example/embed?session=FRAMETOKEN9"]`
@@ -49,14 +50,16 @@ func TestFrameWarning(t *testing.T) {
 	var got []string
 	warn := func(f string, a ...any) { got = append(got, fmt.Sprintf(f, a...)) }
 
-	signedIn := &Runner{Auth: browser.RedactingAuth(), Warn: warn}
-	signedIn.frameWarning(config.Test{ID: "account"}, "initial", frame, cause)
-	signedIn.frameWarning(config.Test{ID: "account"}, "initial", frame, fmt.Errorf("attaching: %w", context.DeadlineExceeded))
+	withAuth := &Runner{Auth: browser.RedactingAuth(), Warn: warn}
+	withAuth.frameWarning(config.Test{ID: "account"}, "initial", frame, cause)
+	withAuth.frameWarning(config.Test{ID: "account"}, "initial", frame, fmt.Errorf("attaching: %w", context.DeadlineExceeded))
+	off := false
+	withAuth.frameWarning(config.Test{ID: "public", Auth: &off}, "initial", frame, cause)
 	plain := &Runner{Warn: warn}
 	plain.frameWarning(config.Test{ID: "home"}, "initial", frame, cause)
 
-	if len(got) != 3 {
-		t.Fatalf("warnings = %q, want 3", got)
+	if len(got) != 4 {
+		t.Fatalf("warnings = %q, want 4", got)
 	}
 	for _, w := range got[:2] {
 		if strings.Contains(w, "FRAMETOKEN9") || strings.Contains(w, "idp.example") {
@@ -69,7 +72,12 @@ func TestFrameWarning(t *testing.T) {
 	if !strings.Contains(got[1], "did not respond in time") {
 		t.Errorf("a deadline is not reported as one: %s", got[1])
 	}
-	if !strings.Contains(got[2], frame) || !strings.Contains(got[2], cause.Error()) {
-		t.Errorf("warning without auth lost the frame or the error: %s", got[2])
+	// auth: false: the selector is printed as that test's reports print
+	// targets (unscrubbed), but the error text still stays out.
+	if !strings.Contains(got[2], frame) || strings.Contains(got[2], cause.Error()) || !strings.Contains(got[2], "could not be reached") {
+		t.Errorf("auth: false warning in a run with auth: %s", got[2])
+	}
+	if !strings.Contains(got[3], frame) || !strings.Contains(got[3], cause.Error()) {
+		t.Errorf("warning without auth lost the frame or the error: %s", got[3])
 	}
 }

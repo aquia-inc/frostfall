@@ -274,9 +274,12 @@ A violation's fingerprint is `sha256` (hex, first 16 bytes) of the following fie
   never the path to the frame, and the same node in two different frames stays two violations.
   This is an additive extension: a target with one level, which is every target in the top
   document, goes through the steps above exactly as before, so every existing fingerprint and
-  baseline is unchanged. Frame-qualified targets did not exist before frames were scanned, so
-  there are no earlier fingerprints for them to break. For a signed-in test the attribute values
-  are dropped in every level, frame selectors included.
+  baseline is unchanged for top-document targets. Before frames were scanned Frostfall never put
+  axe into a frame, so multi-level targets did not normally occur. The one exception: a page that
+  loads axe into its own frames let the plain `axe.run` test them, and those multi-level targets
+  were joined with a space. They now join with ` |> ` (with `frames` on or off), so their
+  fingerprints change once and `--update-baseline` realigns them. For a signed-in test the
+  attribute values are dropped in every level, frame selectors included.
 - (v2 candidate, NOT in the v1 scheme: preferring `data-testid`, then `role` + accessible name,
   over positional selectors. Changing this invalidates baselines, so it requires a fingerprint
   version bump with a migration path — not a silent amendment.)

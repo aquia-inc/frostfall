@@ -583,18 +583,21 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 // frameWarning reports a frame a scan could not reach. It names the frame
 // the way the run's reports name targets: scrubbed of attribute values for a
 // signed-in test, whose frames can hold account data (an identity provider's
-// or a payment processor's). The error is printed only for a test without
-// auth: its text can carry the frame's URL.
+// or a payment processor's). The error's text can carry the frame's URL, so
+// a run with auth configured, which prints every URL redacted, leaves it out
+// for every test and says only whether the frame timed out.
 func (r *Runner) frameWarning(t config.Test, label, frame string, err error) {
 	if r.signedIn(t) {
-		reason := "it could not be reached"
+		frame = secrets.ScrubSelector(frame)
+	}
+	reason := err.Error()
+	if r.Auth != nil {
+		reason = "it could not be reached"
 		if errors.Is(err, context.DeadlineExceeded) {
 			reason = "it did not respond in time"
 		}
-		r.warnf("test %q: scan %q: frame %s was not scanned (%s); its content is missing from the results", t.ID, label, secrets.ScrubSelector(frame), reason)
-		return
 	}
-	r.warnf("test %q: scan %q: frame %s was not scanned (%v); its content is missing from the results", t.ID, label, frame, err)
+	r.warnf("test %q: scan %q: frame %s was not scanned (%s); its content is missing from the results", t.ID, label, frame, reason)
 }
 
 // results fingerprints one scan point's violations and captures evidence.

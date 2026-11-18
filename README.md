@@ -434,8 +434,9 @@ test without a setting of its own, discovered ones included, with
   (10 seconds, cut short by the test's `timeout`), is left out with a warning
   naming it, and the rest of the page is still scanned. Such a scan does not
   count as having checked the test's page, so its baselined findings are not
-  marked stale and their issues stay open. For a signed-in test the warning
-  names the frame with attribute values dropped and without the error text. A frame that hangs the page itself (one running in the page's
+  marked stale and their issues stay open. In a run with `auth` configured
+  the warning leaves out the error text, which can hold the frame's URL, and
+  for a signed-in test it names the frame with attribute values dropped. A frame that hangs the page itself (one running in the page's
   process) still uses up the test's `timeout`.
 - Keyboard audits, screen reader transcripts and `expectFocus` stay in the
   page and do not enter frames yet.
