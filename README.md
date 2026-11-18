@@ -427,17 +427,35 @@ Turn it off for a test whose frames are out of your hands (a third-party
 chat widget that only produces noise) with `frames: false`, or for every
 test without a setting of its own, discovered ones included, with
 `defaults: { frames: false }`. A test's own `frames` wins over the default.
+To keep the top-document-only scans of earlier releases after upgrading,
+pin it in the config:
+
+```yaml
+defaults: { frames: false }
+```
 
 - `scope` is a selector in the page, not inside a frame. A frame within the
   scope is scanned in full.
 - A frame that cannot be reached, or does not answer within its own deadline
-  (10 seconds, cut short by the test's `timeout`), is left out with a warning
-  naming it, and the rest of the page is still scanned. Such a scan does not
-  count as having checked the test's page, so its baselined findings are not
-  marked stale and their issues stay open. In a run with `auth` configured
-  the warning leaves out the error text, which can hold the frame's URL, and
-  for a signed-in test it names the frame with attribute values dropped. A frame that hangs the page itself (one running in the page's
-  process) still uses up the test's `timeout`.
+  (10 seconds, cut short by the test's `timeout`), is left out with a
+  warning on stderr naming it, and the rest of the page is still scanned.
+  The warning is not in the reports and does not change the exit code. A
+  frame removed from the page mid-scan is left out the same way. In a run
+  with `auth` configured the warning leaves out the error text, which can
+  hold the frame's URL, and for a signed-in test it names the frame with
+  attribute values dropped. A frame that hangs the page itself still uses
+  up the test's `timeout`.
+- A scan that left a frame out does not count as having checked the test's
+  axe rules. Another, complete scan point in the same test still does, but
+  a frame that is never reachable keeps every baselined axe finding of that
+  test from going stale (and its issue from closing) until the frame is
+  reachable again or the test sets `frames: false`.
+- In a signed-in test, findings inside a frame get no screenshot: the
+  picture would be the frame, often an identity provider's or a payment
+  processor's.
+- The Chrome Frostfall launches keeps frames of every origin in the page's
+  process. Frames in a process of their own (browsers with site isolation
+  on) are reached too, by attaching to them directly.
 - Keyboard audits, screen reader transcripts and `expectFocus` stay in the
   page and do not enter frames yet.
 

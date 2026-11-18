@@ -374,10 +374,20 @@ frame (a cross-site frame under site isolation), by attaching to its CDP target.
 decided from the owner element before anything runs in the frame. Each frame runs under a deadline
 of its own (10s, cut short by the test's budget). A frame that cannot be reached or scanned in
 time contributes one null partial, which `finishRun` skips together with the frames below it, and
-a warning; the rest of the page is still scanned, and that scan does not count as having checked
-the page's rules (a baselined finding is not marked stale, its issue not closed). `scope` stays a
+a warning on stderr; the rest of the page is still scanned. The same happens to a frame removed
+from the page mid-scan, and to a frame whose own frames changed between `getFrameContexts` and
+`runPartial` (the partial's `frames` list no longer matches the list walked); if that happens in
+the top document, the scan falls back to the plain `axe.run` and warns for every frame.
+
+Coverage (what lets a baselined finding go stale, or its issue close) is counted per test across
+its scan points. A scan that left a frame out counts as having run but not as having looked for
+any axe rule. A full scan at another point of the same test still covers the rules, so a finding
+in the skipped frame can still go stale from that test. A frame that is never reachable leaves
+the test's axe rules uncovered altogether: nothing on that test's page, in the frame or out of it,
+goes stale until the frame is reachable again or the test sets `frames: false`. `scope` stays a
 top-document selector: a frame within it is scanned in full. Keyboard audits, transcripts and
-`expectFocus` stay in the top document.
+`expectFocus` stay in the top document. In a signed-in test a finding inside a frame gets no
+screenshot.
 
 The launched browser keeps rod's default of site isolation off, so frames of every origin run in
 the page's process; `browser.LaunchOptions.SiteIsolation` turns it on (tests use it to exercise the

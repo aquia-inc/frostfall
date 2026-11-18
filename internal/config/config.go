@@ -144,7 +144,11 @@ type Defaults struct {
 	// every enforcing pipeline on findings nobody asked for.
 	Keyboard *KeyboardStep `yaml:"keyboard"`
 	// Frames: false keeps every test's scans out of iframes unless the test
-	// sets its own frames. Absent means on.
+	// sets its own frames. Absent means on, a deliberate exception to the
+	// opt-in rule Keyboard follows: Keyboard adds a new kind of check, while
+	// leaving frames out is a silent false pass, a page whose UI is in a
+	// frame reported clean. Turning frames on adds findings for content that
+	// was always in scope; defaults.frames: false pins the old behavior.
 	Frames *bool `yaml:"frames"`
 }
 
