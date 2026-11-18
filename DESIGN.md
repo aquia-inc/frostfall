@@ -148,6 +148,8 @@ defaults:
   timeout: 30s                 # per-test budget, load + steps + scans
   rules:                       # per-rule toggles applied to every scan
     color-contrast: on
+  frames: true                 # scans reach into iframes (default true; see §7.4); a test's
+                               # own frames wins, so this is how discovered tests opt out
   # Enforcement is OPT-IN: with no expect block anywhere, Frostfall is
   # report-only — violations are reported (terminal, SARIF annotations, step
   # summary) but the run always exits 0. Configuring expect turns on failing:
@@ -185,6 +187,8 @@ tests:
                                # and kept for ?query and #hash paths; a / is added unless the path
                                # starts with /, ? or #); absolute url: also accepted for cross-origin
     scan: true                 # scan the initial state after readiness (default true)
+    frames: false              # keep this test's scans in the top document (default:
+                               # defaults.frames, else true)
 
   - id: dashboard-direct       # fresh load of a deep route
     path: /dashboard
@@ -262,6 +266,20 @@ A violation's fingerprint is `sha256` (hex, first 16 bytes) of the following fie
   generated-id and `:nth-child` rules, and a signed-in test's fingerprints differ from an
   unauthenticated run of the same page. A test with `auth: false`, and any config without `auth`,
   is unaffected, so the v1 scheme is unchanged for them.
+- A target inside an iframe is frame-qualified: one selector per frame level, the top document
+  first, joined with ` |> ` (`engine.FrameSeparator`). `stableTarget` splits it at the separator,
+  counting only separators outside attribute brackets and quotes (an attribute value may contain
+  the text ` |> `), normalizes each level with the steps above on its own, and joins the levels
+  with ` |> ` again. An anchor id inside a frame therefore truncates only that frame's level,
+  never the path to the frame, and the same node in two different frames stays two violations.
+  This is an additive extension: a target with one level, which is every target in the top
+  document, goes through the steps above exactly as before, so every existing fingerprint and
+  baseline is unchanged for top-document targets. Before frames were scanned Frostfall never put
+  axe into a frame, so multi-level targets did not normally occur. The one exception: a page that
+  loads axe into its own frames let the plain `axe.run` test them, and those multi-level targets
+  were joined with a space. They now join with ` |> ` (with `frames` on or off), so their
+  fingerprints change once and `--update-baseline` realigns them. For a signed-in test the
+  attribute values are dropped in every level, frame selectors included.
 - (v2 candidate, NOT in the v1 scheme: preferring `data-testid`, then `role` + accessible name,
   over positional selectors. Changing this invalidates baselines, so it requires a fingerprint
   version bump with a migration path — not a silent amendment.)
@@ -343,6 +361,39 @@ Inject embedded axe if not present, then `axe.run(context, options)` with the ta
 `standard`, per-scan `scope` as the context, and rule toggles merged (defaults → test → scan).
 Marshal violations back over CDP. One scan's failure (axe throws, page navigated mid-scan) fails
 that test with exit 3 semantics.
+
+Iframes (`frames`, default on): the top document first asks axe for its frames in scope
+(`axe.utils.getFrameContexts`). With none, the scan is the plain `axe.run` above, so a page without
+frames gets exactly the results it always did. Otherwise the scan uses axe's partial-run API, the
+flow `@axe-core/playwright` uses for drivers outside the page: `axe.runPartial` in the top
+document, then depth first in each frame (inject axe, `getFrameContexts` and `runPartial` with the
+same context and options, recurse), and finally `axe.finishRun(partials)` in the top document,
+which merges them into one result whose targets carry the frame path (§5). A frame is reached
+through its owner element: in the page's process with rod's frame page, or, for an out-of-process
+frame (a cross-site frame under site isolation), by attaching to its CDP target. Which one is
+decided from the owner element before anything runs in the frame. Each frame runs under a deadline
+of its own (10s, cut short by the test's budget). A frame that cannot be reached or scanned in
+time contributes one null partial, which `finishRun` skips together with the frames below it, and
+a warning on stderr; the rest of the page is still scanned. The same happens to a frame removed
+from the page mid-scan, and to a frame whose own frames changed between `getFrameContexts` and
+`runPartial` (the partial's `frames` list no longer matches the list walked); if that happens in
+the top document, the scan falls back to the plain `axe.run` and warns for every frame.
+
+Coverage (what lets a baselined finding go stale, or its issue close) is counted per test across
+its scan points. A scan that left a frame out counts as having run but not as having looked for
+any axe rule. A full scan at another point of the same test still covers the rules, so a finding
+in the skipped frame can still go stale from that test. A frame that is never reachable leaves
+the test's axe rules uncovered altogether: nothing on that test's page, in the frame or out of it,
+goes stale until the frame is reachable again or the test sets `frames: false`. `scope` stays a
+top-document selector: a frame within it is scanned in full. Keyboard audits, transcripts and
+`expectFocus` stay in the top document. In a signed-in test a finding inside a frame gets no
+screenshot.
+
+The launched browser keeps rod's default of site isolation off, so frames of every origin run in
+the page's process; `browser.LaunchOptions.SiteIsolation` turns it on (tests use it to exercise the
+out-of-process path). Under site isolation, `networkIdle` readiness does not see an
+out-of-process frame's document finish loading and waits out the budget, which is one reason it
+stays off.
 
 ### 7.5 Auth
 
@@ -556,6 +607,8 @@ type ScanOptions struct {
     Standard string            // tag set / conformance target
     Scope    string            // CSS selector context, "" = document
     Rules    map[string]bool   // rule id -> enabled
+    Frames   bool              // also scan iframes, when the Page is a FramePage
+    Warn     func(frame string, err error) // told about each frame left out
 }
 
 type Violation struct {
@@ -572,7 +625,19 @@ type Page interface {
     Eval(js string, args ...any) (json.RawMessage, error)
     InjectScript(src string) error
 }
+
+// FramePage is optional: a Page that can reach its child frames' documents.
+// locate is a JS function, run in this page with arg, returning the frame's
+// owner element; the frame's page runs under a deadline of its own.
+type FramePage interface {
+    Page
+    Frame(locate string, arg json.RawMessage) (FramePage, error)
+}
 ```
+
+`Frames`, `Warn` and `FramePage` are additive: an engine or Page that ignores them scans the top
+document as before. A frame-qualified `Violation.Target` joins its frame levels with
+`engine.FrameSeparator` (` |> `).
 
 Fingerprinting, baselining, and formatting all consume `[]Violation` and know nothing about axe.
 That is the whole point: pa11y-style HTML_CodeSniffer, IBM Equal Access, or a Lighthouse-as-engine

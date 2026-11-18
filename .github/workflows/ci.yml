@@ -29,9 +29,10 @@ jobs:
         run: go test -timeout 15m ./...
 
       - name: Integration test (fixture scan)
-        # Runners ship Chrome; the fixture has 6 planted violations, so the
-        # enforcing profile of this config must exit 1 - anything else means
-        # the scan or the exit-code contract broke.
+        # Runners ship Chrome; the fixture has 8 planted violations (2 of them
+        # inside frames on frames.html), so the enforcing profile of this
+        # config must exit 1 - anything else means the scan or the exit-code
+        # contract broke.
         run: |
           go build -o /tmp/frostfall ./cmd/frostfall
           set +e
@@ -46,9 +47,9 @@ jobs:
       - name: Integration test (auth fixture, signed in)
         # The fixture's protected page redirects to login unless the session
         # cookie from the storage state is present, and carries one planted
-        # violation. Exit 1 therefore proves the session was applied AND the
-        # page was actually reached; a scan of the login page would find
-        # nothing and exit 0.
+        # violation in its own document and one in a cross-site frame. Exit 1
+        # therefore proves the session was applied AND the page was actually
+        # reached; a scan of the login page would find nothing and exit 0.
         run: |
           set +e
           /tmp/frostfall --config testdata/auth/frostfall.yml
@@ -232,7 +233,7 @@ jobs:
           rm -rf frostfall-artifacts
           run_wrapper 1 FF_SCREENSHOTS=false
           no_pngs || fail "FF_SCREENSHOTS=false still wrote screenshots"
-          has_output 'tests-run=2'
+          has_output 'tests-run=3'
           echo "::endgroup::"
 
           echo "::group::screenshots: true forces them on outside Actions"
@@ -262,9 +263,9 @@ jobs:
           sed "s|serve: testdata/static|serve: $REPO/testdata/static|" testdata/static/frostfall.yml > "$PROF/frostfall.yml"
           printf '\nprofiles:\n  ci:\n    defaults:\n      expect: {}\n  staging:\n    defaults:\n      expect: {}\n' >> "$PROF/frostfall.yml"
           run_wrapper 1 FF_CONFIG="$PROF/frostfall.yml" FF_PROFILE=none
-          has_output 'tests-run=2'
+          has_output 'tests-run=3'
           run_wrapper 0 FF_CONFIG="$PROF/frostfall.yml"
-          has_output 'tests-run=2'
+          has_output 'tests-run=3'
           run_wrapper 0 FF_CONFIG="$PROF/frostfall.yml" FF_PROFILE=staging
           run_wrapper 2 FF_PROFILE=no-such-profile
           has_log 'no-such-profile'

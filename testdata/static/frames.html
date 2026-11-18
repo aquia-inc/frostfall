@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Frostfall fixture: iframes</title>
+</head>
+<body>
+  <main id="frames">
+    <h1>Frames fixture page</h1>
+    <p>This document is clean. Each frame carries one planted violation.</p>
+
+    <!-- planted (inside): image-alt (critical), same-origin frame -->
+    <iframe id="same-frame" title="Same-origin frame" src="frame-same.html"></iframe>
+
+    <!-- planted (inside): label (critical), cross-site frame. 127.0.0.1 and
+         localhost are different sites, so the frame loads from whichever
+         loopback name this page was not served from. The fixture server's
+         port is ephemeral, so the src is set from script. Under site
+         isolation this frame runs out of process. -->
+    <iframe id="cross-frame" title="Cross-site frame"></iframe>
+    <script>
+      const other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      document.getElementById('cross-frame').src =
+        location.protocol + '//' + other + ':' + location.port + '/frame-cross.html';
+    </script>
+  </main>
+</body>
+</html>

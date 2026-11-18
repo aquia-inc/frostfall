@@ -137,3 +137,19 @@ func TestRedactURLReplacesWhatItCannotParse(t *testing.T) {
 		}
 	}
 }
+
+// A frame-qualified target is scrubbed in every frame level: the frame
+// separator sits outside brackets and is kept as it is, and a value holding
+// the separator's text is dropped whole with the rest of the value.
+func TestScrubSelectorFrameLevels(t *testing.T) {
+	cases := map[string]string{
+		`iframe[src="https://idp.example/?t=abc"] |> a[href="/dl?token=x"]`:       `iframe[src] |> a[href]`,
+		`#outer |> iframe[title="Pay |> now"] |> input[value="4111111111111111"]`: `#outer |> iframe[title] |> input[value]`,
+		`my-app >>> iframe[name='w'] |> main > button[data-csrf="a1b2c3d4"]`:      `my-app >>> iframe[name] |> main > button[data-csrf]`,
+	}
+	for in, want := range cases {
+		if got := ScrubSelector(in); got != want {
+			t.Errorf("ScrubSelector(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

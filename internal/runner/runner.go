@@ -94,14 +94,20 @@ type Run struct {
 // each rule was switched off when its check ran. A rule was looked for if
 // its check ran more often than the rule was off - so one step toggling it
 // off does not hide another step that checked it.
+//
+// A partial run (a scan that had to leave out a frame it could not reach)
+// counts as a run, so the check is listed, but never as having looked for
+// any rule: the frame's violations are missing because they went unchecked,
+// not because they were fixed.
 type coverage struct {
-	runs   map[string]int
-	off    map[string]int
-	points []ScanPoint
+	runs    map[string]int
+	off     map[string]int
+	partial map[string]int
+	points  []ScanPoint
 }
 
 func newCoverage() *coverage {
-	return &coverage{runs: map[string]int{}, off: map[string]int{}}
+	return &coverage{runs: map[string]int{}, off: map[string]int{}, partial: map[string]int{}}
 }
 
 // point notes that a check ran at label, once per label.
@@ -121,6 +127,12 @@ func (c *coverage) record(check string, rules map[string]bool) {
 			c.off[id]++
 		}
 	}
+}
+
+// recordPartial notes a run of check that left part of the page unchecked.
+func (c *coverage) recordPartial(check string) {
+	c.runs[check]++
+	c.partial[check]++
 }
 
 // The checks that produce findings. axe owns every rule id outside the
@@ -145,7 +157,11 @@ func checkFor(ruleID string) string {
 // absence means fixed rather than unchecked.
 func (r *Run) Covered(testID, ruleID string) bool {
 	c := r.ran[testID]
-	return c != nil && c.runs[checkFor(ruleID)] > c.off[ruleID]
+	if c == nil {
+		return false
+	}
+	check := checkFor(ruleID)
+	return c.runs[check]-c.partial[check] > c.off[ruleID]
 }
 
 // Checks lists, sorted, the checks (axe, keyboard, expectFocus) that ran on
@@ -228,6 +244,9 @@ type Runner struct {
 	ScreenshotDir string
 	Verbose       bool
 	Log           func(format string, args ...any)
+	// Warn prints a warning whether or not the run is verbose: a frame a
+	// scan could not reach is a gap in coverage, not a detail.
+	Warn func(format string, args ...any)
 
 	baselineIdx map[string]baseline.Violation
 	// afterOp, when set, runs right after a check that reports on the page
@@ -253,6 +272,12 @@ func (r *Runner) recheck(s *browser.Session, op string) error {
 func (r *Runner) logf(format string, args ...any) {
 	if r.Verbose && r.Log != nil {
 		r.Log(format, args...)
+	}
+}
+
+func (r *Runner) warnf(format string, args ...any) {
+	if r.Warn != nil {
+		r.Warn(format, args...)
 	}
 }
 
@@ -527,10 +552,16 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	rules := mergeRules(false, r.Config.Defaults.Rules, t.Rules, s.Rules)
 
 	r.logf("test %s: scanning (%s)", t.ID, label)
+	missed := 0
 	violations, err := r.Engine.Audit(ctx, session, engine.ScanOptions{
 		Standard: r.Config.Defaults.Standard,
 		Scope:    s.Scope,
 		Rules:    rules,
+		Frames:   r.Config.FramesFor(t),
+		Warn: func(frame string, err error) {
+			missed++
+			r.frameWarning(t, label, frame, err)
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan %q: %w", label, err)
@@ -540,9 +571,33 @@ func (r *Runner) scan(ctx context.Context, session *browser.Session, t config.Te
 	if err := r.recheck(session, fmt.Sprintf("scan %q", label)); err != nil {
 		return nil, err
 	}
-	cov.record(checkAxe, rules)
+	if missed > 0 {
+		cov.recordPartial(checkAxe)
+	} else {
+		cov.record(checkAxe, rules)
+	}
 	cov.point(label, url)
 	return r.results(session, t, url, label, violations), nil
+}
+
+// frameWarning reports a frame a scan could not reach. It names the frame
+// the way the run's reports name targets: scrubbed of attribute values for a
+// signed-in test, whose frames can hold account data (an identity provider's
+// or a payment processor's). The error's text can carry the frame's URL, so
+// a run with auth configured, which prints every URL redacted, leaves it out
+// for every test and says only whether the frame timed out.
+func (r *Runner) frameWarning(t config.Test, label, frame string, err error) {
+	if r.signedIn(t) {
+		frame = secrets.ScrubSelector(frame)
+	}
+	reason := err.Error()
+	if r.Auth != nil {
+		reason = "it could not be reached"
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = "it did not respond in time"
+		}
+	}
+	r.warnf("test %q: scan %q: frame %s was not scanned (%s); its content is missing from the results", t.ID, label, frame, reason)
 }
 
 // results fingerprints one scan point's violations and captures evidence.
@@ -573,8 +628,12 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 		// Screenshot new violations only: baselined ones are known debt, and
 		// skipping them keeps CI artifact size proportional to what changed.
 		// A focus expectation names no element (its target is the
-		// assertion), so there is nothing to photograph.
-		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation {
+		// assertion), so there is nothing to photograph. Nor does a finding
+		// inside a frame in a signed-in test: its picture would be the frame,
+		// and a signed-in page's frames are where an identity provider or a
+		// payment processor shows account data, which must not end up in CI
+		// artifacts.
+		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation && !(r.signedIn(t) && inFrame(raw)) {
 			if _, known := r.baselineIdx[res.Fingerprint]; !known {
 				res.ScreenshotPath = r.captureScreenshot(session, res, raw, r.signedIn(t))
 			}
@@ -584,9 +643,18 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 	return results
 }
 
+// inFrame reports whether a target is inside a frame.
+func inFrame(target string) bool { return len(fingerprint.SplitFrames(target)) > 1 }
+
 // captureScreenshot best-effort shoots the violating element. Failure is
 // logged, never fatal: a violation without a picture still counts.
+//
+// A node inside a frame is shot by its frame's owner element in the top
+// document, the first level of the target: the screenshot shows where on the
+// page the frame is, and the node's own selector means nothing in the top
+// document.
 func (r *Runner) captureScreenshot(session *browser.Session, res Result, target string, signedIn bool) string {
+	target = fingerprint.SplitFrames(target)[0]
 	png, err := session.CaptureElement(target)
 	if err != nil {
 		if signedIn {

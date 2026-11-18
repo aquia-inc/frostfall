@@ -94,6 +94,7 @@ type ProfileDefaults struct {
 	Rules      map[string]bool `yaml:"rules"`
 	Expect     *Expect         `yaml:"expect"`
 	Keyboard   *KeyboardStep   `yaml:"keyboard"`
+	Frames     *bool           `yaml:"frames"`
 }
 
 // UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
@@ -142,6 +143,13 @@ type Defaults struct {
 	// config, never a binary default: turning it on in a release would fail
 	// every enforcing pipeline on findings nobody asked for.
 	Keyboard *KeyboardStep `yaml:"keyboard"`
+	// Frames: false keeps every test's scans out of iframes unless the test
+	// sets its own frames. Absent means on, a deliberate exception to the
+	// opt-in rule Keyboard follows: Keyboard adds a new kind of check, while
+	// leaving frames out is a silent false pass, a page whose UI is in a
+	// frame reported clean. Turning frames on adds findings for content that
+	// was always in scope; defaults.frames: false pins the old behavior.
+	Frames *bool `yaml:"frames"`
 }
 
 // UnmarshalYAML: a bare `keyboard:` means on, as everywhere else.
@@ -179,6 +187,18 @@ func (c *Config) KeyboardFor(t Test) *KeyboardStep {
 	}
 	maps.Copy(merged.Rules, k.Rules)
 	return &merged
+}
+
+// FramesFor reports whether t's scans reach into iframes: the test's own
+// frames setting, else defaults.frames, else on.
+func (c *Config) FramesFor(t Test) bool {
+	if t.Frames != nil {
+		return *t.Frames
+	}
+	if c.Defaults.Frames != nil {
+		return *c.Defaults.Frames
+	}
+	return true
 }
 
 // Expect is the enforcement contract. When no expect block is configured
@@ -235,6 +255,10 @@ type Test struct {
 	// itself. Absent or true means the configured auth applies (true needs
 	// an auth block).
 	Auth *bool `yaml:"auth"`
+	// Frames: false keeps this test's scans in the top document, for pages
+	// whose frames are out of the team's hands. Absent falls back to
+	// defaults.frames, and that to on.
+	Frames *bool `yaml:"frames"`
 }
 
 // UsesAuth reports whether the config's auth block applies to t: always,
@@ -697,6 +721,9 @@ func (c *Config) applyProfile(profile string) error {
 		}
 		if d.Keyboard != nil {
 			c.Defaults.Keyboard = d.Keyboard
+		}
+		if d.Frames != nil {
+			c.Defaults.Frames = d.Frames
 		}
 	}
 	return nil

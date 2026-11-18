@@ -144,3 +144,102 @@ func TestFieldBoundariesNotAmbiguous(t *testing.T) {
 		t.Errorf("field boundary collision")
 	}
 }
+
+// Pinned outputs for targets in the top document, computed with the scheme as
+// it stood before frame-qualified targets existed. Frame support must leave
+// every one of them byte for byte as it was: these are the fingerprints in
+// users' committed baselines. The attribute value holding " |> " must not be
+// read as a frame boundary.
+func TestTopDocumentTargetsPinned(t *testing.T) {
+	cases := []struct{ raw, stable, fp string }{
+		{"img", "img", "f784165ebae6dff8c9c1152f80ab8ba8"},
+		{"#unlabeled", "#unlabeled", "3f535e9b2cbc24350269f8cb3d4cf1da"},
+		{"#app > p:nth-child(4)", "#app > p:nth-child(4)", "dab04d2a8433f047fe789e525d59e05d"},
+		{`#app > div#\:r1a\: > button`, "#app > div > button", "fbe96fce05ce42e57ee0b3e11db1fb35"},
+		{"html > body > div.wrapper > #sidebar > nav > a", "#sidebar > nav > a", "8be120c00dd1cde496b47b58e7e56ec5"},
+		{".MuiChip-label.css-rrn746-MuiChip-label > span", ".MuiChip-label > span", "631f49c6c9ac6a2cb4ef8102eafbed23"},
+		{`main > a[href="/dl?token=Q7xK2pLm9Zw"]`, `main > a[href="/dl?token=Q7xK2pLm9Zw"]`, "16f8ce684bcd5e5ebc491c8ef19492c7"},
+		{`a[title="x |> y"]`, `a[title="x > | > y"]`, "140b72444f925413a95fc4ce55961642"},
+		{"main > a[href]", "main > a[href]", "8533d4825fac091713c177ef00a194ca"},
+		{"#list > li:nth-child(2)", "#list > li:nth-child(2)", "b13a77478322cb9d672dd569894091fc"},
+		{"my-app >>> button.css-1abc2d", "my-app > button", "1a9c5cd9b80f196497ac114b41fc7dd8"},
+	}
+	for _, c := range cases {
+		if got := StableTarget(c.raw); got != c.stable {
+			t.Errorf("StableTarget(%q) = %q, want %q", c.raw, got, c.stable)
+		}
+		if got := Fingerprint("fixture-initial", "initial", "image-alt", c.raw); got != c.fp {
+			t.Errorf("Fingerprint(%q) = %s, want %s", c.raw, got, c.fp)
+		}
+	}
+}
+
+func TestSplitFrames(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"img", []string{"img"}},
+		{"#frame |> img", []string{"#frame", "img"}},
+		{"#outer |> #inner |> main > p", []string{"#outer", "#inner", "main > p"}},
+		// The separator inside a quoted or bracketed value is part of it.
+		{`iframe[title="a |> b"] |> img`, []string{`iframe[title="a |> b"]`, "img"}},
+		{`iframe[title='a |> b'] |> img`, []string{`iframe[title='a |> b']`, "img"}},
+		{`a[title="x |> y"]`, []string{`a[title="x |> y"]`}},
+		// An escaped quote does not end the value.
+		{`iframe[title="say \" |> "] |> img`, []string{`iframe[title="say \" |> "]`, "img"}},
+		{"host >>> iframe |> button", []string{"host >>> iframe", "button"}},
+	}
+	for _, c := range cases {
+		got := SplitFrames(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("SplitFrames(%q) = %q, want %q", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("SplitFrames(%q) = %q, want %q", c.in, got, c.want)
+				break
+			}
+		}
+	}
+}
+
+func TestFrameTargetNormalizedPerLevel(t *testing.T) {
+	cases := map[string]string{
+		// Each level normalizes on its own: the hash class goes in both.
+		"#app > iframe.css-1abc2d |> main > button.css-9xyz8q": "#app > iframe |> main > button",
+		// An id anchor inside the frame truncates that level only; the path
+		// to the frame survives.
+		"iframe#pay |> html > body > div > #card > input": "iframe#pay |> #card > input",
+		// A generated id in the frame path is stripped like anywhere else.
+		"iframe#a1b2c3d4e5 |> img": "iframe |> img",
+		// Three levels.
+		"#outer |> iframe.inner |> p:nth-child(3)": "#outer |> iframe.inner |> p:nth-child(3)",
+	}
+	for in, want := range cases {
+		if got := StableTarget(in); got != want {
+			t.Errorf("StableTarget(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFrameTargetFingerprints(t *testing.T) {
+	// Hash churn inside the frame does not fork identity.
+	if fp("#pay |> button.css-1abc2d") != fp("#pay |> button.css-9xyz8q") {
+		t.Errorf("hash class churn inside a frame changed the fingerprint")
+	}
+	// The same node in two different frames is two violations.
+	if fp("#pay |> #card") == fp("#chat |> #card") {
+		t.Errorf("same selector in different frames collapsed into one fingerprint")
+	}
+	// A node in a frame is not the same violation as a top-document node
+	// with the same selector.
+	if fp("#pay |> #card") == fp("#card") {
+		t.Errorf("frame node collapsed into the top-document node")
+	}
+	// Stable across runs: the same input always gives the same output.
+	if fp("#pay |> main > img") != fp("#pay |> main > img") {
+		t.Errorf("fingerprint not deterministic")
+	}
+}

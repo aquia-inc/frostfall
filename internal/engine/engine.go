@@ -46,7 +46,23 @@ type ScanOptions struct {
 	Scope string
 	// Rules toggles individual rules by engine rule id.
 	Rules map[string]bool
+	// Frames extends the scan into the documents of the page's iframes,
+	// nested ones included, when the Page is a FramePage. False is the scan
+	// as it was before frames were supported: the top document only.
+	Frames bool
+	// Warn, when set, is told about each frame that could not be scanned:
+	// frame is its frame-qualified selector as the engine reports targets
+	// (raw, so the caller decides what may be printed), err is why. The scan
+	// goes on without that frame's content; it is not an error.
+	Warn func(frame string, err error)
 }
+
+// FrameSeparator joins the frame levels of a Violation.Target: the selector
+// of the frame's owner element in the top document, then each nested frame's
+// selector in its parent, then the node's selector in its own document. A
+// target in the top document has no separator and is exactly what it was
+// before frames were supported.
+const FrameSeparator = " |> "
 
 // Violation is one engine finding, normalized across engines.
 type Violation struct {
@@ -75,6 +91,19 @@ type Page interface {
 	// InjectScript evaluates a script source in the page (idempotent injection
 	// is the caller's concern).
 	InjectScript(src string) error
+}
+
+// FramePage is a Page that can reach the documents of its child frames,
+// whether they run in the page's process or out of it. It is optional: an
+// engine scans frames only when its Page implements it.
+type FramePage interface {
+	Page
+	// Frame returns the document of a child frame of this page. locate is a
+	// JS function expression, evaluated in this page with arg passed as a
+	// string, that returns the frame's owner element (iframe or frame) or
+	// null. The returned page runs under a deadline of its own, so one
+	// unresponsive frame cannot use up the whole scan's budget.
+	Frame(locate string, arg json.RawMessage) (FramePage, error)
 }
 
 // Engine audits a page that the runner has already navigated to readiness.

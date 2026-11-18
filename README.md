@@ -214,6 +214,7 @@ defaults:                        # applied to every test unless overridden
   keyboard: true                 # keyboard-audit every test's initial state,
                                  # discovered ones included (default off;
                                  # a test opts out with keyboard: false)
+  frames: true                   # scan inside iframes (default true; see Iframes)
   expect:                        # ABSENT = report-only, always exit 0
     severity: serious            # fail on new violations at this impact or worse:
                                  #   minor | moderate | serious | critical
@@ -269,6 +270,8 @@ tests:
                                  # the initial state (default false)
     auth: false                  # run without the configured auth: no session,
                                  # no login guard (public pages, signed-out states)
+    frames: false                # keep this test's scans out of iframes
+                                 # (default: defaults.frames, else true)
     expect:                      # per-test enforcement override
       severity: critical
     steps: []                    # see the step table below
@@ -401,6 +404,60 @@ actually is:
       - press: Escape
       - expectFocus: { label: closed, name: Delete }            # and came back
 ```
+
+### Iframes
+
+Scans reach into iframes. axe runs in the page and in every frame below it,
+same-origin and cross-origin, nested frames included, and the results merge
+into one set per scan point, so baselines, reports and `--gh-issues` treat a
+violation inside a frame like any other. A finding's target names the path
+to it, one selector per frame level joined with ` |> `:
+
+```text
+label at #payment-frame |> #card-number
+```
+
+The part before the first ` |> ` is the frame's element in the page; the
+last part is the element inside the frame. Targets in the page itself are
+unchanged, and so are their fingerprints: upgrading only adds findings for
+content inside frames. A screenshot of a finding inside a frame shows the
+frame's element in the page.
+
+Turn it off for a test whose frames are out of your hands (a third-party
+chat widget that only produces noise) with `frames: false`, or for every
+test without a setting of its own, discovered ones included, with
+`defaults: { frames: false }`. A test's own `frames` wins over the default.
+To keep the top-document-only scans of earlier releases after upgrading,
+pin it in the config:
+
+```yaml
+defaults: { frames: false }
+```
+
+- `scope` is a selector in the page, not inside a frame. A frame within the
+  scope is scanned in full.
+- A frame that cannot be reached, or does not answer within its own deadline
+  (10 seconds, cut short by the test's `timeout`), is left out with a
+  warning on stderr naming it, and the rest of the page is still scanned.
+  The warning is not in the reports and does not change the exit code. A
+  frame removed from the page mid-scan is left out the same way. In a run
+  with `auth` configured the warning leaves out the error text, which can
+  hold the frame's URL, and for a signed-in test it names the frame with
+  attribute values dropped. A frame that hangs the page itself still uses
+  up the test's `timeout`.
+- A scan that left a frame out does not count as having checked the test's
+  axe rules. Another, complete scan point in the same test still does, but
+  a frame that is never reachable keeps every baselined axe finding of that
+  test from going stale (and its issue from closing) until the frame is
+  reachable again or the test sets `frames: false`.
+- In a signed-in test, findings inside a frame get no screenshot: the
+  picture would be the frame, often an identity provider's or a payment
+  processor's.
+- The Chrome Frostfall launches keeps frames of every origin in the page's
+  process. Frames in a process of their own (browsers with site isolation
+  on) are reached too, by attaching to them directly.
+- Keyboard audits, screen reader transcripts and `expectFocus` stay in the
+  page and do not enter frames yet.
 
 ## Command-line reference
 

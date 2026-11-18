@@ -34,3 +34,8 @@ tests:
       - expectFocus:
           label: dialog-open
           within: "#dialog"
+
+  # planted: image-alt inside a same-origin frame and label inside a
+  # cross-site frame (frames.html); the top document itself is clean
+  - id: fixture-frames
+    path: /frames.html
