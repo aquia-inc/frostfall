@@ -10,6 +10,7 @@ import (
 	"github.com/aquia-inc/frostfall/internal/baseline"
 	"github.com/aquia-inc/frostfall/internal/browser"
 	"github.com/aquia-inc/frostfall/internal/config"
+	"github.com/aquia-inc/frostfall/internal/engine"
 )
 
 // A scan that had to leave a frame out did not look for the frame's
@@ -79,5 +80,21 @@ func TestFrameWarning(t *testing.T) {
 	}
 	if !strings.Contains(got[3], frame) || !strings.Contains(got[3], cause.Error()) {
 		t.Errorf("warning without auth lost the frame or the error: %s", got[3])
+	}
+}
+
+// A signed-in test takes no screenshot of a finding inside a frame (the
+// picture would be the frame, an identity provider's or a payment
+// processor's account data). Reaching the capture would need the session,
+// which is nil here, so getting through at all shows it was skipped.
+func TestSignedInFrameFindingNotPhotographed(t *testing.T) {
+	r := &Runner{Auth: browser.RedactingAuth(), ScreenshotDir: t.TempDir()}
+	v := engine.Violation{RuleID: "link-name", Target: `iframe[title="Pay"] |> a[href="/x?t=1"]`}
+	res := r.results(nil, config.Test{ID: "account"}, "https://app.example/", "initial", []engine.Violation{v})
+	if len(res) != 1 || res[0].ScreenshotPath != "" {
+		t.Errorf("results = %+v, want one result without a screenshot", res)
+	}
+	if res[0].Target != "iframe[title] |> a[href]" {
+		t.Errorf("target = %q, want it scrubbed in every level", res[0].Target)
 	}
 }

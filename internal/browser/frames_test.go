@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -263,5 +264,107 @@ func TestChildLocatedOnItsOwnDeadline(t *testing.T) {
 	raw, err := inner.Eval(`() => document.getElementById('deep').textContent`)
 	if err != nil || string(raw) != `"deep"` {
 		t.Errorf("inner frame eval = %s, %v", raw, err)
+	}
+}
+
+// removeAfterInject is a FramePage whose frames remove their own iframe from
+// the top document right after axe is injected into them: the frame leaves
+// the page between two of the scan's calls into it.
+type removeAfterInject struct {
+	engine.FramePage
+	s *Session
+}
+
+func (r removeAfterInject) Frame(locate string, arg json.RawMessage) (engine.FramePage, error) {
+	f, err := r.FramePage.Frame(locate, arg)
+	if err != nil {
+		return nil, err
+	}
+	return removeAfterInject{FramePage: f, s: r.s}, nil
+}
+
+func (r removeAfterInject) InjectScript(src string) error {
+	if err := r.FramePage.InjectScript(src); err != nil {
+		return err
+	}
+	if _, isTop := r.FramePage.(*Session); isTop {
+		return nil
+	}
+	_, err := r.s.Eval(`() => { document.getElementById('gone').remove(); return true }`)
+	return err
+}
+
+// A frame removed from the page mid-scan makes rod's in-process frame page
+// dereference a content document that no longer exists. That must be an
+// error for that frame - one null partial and a warning - never a panic that
+// takes the run down.
+func TestFrameRemovedMidScan(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body><main><img src="a.png">
+			<iframe id="gone" title="gone" src="/child"></iframe></main></body></html>`)
+	})
+	mux.HandleFunc("/child", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>c</title></head><body><input type="text"></body></html>`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	b, err := Launch("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	open := func() *Session {
+		s, err := b.NewSession(srv.URL+"/", config.Viewport{Width: 800, Height: 600}, "load", 0, 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	// Directly: open the frame, use it, remove it, use it again.
+	s := open()
+	f, err := s.Frame(`(s) => document.querySelector(JSON.parse(s))`, []byte(`"#gone"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Eval(`() => 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Eval(`() => { document.getElementById('gone').remove(); return true }`); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range []func() error{
+		func() error { _, err := f.Eval(`() => 1`); return err },
+		func() error { return f.InjectScript("window.x = 1") },
+	} {
+		if err := call(); err == nil {
+			t.Error("a call into a removed frame succeeded")
+		}
+	}
+	s.Close()
+
+	// Through a scan: the frame goes away between injection and the run.
+	s = open()
+	defer s.Close()
+	var warned []string
+	vs, err := axe.New().Audit(t.Context(), removeAfterInject{FramePage: s, s: s}, engine.ScanOptions{
+		Standard: "wcag21aa",
+		Frames:   true,
+		Warn:     func(frame string, err error) { warned = append(warned, frame) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := targets(vs); !slices.Equal(got, []string{"image-alt at img"}) {
+		t.Errorf("violations = %q, want the top document's alone", got)
+	}
+	if len(warned) != 1 {
+		t.Errorf("warnings = %q, want the removed frame", warned)
 	}
 }

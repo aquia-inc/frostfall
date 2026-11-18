@@ -628,8 +628,12 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 		// Screenshot new violations only: baselined ones are known debt, and
 		// skipping them keeps CI artifact size proportional to what changed.
 		// A focus expectation names no element (its target is the
-		// assertion), so there is nothing to photograph.
-		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation {
+		// assertion), so there is nothing to photograph. Nor does a finding
+		// inside a frame in a signed-in test: its picture would be the frame,
+		// and a signed-in page's frames are where an identity provider or a
+		// payment processor shows account data, which must not end up in CI
+		// artifacts.
+		if r.ScreenshotDir != "" && v.RuleID != keyboard.RuleFocusExpectation && !(r.signedIn(t) && inFrame(raw)) {
 			if _, known := r.baselineIdx[res.Fingerprint]; !known {
 				res.ScreenshotPath = r.captureScreenshot(session, res, raw, r.signedIn(t))
 			}
@@ -638,6 +642,9 @@ func (r *Runner) results(session *browser.Session, t config.Test, url, label str
 	}
 	return results
 }
+
+// inFrame reports whether a target is inside a frame.
+func inFrame(target string) bool { return len(fingerprint.SplitFrames(target)) > 1 }
 
 // captureScreenshot best-effort shoots the violating element. Failure is
 // logged, never fatal: a violation without a picture still counts.

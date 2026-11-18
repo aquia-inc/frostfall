@@ -1939,14 +1939,17 @@ func TestFramesOptOut(t *testing.T) {
 // A signed-in run scans the auth fixture's cross-site frame and prints its
 // violation's target with the attribute values dropped in every frame level:
 // the frame's own title and the link's href (a stand-in for an account token)
-// appear nowhere.
+// appear nowhere. With screenshots on, only the top document's finding is
+// photographed: a frame finding's picture would be the frame's content.
 func TestSignedInFrameTargetScrubbed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}
 	t.Chdir("../..")
-	out := filepath.Join(t.TempDir(), "report.json")
-	code, stdout, stderr := runBoth(t, "--config", "testdata/auth/frostfall.yml", "--verbose", "--format", "json", "--output", out, "--no-screenshots", "--baseline", "none")
+	dir := t.TempDir()
+	out := filepath.Join(dir, "report.json")
+	shots := filepath.Join(dir, "shots")
+	code, stdout, stderr := runBoth(t, "--config", "testdata/auth/frostfall.yml", "--verbose", "--format", "json", "--output", out, "--screenshots", "--screenshot-dir", shots, "--baseline", "none")
 	if code != exitViolations {
 		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitViolations, stderr)
 	}
@@ -1960,6 +1963,9 @@ func TestSignedInFrameTargetScrubbed(t *testing.T) {
 	report, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if pngs, _ := filepath.Glob(filepath.Join(shots, "*.png")); len(pngs) != 1 {
+		t.Errorf("screenshots = %q, want only the top document's finding", pngs)
 	}
 	for _, secret := range []string{"FRAMESECRET42", "Account widget"} {
 		for name, haystack := range map[string]string{"stdout": stdout, "stderr": stderr, "report": string(report)} {

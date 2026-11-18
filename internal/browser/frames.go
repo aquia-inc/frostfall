@@ -31,14 +31,37 @@ type framePage struct {
 	page *rod.Page
 }
 
-func (f *framePage) Eval(js string, args ...any) (json.RawMessage, error) {
+// Every call into a frame page is guarded (see guard): a frame can leave the
+// page between two calls.
+func (f *framePage) Eval(js string, args ...any) (res json.RawMessage, err error) {
+	defer guard(&err)
 	return evalJSON(f.page, js, args...)
 }
 
-func (f *framePage) InjectScript(src string) error { return inject(f.page, src) }
+func (f *framePage) InjectScript(src string) (err error) {
+	defer guard(&err)
+	return inject(f.page, src)
+}
 
-func (f *framePage) Frame(locate string, arg json.RawMessage) (engine.FramePage, error) {
+func (f *framePage) Frame(locate string, arg json.RawMessage) (child engine.FramePage, err error) {
+	defer guard(&err)
 	return f.s.frame(f.page, locate, arg)
+}
+
+// errFrameGone is what a call into a frame whose element left the page
+// returns in place of rod's panic.
+var errFrameGone = errors.New("the frame left the page during the scan")
+
+// guard turns a panic in a call into a frame page into an error, so the frame
+// is left out of the scan rather than crashing the run. rod's in-process frame
+// page re-reads its owner element's content document whenever it has no
+// cached window (first use, and after the frame's context went away) and
+// dereferences it unchecked; once the iframe is removed from the page there
+// is no content document, and that is a nil dereference.
+func guard(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%w (%v)", errFrameGone, r)
+	}
 }
 
 // Frame implements engine.FramePage for the top document.

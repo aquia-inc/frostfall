@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -179,6 +180,18 @@ func (e *Engine) frameRun(ctx context.Context, page engine.FramePage, scope, opt
 	if err != nil {
 		return nil, err
 	}
+	if !framesMatch(top, frames) {
+		// The page's frames changed between the two calls, so the frame
+		// list cannot be matched to the frames finishRun will expect. Scan
+		// the top document as the plain run does, and report every frame
+		// as left out.
+		if warn != nil {
+			for _, f := range frames {
+				warn(flattenTarget([]json.RawMessage{f.FrameSelector}), errFramesChanged)
+			}
+		}
+		return page.Eval(fmt.Sprintf("() => window.axe.run(%s, %s)", scope, opts))
+	}
 	partials := []json.RawMessage{top}
 	for _, f := range frames {
 		if err := ctx.Err(); err != nil {
@@ -230,15 +243,40 @@ func (e *Engine) framePartials(ctx context.Context, parent engine.FramePage, f f
 	if err != nil {
 		return fail(err)
 	}
+	if !framesMatch(partial, children) {
+		return fail(errFramesChanged)
+	}
 	out := []json.RawMessage{partial}
 	for _, c := range children {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			if warn != nil {
+				warn(flattenTarget(append(slices.Clone(path), c.FrameSelector)), err)
+			}
 			out = append(out, nullPartial)
 			continue
 		}
 		out = append(out, e.framePartials(ctx, frame, c, path, opts, warn)...)
 	}
 	return out
+}
+
+// errFramesChanged is why a frame is left out when its document's frames
+// changed between getFrameContexts and runPartial.
+var errFramesChanged = errors.New("frames changed during the scan")
+
+// framesMatch reports whether a runPartial result recorded as many frames as
+// getFrameContexts listed. finishRun matches the partials that follow to the
+// partial's own frames list, in order; if the document gained or lost a frame
+// between the two calls, the children walked from the other list would be
+// filed under the wrong frames.
+func framesMatch(partial json.RawMessage, listed []frameContext) bool {
+	var p struct {
+		Frames []json.RawMessage `json:"frames"`
+	}
+	if err := json.Unmarshal(partial, &p); err != nil {
+		return false
+	}
+	return len(p.Frames) == len(listed)
 }
 
 // impactOrDefault maps an axe impact string to the normalized scale. An
