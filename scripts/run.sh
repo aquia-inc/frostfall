@@ -6,23 +6,24 @@
 # bash 3.2 (macOS runners): no associative arrays, no ${var,,}, no mapfile.
 set -euo pipefail
 
+CR=$'\r'
+LF=$'\n'
+
 # escape_cmd TEXT: encode text for a workflow command message. Input values
 # can contain newlines, and an unescaped one would start a new line that the
 # runner parses as its own command (::set-output, ::stop-commands::).
 escape_cmd() {
-  local s="$1" cr lf
-  cr=$'\r'
-  lf=$'\n'
+  local s="$1"
   s="${s//%/%25}"
-  s="${s//$cr/%0D}"
-  s="${s//$lf/%0A}"
+  s="${s//$CR/%0D}"
+  s="${s//$LF/%0A}"
   printf '%s' "$s"
 }
 
 # fail MESSAGE: report an input problem as a step error and stop before any
 # scan runs.
 fail() {
-  echo "::error::$(escape_cmd "$1")"
+  printf '::error::%s\n' "$(escape_cmd "$1")"
   exit 2
 }
 
@@ -31,6 +32,16 @@ check_bool() {
   case "$2" in
     ""|true|false) ;;
     *) fail "input '$1' must be \"true\", \"false\" or empty, got \"$2\"" ;;
+  esac
+}
+
+# check_line NAME VALUE: free-text values are single lines. A line break is
+# never meaningful in a path, URL, profile name or regex, and refusing it keeps
+# a stray YAML block-scalar newline from silently changing what a regex
+# matches. The value is not echoed.
+check_line() {
+  case "$2" in
+    *"$CR"*|*"$LF"*) fail "input '$1' must not contain line breaks" ;;
   esac
 }
 
@@ -50,6 +61,15 @@ FF_PATH="${FF_PATH:-}"
 FF_DISCOVER="${FF_DISCOVER:-}"
 FF_SCREENSHOTS="${FF_SCREENSHOTS:-}"
 
+check_line config "$FF_CONFIG"
+check_line serve "$FF_SERVE"
+check_line base-url "$FF_BASE_URL"
+check_line baseline "$FF_BASELINE"
+check_line format "$FF_FORMAT"
+check_line output "$FF_OUTPUT"
+check_line profile "$FF_PROFILE"
+check_line id "$FF_ID"
+check_line path "$FF_PATH"
 check_bool gh-issues "$FF_GH_ISSUES"
 check_bool discover "$FF_DISCOVER"
 check_bool screenshots "$FF_SCREENSHOTS"

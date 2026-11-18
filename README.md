@@ -1240,9 +1240,10 @@ them empty, so the examples below upload explicit file paths rather than
 
 Each input maps to the CLI flag of the same name; see the
 [command-line reference](#command-line-reference). The step exits with
-frostfall's own exit code. Input values are passed verbatim, with no trimming,
-so a regex that ends in a newline (a YAML `|` block adds one) will not match
-what you meant; use a quoted single-line string.
+frostfall's own exit code. Values may not contain line breaks: a value with a
+CR or LF fails the step before any scan runs, which catches the trailing newline
+a YAML `|` block adds. Within a line, values are passed verbatim with no
+trimming, so leading or trailing spaces stay part of the value.
 
 ### Code scanning (SARIF)
 
@@ -1256,19 +1257,22 @@ permissions:
   security-events: write
 steps:
   - uses: aquia-inc/frostfall@v1
+    id: frostfall
     with:
       serve: ./dist
       format: sarif
   - uses: github/codeql-action/upload-sarif@v3
-    if: always() && hashFiles('frostfall.sarif') != ''
+    if: always() && steps.frostfall.outputs.report-file != ''
     with:
       sarif_file: frostfall.sarif
 ```
 
-The SARIF file is written only when the scan completes. The `hashFiles` check
-skips the upload when it is missing, so a run that stops early (a bad config,
-an unreachable server) fails with its own error instead of adding a second one
-from the upload step.
+The SARIF file and the `report-file` output are both written only when the
+scan completes, and that includes a scan that finds violations and exits 1. The
+upload is gated on the output rather than on the file, so a run that stopped
+early (a bad config, an unreachable server) has no output and skips the upload,
+and a leftover `frostfall.sarif` from an earlier run is never uploaded. The
+failed run reports its own error instead of a second one from the upload step.
 
 Violations land in the **Security tab** as code scanning alerts (scanning
 rendered pages, there is no source line to annotate, so no inline PR
