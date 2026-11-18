@@ -24,6 +24,16 @@ import (
 	"github.com/aquia-inc/frostfall/internal/config"
 )
 
+// logOpts sends an auth run's warnings and log lines to the test log, so a
+// capture that went wrong says why in the failure output.
+func logOpts(t *testing.T) AuthOptions {
+	return AuthOptions{
+		Warn: func(f string, args ...any) { t.Logf("warning: "+f, args...) },
+		Log:  func(f string, args ...any) { t.Logf(f, args...) },
+		Note: func(f string, args ...any) { t.Logf(f, args...) },
+	}
+}
+
 func cfgViewport() config.Viewport { return config.Viewport{Width: 1280, Height: 800} }
 
 // pages lists the browser's page targets in a stable order.
@@ -80,7 +90,7 @@ func TestAttachTakesTheAppsSessionAndLeavesTheBrowserAlone(t *testing.T) {
 
 	b := connectTo(t, c, c.HTTP())
 	cfg := loadAuthConfig(t, app.URL, "  attach: true\n  allowedOrigins: [\""+idpOrigin+"\"]\n")
-	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	a, err := NewAuth(b, cfg, app.URL, logOpts(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +239,7 @@ func TestAttachNeedsAnAttachedBrowser(t *testing.T) {
 	app := newAuthApp(t)
 	b := launch(t)
 	cfg := loadAuthConfig(t, app.URL, "  attach: true\n")
-	if _, err := NewAuth(b, cfg, app.URL, AuthOptions{}); err == nil || !strings.Contains(err.Error(), "--browser-url") {
+	if _, err := NewAuth(b, cfg, app.URL, logOpts(t)); err == nil || !strings.Contains(err.Error(), "--browser-url") {
 		t.Errorf("err = %v, want it to ask for --browser-url", err)
 	}
 }
@@ -261,7 +271,7 @@ func TestCloseDuringCaptureLeavesNoTab(t *testing.T) {
 	cfg := loadAuthConfig(t, app.URL, "  attach: true\n")
 	captureTabOpened = b.Close
 	t.Cleanup(func() { captureTabOpened = nil })
-	if _, err := NewAuth(b, cfg, app.URL, AuthOptions{}); err == nil {
+	if _, err := NewAuth(b, cfg, app.URL, logOpts(t)); err == nil {
 		t.Error("the capture went on after the browser was closed")
 	}
 	if after := pages(t, c); !slices.Equal(before, after) {
@@ -295,8 +305,8 @@ func TestAddAfterCloseRemovesAtOnce(t *testing.T) {
 
 // Reading the session sends nothing to the app (every request of the capture
 // tab is answered by Frostfall or failed), leaves no tab, and leaves no
-// visible history entry in the user's profile: the one navigation is marked
-// auto_subframe, which Chrome stores as a hidden, never-typed row.
+// visible history entry in the user's profile: the empty page is answered
+// with HTTP 404, which Chrome stores as a hidden row.
 func TestCaptureSendsNothingToTheAppAndLeavesNoVisibleHistory(t *testing.T) {
 	var userRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +325,7 @@ func TestCaptureSendsNothingToTheAppAndLeavesNoVisibleHistory(t *testing.T) {
 	b := connectTo(t, c, c.HTTP())
 	cfg := loadAuthConfig(t, srv.URL, "  attach: true\n")
 	var notes []string
-	a, err := NewAuth(b, cfg, srv.URL, AuthOptions{Note: func(f string, args ...any) { notes = append(notes, fmt.Sprintf(f, args...)) }})
+	a, err := NewAuth(b, cfg, srv.URL, AuthOptions{Warn: logOpts(t).Warn, Note: func(f string, args ...any) { notes = append(notes, fmt.Sprintf(f, args...)) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,12 +349,14 @@ func TestCaptureSendsNothingToTheAppAndLeavesNoVisibleHistory(t *testing.T) {
 	}
 	c.Quit(t)
 	out, err := exec.Command(sqlite, filepath.Join(c.Dir, "Default", "History"),
-		"select hidden, typed_count from urls where url = '"+srv.URL+"/'").CombinedOutput()
+		"select hidden from urls where url = '"+srv.URL+"/'").CombinedOutput()
 	if err != nil {
 		t.Fatalf("reading History: %v: %s", err, out)
 	}
-	if row := strings.TrimSpace(string(out)); row != "" && row != "1|0" {
-		t.Errorf("history row for the app root = %q, want none or hidden and never typed (1|0)", row)
+	// Hidden rows are left out of chrome://history and of the address bar's
+	// suggestions, whatever their typed count.
+	if row := strings.TrimSpace(string(out)); row != "" && row != "1" {
+		t.Errorf("history row for the app root has hidden = %q, want none or a hidden row (1)", row)
 	}
 }
 
@@ -537,7 +549,7 @@ func TestCaptureBypassesServiceWorkers(t *testing.T) {
 
 	b := connectTo(t, c, c.HTTP())
 	cfg := loadAuthConfig(t, app.URL, "  attach: true\n")
-	a, err := NewAuth(b, cfg, app.URL, AuthOptions{})
+	a, err := NewAuth(b, cfg, app.URL, logOpts(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +677,7 @@ func TestCaptureKeepsAnExistingHistoryTitle(t *testing.T) {
 
 	b := connectTo(t, c, c.HTTP())
 	cfg := loadAuthConfig(t, srv.URL, "  attach: true\n")
-	if _, err := NewAuth(b, cfg, srv.URL, AuthOptions{}); err != nil {
+	if _, err := NewAuth(b, cfg, srv.URL, logOpts(t)); err != nil {
 		t.Fatal(err)
 	}
 	b.Close()
@@ -700,7 +712,7 @@ func TestCaptureCarriesFirstPartyPartitionedCookies(t *testing.T) {
 	c.OpenTab(t, srv.URL+"/set")
 	b := connectTo(t, c, c.HTTP())
 	cfg := loadAuthConfig(t, srv.URL, "  attach: true\n")
-	a, err := NewAuth(b, cfg, srv.URL, AuthOptions{})
+	a, err := NewAuth(b, cfg, srv.URL, logOpts(t))
 	if err != nil {
 		t.Fatal(err)
 	}

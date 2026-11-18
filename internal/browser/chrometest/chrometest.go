@@ -53,7 +53,12 @@ func Start(t testing.TB, headed bool) *Chrome {
 // --ignore-certificate-errors for a self-signed https fixture.
 func StartWith(t testing.TB, headed bool, extra ...string) *Chrome {
 	t.Helper()
-	bin, ok := launcher.LookPath()
+	// FROSTFALL_TEST_CHROME picks a specific binary, such as a Chrome for
+	// Testing build of the version a CI runner has.
+	bin, ok := os.Getenv("FROSTFALL_TEST_CHROME"), true
+	if bin == "" {
+		bin, ok = launcher.LookPath()
+	}
 	if !ok {
 		t.Fatal("no Chrome or Chromium found")
 	}
@@ -93,6 +98,9 @@ func StartWith(t testing.TB, headed bool, extra ...string) *Chrome {
 		if lines := strings.Split(strings.TrimSpace(string(raw)), "\n"); err == nil && len(lines) == 2 {
 			c := &Chrome{Port: strings.TrimSpace(lines[0]), WSPath: strings.TrimSpace(lines[1]), Dir: dir, cmd: cmd}
 			if c.VersionOK() {
+				// Which browser a failure ran against, for CI logs (shown with -v
+				// or on failure).
+				t.Logf("chrometest: %s (%s)", c.product(), bin)
 				return c
 			}
 		}
@@ -115,6 +123,23 @@ func (c *Chrome) Quit(t testing.TB) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Chrome did not exit after Browser.close")
 	}
+}
+
+// product is the Browser field of /json/version, such as Chrome/157.0.8103.50.
+func (c *Chrome) product() string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(c.HTTP() + "/json/version")
+	if err != nil {
+		return "unknown browser"
+	}
+	defer resp.Body.Close()
+	var v struct {
+		Browser string `json:"Browser"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&v) != nil || v.Browser == "" {
+		return "unknown browser"
+	}
+	return v.Browser
 }
 
 // VersionOK reports whether /json/version still answers, which is how a test

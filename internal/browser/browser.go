@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,8 +204,29 @@ func (b *Browser) Close() {
 			_ = proto.TargetDisposeBrowserContext{BrowserContextID: id}.Call(r)
 		}
 		r.CancelTimeout()
+		b.waitGone(targets)
 		_ = b.ws.Close()
 	})
+}
+
+// waitGone waits, briefly, until none of ids is among the browser's targets.
+// Target.closeTarget answers once the close has started, and on a busy
+// machine the tab is still listed for a moment afterwards (seen on a CI
+// runner): Close and the capture tab's own close wait it out, so "closed"
+// means gone when they return.
+func (b *Browser) waitGone(ids []proto.TargetTargetID) {
+	if len(ids) == 0 {
+		return
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		res, err := proto.TargetGetTargets{}.Call(b.rod.Timeout(time.Second))
+		if err != nil {
+			return
+		}
+		if !slices.ContainsFunc(res.TargetInfos, func(ti *proto.TargetTargetInfo) bool { return slices.Contains(ids, ti.TargetID) }) {
+			return
+		}
+	}
 }
 
 // Session is one test's page in its own incognito browser context.

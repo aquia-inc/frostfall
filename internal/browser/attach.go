@@ -413,9 +413,11 @@ var captureTabOpened func()
 //     an empty page by Frostfall and anything else is failed, so nothing goes
 //     to the network, the app's code never runs, and no redirect can happen. A
 //     request still paused when the tab closes is aborted with it.
-//   - The navigation is marked auto_subframe, which keeps it out of the visible
-//     history and the address bar's suggestions (Chrome still stores a hidden
-//     row for the URL), and the empty page has no title to give a history row.
+//   - The empty page is answered with HTTP 404, which Chrome records as a
+//     hidden history row, left out of the visible history and the address
+//     bar's suggestions, and it has no title to give a history row. (Marking
+//     the navigation auto_subframe did the same up to Chrome 154; Chrome 157
+//     never commits such a top-level navigation.)
 //
 // On each origin's page the cookies come from Network.getCookies for that URL,
 // so Chrome does the matching and no other site's cookie is read at all;
@@ -471,9 +473,16 @@ func (a *Auth) captureAttached(b *Browser) (*State, error) {
 	keys := 0
 	for i, o := range origins {
 		items, err := a.readOrigin(page, o, urls[i])
-		if err != nil {
+		switch {
+		case err != nil && i == 0:
+			// Without the app's own page neither its localStorage nor a
+			// partitioned cookie can be read, and a scan would start from a
+			// partial session that the guard can only call "expired". Say what
+			// actually failed instead.
+			return nil, fmt.Errorf("auth attach: %w: the session could not be read from the attached browser", err)
+		case err != nil:
 			a.warnf("auth attach: %v; the session may be missing what %s keeps in localStorage", err, o)
-		} else if len(items) > 0 {
+		case len(items) > 0:
 			st.origins = append(st.origins, originStorage{origin: o, local: items})
 			keys += len(items)
 		}
@@ -523,6 +532,7 @@ func (b *Browser) openCaptureTab() (*rod.Page, func(), error) {
 	}
 	closeTab := func() {
 		if _, err := (proto.TargetCloseTarget{TargetID: id}).Call(b.rod.Timeout(5 * time.Second)); err == nil {
+			b.waitGone([]proto.TargetTargetID{id})
 			b.owned.dropTarget(id)
 		}
 	}
@@ -565,7 +575,7 @@ func interceptCaptureTab(page *rod.Page, docs []string) (func(), error) {
 		if e.ResourceType == proto.NetworkResourceTypeDocument && slices.Contains(docs, e.Request.URL) {
 			_ = proto.FetchFulfillRequest{
 				RequestID:       e.RequestID,
-				ResponseCode:    http.StatusOK,
+				ResponseCode:    http.StatusNotFound, // a hidden history row; see captureAttached
 				ResponseHeaders: []*proto.FetchHeaderEntry{{Name: "Content-Type", Value: "text/html; charset=utf-8"}},
 				Body:            []byte(blankDocument),
 			}.Call(h)
@@ -583,7 +593,7 @@ func interceptCaptureTab(page *rod.Page, docs []string) (func(), error) {
 func (a *Auth) readOrigin(page *rod.Page, origin, url string) ([][2]string, error) {
 	p := page.Timeout(a.defaults.Timeout.Std())
 	defer p.CancelTimeout()
-	nav, err := proto.PageNavigate{URL: url, TransitionType: proto.PageTransitionTypeAutoSubframe}.Call(p)
+	nav, err := proto.PageNavigate{URL: url, TransitionType: proto.PageTransitionTypeLink}.Call(p)
 	if err != nil || nav.ErrorText != "" {
 		return nil, fmt.Errorf("could not open %s in the capture tab", origin)
 	}

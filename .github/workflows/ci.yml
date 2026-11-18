@@ -25,6 +25,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Browser version
+        # For reading test failures against: the attach tests drive this Chrome.
+        run: |
+          google-chrome --version || true
+          chromium --version || true
+
       - name: Unit tests
         run: go test -timeout 15m ./...
 

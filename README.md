@@ -1171,7 +1171,9 @@ afterwards. It never reads, navigates or closes your own tabs.
   its code never runs, and nothing can redirect. Chrome still records the
   visit as a hidden history entry, left out of `chrome://history` and the
   address bar's suggestions; the empty page has no title, so an entry you
-  already have for that URL keeps its name.
+  already have for that URL keeps its name and stays visible. If the app's
+  own page cannot be opened this way, the run stops with exit 3 and says so,
+  rather than scanning with part of the session.
 - *Cookies.* Chrome is asked for the cookies it would send to the base URL
   and to each `allowedOrigins` root, so no other site's cookies are read.
   Frostfall checks them again by domain (a parent-domain cookie such as

@@ -529,10 +529,15 @@ the key without the flag, except under `--validate`, which checks the config alo
   document is fulfilled with an empty, untitled page and anything else failed. Fetch is never
   disabled while the tab is open, since disabling it releases a paused request to the network (a
   test reproduced that too); a request still paused at the end is aborted when the tab closes.
-  The page checks `location.origin` itself before returning storage. The navigation is sent as
-  `auto_subframe`, which Chrome records as a hidden, never-typed history row (`hidden=1`,
-  `typed_count=0`; every other transition type tried left a visible or typed row), and the empty
-  page has no title, so an existing row keeps its own (with a title, Chrome renamed it). On each
+  The page checks `location.origin` itself before returning storage. The empty page is answered
+  with HTTP 404, which Chrome records as a hidden history row (`hidden=1`, so it is left out of
+  `chrome://history` and the address bar's suggestions; checked on Chrome 154 and 157), and it has
+  no title, so an existing row keeps its own title and stays visible (with a title, Chrome renamed
+  it). An earlier version marked the navigation `auto_subframe` instead, which worked up to Chrome
+  154; Chrome 157 never commits a top-level navigation with that transition, so the visit timed out
+  and the capture came back with no localStorage. A visit to the app's own origin that fails now
+  stops the run (exit 3) with that reason, instead of a warning followed by a scan from a partial
+  session that the guard could only call expired; a failed visit to an allowed origin still warns. On each
   origin's page, `Network.getCookies` for that URL does the matching, so no other site's cookie
   enters memory, and `attachedCookies` checks again (RFC 6265 domain match including parent-domain
   cookies and bracketed IPv6 literals, the cookie's path covering the scope's, `Secure` only for
