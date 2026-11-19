@@ -11,7 +11,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	"gopkg.in/yaml.v3"
 
 	"github.com/aquia-inc/frostfall/internal/secrets"
@@ -136,6 +138,10 @@ func LoadStorageState(path string) (*StorageState, error) {
 	}
 	for i, o := range st.Origins {
 		if _, err := NormalizeOrigin(o.Origin); err != nil {
+			if errors.Is(err, ErrInvalidIDN) {
+				// The reason without the value, as for every error here.
+				return nil, fmt.Errorf("origins[%d]: %w", i, ErrInvalidIDN)
+			}
 			return nil, fmt.Errorf("origins[%d]: origin must be an http(s) origin", i)
 		}
 	}
@@ -248,6 +254,9 @@ func NormalizeOrigin(raw string) (string, error) {
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("%q has more than an origin (what follows the origin is not shown here): drop the path, query and credentials", secrets.RedactURL(raw))
 	}
+	if _, err := CanonicalHost(u.Hostname()); err != nil {
+		return "", fmt.Errorf("%q: %w", secrets.RedactURL(raw), err)
+	}
 	return originOfURL(u), nil
 }
 
@@ -255,12 +264,172 @@ func NormalizeOrigin(raw string) (string, error) {
 // without requiring u to be a bare origin.
 func OriginOfURL(u *url.URL) string { return originOfURL(u) }
 
+// ErrInvalidIDN is CanonicalHost's error for a non-ASCII host that does not
+// pass the checks CanonicalHost makes on what a browser would load.
+var ErrInvalidIDN = errors.New("the host is not a valid internationalized domain name (the browser refuses it, or reads it as an IP address)")
+
+// browserIDNA converts a non-ASCII host as the WHATWG URL standard's "domain
+// to ASCII" does: UTS #46 mapping with non-transitional processing (ß stays
+// ß, xn--zca, instead of becoming ss), the bidi and joiner rules, and no STD3
+// or hyphen checks, which browsers leave off (an underscore or a leading
+// hyphen in a label loads in Chrome).
+var browserIDNA = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.Transitional(false),
+	idna.StrictDomainName(false), idna.CheckHyphens(false))
+
+// CanonicalHost returns host, as url.URL.Hostname gives it (no port, an IPv6
+// literal without brackets), the way a browser writes it in location.origin
+// and in the URLs it reports: lower-cased, an IPv6 literal in brackets, and a
+// non-ASCII (IDN) host in punycode (café.example is xn--caf-dma.example).
+//
+// An all-ASCII host is only lower-cased and bracketed, exactly as before IDN
+// support; none of the checks below apply to it.
+//
+// A non-ASCII host is refused with ErrInvalidIDN when:
+//   - a label starts with xn-- once mapped but is not all ASCII (see
+//     nonASCIIPunycodeLabel);
+//   - browserIDNA refuses it (a disallowed code point, the bidi or joiner
+//     rules);
+//   - the bidi rule fails on the mapped labels. x/net/idna decides whether to
+//     run that rule from the runes as written, so a code point that maps into
+//     a right-to-left script (ℵ, U+2135, maps to Hebrew alef) skips it.
+//     Converting the result a second time decodes its punycode labels and
+//     applies the rule to what the browser sees; that pass must also give
+//     back the same string;
+//   - the result fails the URL standard's checks after domain to ASCII: it is
+//     empty, has a forbidden domain code point (fullwidth ／, ＠ and ： map to
+//     /, @ and :), or its last label is a number. The browser then parses the
+//     host as IPv4 and refuses it (é.1.2.3) or rewrites it to an address
+//     (１２７.0.0.1 is 127.0.0.1); both are refused here, the second on
+//     purpose, since a config that means an IP address should say so;
+//   - an xn-- label decodes to nothing (é.xn--.example). A label that is
+//     empty as written is kept, as the browser keeps it (é..example).
+//
+// These are the checks made, not a promise to refuse everything a browser
+// refuses. A host the browser refuses for a reason not listed here is still
+// converted, and nothing here proves the result is a host no page reports;
+// the one known way a refused host converts to a real one (a malformed xn--
+// label) is checked explicitly, and the Chrome comparison test in
+// internal/browser covers the rest of what is known.
+//
+// A refused host comes back exactly as written. It is non-ASCII, so it can
+// never equal an origin a browser reports, and a comparison against it fails
+// closed. (Lower-casing it could not promise that: strings.ToLower turns the
+// Kelvin sign U+212A into "k" and İ U+0130 into "i", so a refused host could
+// come out ASCII and equal a real one.)
+func CanonicalHost(host string) (string, error) {
+	if isASCII(host) {
+		host = strings.ToLower(host)
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		return host, nil
+	}
+	if nonASCIIPunycodeLabel(host) {
+		return host, ErrInvalidIDN
+	}
+	ascii, err := browserIDNA.ToASCII(host)
+	if err != nil || !browserDomainOK(ascii) || emptyLabels(ascii) > emptyLabels(dotsReplacer.Replace(host)) {
+		return host, ErrInvalidIDN
+	}
+	// The second pass decodes the result's punycode labels, checks them, and
+	// encodes them again: anything but the same string back means the first
+	// pass decoded something that does not stand for itself.
+	if again, err := browserIDNA.ToASCII(ascii); err != nil || again != ascii {
+		return host, ErrInvalidIDN
+	}
+	return strings.ToLower(ascii), nil
+}
+
+// nonASCIIPunycodeLabel reports whether a label of host, once mapped as UTS
+// #46 maps it (case, fullwidth forms, ignored code points), starts with xn--
+// and is not all ASCII: xn--café-, XN--café-, ｘｎ--café-. The browser
+// refuses such a label. x/net/idna does not: its punycode decoder takes the
+// last hyphen for the delimiter and decodes café-, so the host would come out
+// as the real xn--caf-dma.example.
+//
+// The mapping is x/net/idna's own, the one its decoder sees. There is no
+// mapping-only profile, and any label that starts with xn-- after mapping is
+// decoded, so each label is mapped with an "a" in front, which keeps it from
+// starting with xn-- and maps to itself.
+func nonASCIIPunycodeLabel(host string) bool {
+	for _, l := range strings.Split(dotsReplacer.Replace(host), ".") {
+		m, _ := browserIDNA.ToUnicode("a" + l)
+		m, ok := strings.CutPrefix(m, "a")
+		if !ok {
+			// The label began with a combining mark, which composed with the
+			// "a": it cannot start with xn--, and ToASCII refuses it anyway.
+			continue
+		}
+		for _, s := range strings.Split(m, ".") {
+			if strings.HasPrefix(s, "xn--") && !isASCII(s) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// browserDomainOK is the URL standard's checks on the result of domain to
+// ASCII: not empty, no forbidden domain code point, and a last label (one
+// trailing dot aside) that is not a number.
+func browserDomainOK(ascii string) bool {
+	if ascii == "" || !isASCII(ascii) {
+		return false
+	}
+	for i := range len(ascii) {
+		if c := ascii[i]; c <= ' ' || c == 0x7f || strings.IndexByte(`#%/:<>?@[\]^|`, c) >= 0 {
+			return false
+		}
+	}
+	labels := strings.Split(ascii, ".")
+	if len(labels) > 1 && labels[len(labels)-1] == "" {
+		labels = labels[:len(labels)-1]
+	}
+	return !isNumberLabel(labels[len(labels)-1])
+}
+
+// isNumberLabel is the URL standard's "ends in a number" test for the last
+// label: all decimal digits, or 0x or 0X followed by hex digits (or none).
+func isNumberLabel(l string) bool {
+	if strings.HasPrefix(l, "0x") || strings.HasPrefix(l, "0X") {
+		return strings.Trim(l[2:], "0123456789abcdefABCDEF") == ""
+	}
+	return l != "" && strings.Trim(l, "0123456789") == ""
+}
+
+// dotsReplacer writes the label separators UTS #46 maps to "." as "." (。
+// U+3002, ． U+FF0E, ｡ U+FF61), so the labels of a host as written can be
+// counted.
+var dotsReplacer = strings.NewReplacer("。", ".", "．", ".", "｡", ".")
+
+// emptyLabels counts the empty labels of a host. The browser keeps a label
+// that is empty as written (é..example loads as xn--9ca..example) but
+// refuses an xn-- label that decodes to nothing, which x/net/idna turns into
+// a new empty label instead: one more empty label in the result than in the
+// input is that case.
+func emptyLabels(host string) int {
+	n := 0
+	for _, l := range strings.Split(host, ".") {
+		if l == "" {
+			n++
+		}
+	}
+	return n
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
 func originOfURL(u *url.URL) string {
 	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Hostname())
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
+	// An invalid IDN keeps the host as written: see CanonicalHost.
+	host, _ := CanonicalHost(u.Hostname())
 	port := u.Port()
 	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
 		return scheme + "://" + host
@@ -501,6 +670,11 @@ func (c *Config) CheckTestOrigins(baseURL string, tests []Test) error {
 		u, err := url.Parse(t.URL)
 		if err != nil || u.Host == "" {
 			continue // not an absolute URL: validate and the run report that
+		}
+		// A host the browser refuses is not compared at all: it is on no
+		// origin, the app's least of all.
+		if _, err := CanonicalHost(u.Hostname()); err != nil {
+			return fmt.Errorf("test %q: url %s: %w; set auth: false on this test or fix the host", t.ID, secrets.RedactURL(t.URL), err)
 		}
 		if o := originOfURL(u); o != base {
 			return fmt.Errorf("test %q: url is on %s, not on the app's origin %s: the session's cookies go to every host a test loads "+

@@ -617,9 +617,42 @@ judge (`CheckTestOrigins`, over the tests the run selects with `--id`/`--path`).
 and at scan time otherwise (`serve:` binds an ephemeral port).
 
 **Allowed origins.** `allowedOrigins` lists absolute http(s) origins (validated; `NormalizeOrigin`
-lower-cases the host and drops a default port) that a *setup flow* may pass through, an SSO identity
-provider: their storage is captured. They are never an exception for a test. A browser reports
-`location.origin` lower-cased, and capture, seed and guard all compare against the normalized form.
+lower-cases the host, writes an IDN host in punycode and drops a default port) that a *setup flow*
+may pass through, an SSO identity provider: their storage is captured. They are never an exception
+for a test. A browser reports `location.origin` lower-cased and in punycode, and capture, seed and
+guard all compare against the normalized form, the base URL's origin included. Every origin goes
+through one helper, `config.CanonicalHost`: an ASCII host is only lower-cased (and an IPv6 literal
+bracketed), byte for byte as before IDN support; a non-ASCII host is converted with
+`golang.org/x/net/idna` set up as the WHATWG URL standard's domain-to-ASCII (UTS #46,
+non-transitional, bidi and joiner checks, no STD3 or hyphen checks). `idna.Lookup` is stricter than
+that and would refuse hosts Chrome loads (an underscore or a leading hyphen in a label). On top of
+the conversion it refuses a non-ASCII host when:
+- a label starts with `xn--` once mapped (`XN--`, fullwidth `ｘｎ--`, a soft hyphen inside) but is not
+  all ASCII. x/net/idna's punycode decoder takes the last hyphen of `xn--café-` for the delimiter and
+  decodes `café`, so `xn--café-.example` would come out as the real `xn--caf-dma.example`. The labels
+  are mapped with x/net/idna's own mapping (each prefixed with `a`, which keeps it from being decoded);
+- the bidi rule fails on the mapped labels. x/net/idna decides whether to run the rule from the runes
+  as written, so ℵ (U+2135, which maps to Hebrew alef) after a Latin letter skipped it; converting
+  the result a second time decodes its punycode labels and applies the rule to them, and that pass
+  must give back the same string;
+- the result is empty, holds a forbidden domain code point (fullwidth ／, ＠ and ： map to `/`, `@`
+  and `:`, so `：：1` is not `[::1]` and `evil.com＠app.example` is not userinfo), or ends in a number;
+- an `xn--` label decodes to nothing. A label empty as written is kept, as Chrome keeps it.
+
+A test compares every one of these rows with Chrome's own `new URL()`. The one deliberate difference:
+a non-ASCII host whose last label is a number that Chrome rewrites to an IPv4 address
+(`１２７.0.0.1`, `1.2.3.4。`) is refused rather than converted. These are the checks made, not a claim
+to refuse all Chrome refuses: a host Chrome refuses for a reason not listed here is still converted,
+and nothing proves the result is a host no page reports. The malformed `xn--` label was such a case
+until it was checked; the Chrome comparison test is where any other belongs. A refused host is an
+error in `allowedOrigins`, a storage-state origin, a test's `url:` (`CheckTestOrigins`), the base
+URL's reachability probe (exit 2, before any request) and the base URL (`NewAuth`); anywhere else it
+is kept exactly as written. It is non-ASCII, so it matches nothing the browser reports (lower-casing
+it could not promise that: Go maps the Kelvin sign to `k` and `İ` to `i`). Discovery's same-origin
+filter converts a non-ASCII host the same way, dropping its scheme's default port, and keeps its
+plain host:port comparison for ASCII hosts. The base URL's reachability probe (`net/http`) requests
+the punycode host, since Go's client would otherwise apply `idna.Lookup` and dial the raw UTF-8 host
+for a label it refuses.
 
 **Timeouts.** With `reuse: false` the flow runs under its own `defaults.timeout` and the test's
 budget (or discovery's 15s per page) is restarted after it.

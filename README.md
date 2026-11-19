@@ -279,6 +279,11 @@ tests:
     steps: []                    # see the step table below
 ```
 
+Internationalized (IDN) hosts work in `server.baseUrl` (and `--base-url`), a
+test's `url:` and `auth.allowedOrigins`. Frostfall compares them in punycode,
+the form the browser uses, so messages print origins that way, as the browser
+reports them: `café.example` appears as `xn--caf-dma.example`.
+
 ### Steps
 
 Each step is one action. Deliberately small - enough to reach a state worth
@@ -962,8 +967,10 @@ auth:
   signedIn: "[data-testid=account-menu]"
 ```
 
-Entries are absolute `http(s)` origins (no path); the host is lower-cased and a
-default port dropped. Frostfall captures the storage of the base origin and of
+Entries are absolute `http(s)` origins (no path); the host is lower-cased, an
+internationalized host (`café.example`) written in punycode
+(`xn--caf-dma.example`) as the browser reports it, and a default port dropped.
+Frostfall captures the storage of the base origin and of
 every allowed origin the flow visited. A setup that ends anywhere but the app's
 origin fails with a message saying where it ended, which also catches a base URL
 that redirects (to `https`, or to `www`): set `baseUrl` to the app's real origin.

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aquia-inc/frostfall/internal/browser"
 	"github.com/aquia-inc/frostfall/internal/config"
@@ -238,7 +239,7 @@ func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean
 		if u.Scheme != "http" && u.Scheme != "https" {
 			continue
 		}
-		if u.Host != base.Host {
+		if hostKey(u) != hostKey(base) {
 			continue
 		}
 		p := browser.RouteKey(u)
@@ -262,6 +263,23 @@ func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean
 	}
 	sort.Strings(out)
 	return out
+}
+
+// hostKey is u's host:port for the same-origin filter. An ASCII host is
+// compared as written, as it always was. A non-ASCII (IDN) host is written as
+// the browser reports every href, in punycode and without its scheme's
+// default port: a base URL of http://café.example:80 must keep
+// http://xn--caf-dma.example/x.
+func hostKey(u *url.URL) string {
+	if strings.IndexFunc(u.Host, func(r rune) bool { return r >= utf8.RuneSelf }) < 0 {
+		return u.Host
+	}
+	h, _ := config.CanonicalHost(u.Hostname())
+	p := u.Port()
+	if p == "" || (u.Scheme == "http" && p == "80") || (u.Scheme == "https" && p == "443") {
+		return h
+	}
+	return h + ":" + p
 }
 
 var numericSegRe = regexp.MustCompile(`/\d+(/|$)`)

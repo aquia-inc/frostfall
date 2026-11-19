@@ -18,6 +18,8 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/cdp"
 	"github.com/go-rod/rod/lib/proto"
+
+	"github.com/aquia-inc/frostfall/internal/config"
 )
 
 // connectTimeout bounds each step of reaching an attached browser: the
@@ -302,12 +304,11 @@ func scopeOf(origin, path string) (cookieScope, error) {
 }
 
 // cookieHost is a URL's host as Chrome writes it in a cookie's domain:
-// lower-cased, and an IPv6 literal in brackets ([::1], which Hostname strips).
+// lower-cased, an IPv6 literal in brackets ([::1], which Hostname strips), and
+// an IDN host in punycode. Both callers pass URLs Chrome already wrote, so the
+// conversion is only there to keep one definition of a canonical host.
 func cookieHost(u *url.URL) string {
-	h := strings.ToLower(u.Hostname())
-	if strings.Contains(h, ":") {
-		h = "[" + h + "]"
-	}
+	h, _ := config.CanonicalHost(u.Hostname())
 	return h
 }
 

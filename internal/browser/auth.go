@@ -662,7 +662,10 @@ func (a *Auth) DiscoverExcludes() []*regexp.Regexp {
 func RouteKey(u *url.URL) string { return config.RouteKey(u) }
 
 // originOf is the scheme://host[:port] a browser reports as location.origin,
-// lower-cased, with a scheme's default port dropped.
+// lower-cased, an IDN host in punycode, with a scheme's default port dropped.
+// A non-ASCII host config.CanonicalHost refuses is an error: for the
+// base URL that is the only place it would be caught before every test failed
+// to load.
 func originOf(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -671,6 +674,9 @@ func originOf(raw string) (string, error) {
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", fmt.Errorf("%q is not an http(s) URL", RedactURL(raw))
+	}
+	if _, err := config.CanonicalHost(u.Hostname()); err != nil {
+		return "", fmt.Errorf("%q: %w", RedactURL(raw), err)
 	}
 	return config.OriginOfURL(u), nil
 }
