@@ -2,6 +2,7 @@ package browser
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -381,7 +382,9 @@ func TestAttachedPagesKeepFocusInAHeadedBrowser(t *testing.T) {
 		t.Skip("needs a display for a headed Chrome")
 	}
 	app := newAuthApp(t)
-	c := chrometest.Start(t, true)
+	// FF_HEADED_ARGS adds Chrome flags, such as --ozone-platform=x11 to run
+	// under XWayland on a Wayland desktop, where xdotool can reach the windows.
+	c := chrometest.StartWith(t, true, strings.Fields(os.Getenv("FF_HEADED_ARGS"))...)
 	conn := c.Connect(t)
 	// No device emulation on the test's own windows, so they match
 	// Frostfall's attached pages in everything but focus emulation.
@@ -455,15 +458,43 @@ func TestAttachedPagesKeepFocusInAHeadedBrowser(t *testing.T) {
 }
 
 // windowTakesFocus opens url in a new window of ctx and reports whether its
-// page gets focus within a few seconds.
+// page gets focus within a few seconds. Where xdotool is installed (X11, as
+// under Xvfb in CI), the window is also given X input focus directly, since
+// a bare or minimal window manager may not hand a new window focus on its
+// own: first windowactivate (through the window manager), then windowfocus
+// (plain XSetInputFocus, which needs none).
 func windowTakesFocus(t *testing.T, ctx *rod.Browser, url string) bool {
 	t.Helper()
 	p, err := ctx.Page(proto.TargetCreateTarget{URL: url})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if r, err := p.Eval(`() => document.hasFocus()`); err == nil && r.Value.Bool() {
+	focused := func(d time.Duration) bool {
+		for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			if r, err := p.Eval(`() => document.hasFocus()`); err == nil && r.Value.Bool() {
+				return true
+			}
+		}
+		return false
+	}
+	if focused(3 * time.Second) {
+		return true
+	}
+	xdotool, err := exec.LookPath("xdotool")
+	if err != nil {
+		return false
+	}
+	// A title no other window has, so xdotool finds this one.
+	title := fmt.Sprintf("frostfall-focus-%d", time.Now().UnixNano())
+	if _, err := p.Eval(`(t) => { document.title = t }`, title); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"windowactivate", "windowfocus"} {
+		cmdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := exec.CommandContext(cmdCtx, xdotool, "search", "--sync", "--name", title, action, "--sync").CombinedOutput()
+		cancel()
+		t.Logf("xdotool %s: err=%v %s", action, err, strings.TrimSpace(string(out)))
+		if err == nil && focused(2*time.Second) {
 			return true
 		}
 	}

@@ -567,6 +567,10 @@ the key without the flag, except under `--validate`, which checks the config alo
   enables `Emulation.setFocusEmulationEnabled` on every test page, which made `hasFocus()` true in
   every case and removed that finding. The testdata keyboard and transcript fixtures gave the same
   findings headless, attached headless and attached headed, with or without focus being taken away.
+  CI checks this with a headed Chrome under bare Xvfb (a new window took no focus under fluxbox on
+  the runner); where xdotool is installed the test also gives the other window X input focus
+  directly (`windowactivate`, then `windowfocus`, which needs no window manager), and a page
+  without emulation must first read false, or the run proves nothing and fails.
   The attach connection also turns off go-rod's default device emulation, which would present an
   emulated user-agent instead of the one the user signed in with; the viewport is set per test.
 - *Interrupts.* In attach mode SIGHUP, SIGINT, SIGQUIT and SIGTERM are caught: the handler sets
