@@ -285,13 +285,16 @@ var browserIDNA = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.Transition
 // support; none of the checks below apply to it.
 //
 // A non-ASCII host is refused with ErrInvalidIDN when:
+//   - a label starts with xn-- once mapped but is not all ASCII (see
+//     nonASCIIPunycodeLabel);
 //   - browserIDNA refuses it (a disallowed code point, the bidi or joiner
 //     rules);
 //   - the bidi rule fails on the mapped labels. x/net/idna decides whether to
 //     run that rule from the runes as written, so a code point that maps into
 //     a right-to-left script (ℵ, U+2135, maps to Hebrew alef) skips it.
 //     Converting the result a second time decodes its punycode labels and
-//     applies the rule to what the browser sees;
+//     applies the rule to what the browser sees; that pass must also give
+//     back the same string;
 //   - the result fails the URL standard's checks after domain to ASCII: it is
 //     empty, has a forbidden domain code point (fullwidth ／, ＠ and ： map to
 //     /, @ and :), or its last label is a number. The browser then parses the
@@ -302,8 +305,11 @@ var browserIDNA = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.Transition
 //     empty as written is kept, as the browser keeps it (é..example).
 //
 // These are the checks made, not a promise to refuse everything a browser
-// refuses: a host refused for a reason not listed here is converted to a
-// punycode form no page reports, which fails closed at the guard.
+// refuses. A host the browser refuses for a reason not listed here is still
+// converted, and nothing here proves the result is a host no page reports;
+// the one known way a refused host converts to a real one (a malformed xn--
+// label) is checked explicitly, and the Chrome comparison test in
+// internal/browser covers the rest of what is known.
 //
 // A refused host comes back exactly as written. It is non-ASCII, so it can
 // never equal an origin a browser reports, and a comparison against it fails
@@ -318,14 +324,49 @@ func CanonicalHost(host string) (string, error) {
 		}
 		return host, nil
 	}
+	if nonASCIIPunycodeLabel(host) {
+		return host, ErrInvalidIDN
+	}
 	ascii, err := browserIDNA.ToASCII(host)
 	if err != nil || !browserDomainOK(ascii) || emptyLabels(ascii) > emptyLabels(dotsReplacer.Replace(host)) {
 		return host, ErrInvalidIDN
 	}
-	if _, err := browserIDNA.ToASCII(ascii); err != nil {
+	// The second pass decodes the result's punycode labels, checks them, and
+	// encodes them again: anything but the same string back means the first
+	// pass decoded something that does not stand for itself.
+	if again, err := browserIDNA.ToASCII(ascii); err != nil || again != ascii {
 		return host, ErrInvalidIDN
 	}
 	return strings.ToLower(ascii), nil
+}
+
+// nonASCIIPunycodeLabel reports whether a label of host, once mapped as UTS
+// #46 maps it (case, fullwidth forms, ignored code points), starts with xn--
+// and is not all ASCII: xn--café-, XN--café-, ｘｎ--café-. The browser
+// refuses such a label. x/net/idna does not: its punycode decoder takes the
+// last hyphen for the delimiter and decodes café-, so the host would come out
+// as the real xn--caf-dma.example.
+//
+// The mapping is x/net/idna's own, the one its decoder sees. There is no
+// mapping-only profile, and any label that starts with xn-- after mapping is
+// decoded, so each label is mapped with an "a" in front, which keeps it from
+// starting with xn-- and maps to itself.
+func nonASCIIPunycodeLabel(host string) bool {
+	for _, l := range strings.Split(dotsReplacer.Replace(host), ".") {
+		m, _ := browserIDNA.ToUnicode("a" + l)
+		m, ok := strings.CutPrefix(m, "a")
+		if !ok {
+			// The label began with a combining mark, which composed with the
+			// "a": it cannot start with xn--, and ToASCII refuses it anyway.
+			continue
+		}
+		for _, s := range strings.Split(m, ".") {
+			if strings.HasPrefix(s, "xn--") && !isASCII(s) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // browserDomainOK is the URL standard's checks on the result of domain to

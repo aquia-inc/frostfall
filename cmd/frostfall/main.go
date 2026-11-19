@@ -1157,29 +1157,35 @@ var probeTransport http.RoundTripper
 // it, in punycode (config.CanonicalHost), so the probe reaches what the
 // browser will. Go's client converts a host with idna.Lookup, and for one that
 // profile refuses but the browser loads (an underscore or a leading hyphen in
-// a label) it dials the raw UTF-8 host, which no resolver knows. Anything else,
-// a host the browser refuses included, is returned unchanged.
-func probeURL(raw string) string {
+// a label) it dials the raw UTF-8 host, which no resolver knows. A non-ASCII
+// host CanonicalHost refuses is an error: Go's client might still reach
+// something there (it maps １２７.0.0.1 to 127.0.0.1), but the browser would
+// not load the run's pages from it. Anything else is returned unchanged.
+func probeURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || strings.IndexFunc(u.Host, func(r rune) bool { return r >= utf8.RuneSelf }) < 0 {
-		return raw
+		return raw, nil
 	}
 	h, err := config.CanonicalHost(u.Hostname())
 	if err != nil {
-		return raw
+		return "", err
 	}
 	if p := u.Port(); p != "" {
 		h += ":" + p
 	}
 	u.Host = h
-	return u.String()
+	return u.String(), nil
 }
 
 func probeAttach(url string, cleanup func(), redact bool) (string, func(), int, string) {
-	client := &http.Client{Timeout: 10 * time.Second, Transport: probeTransport}
 	// The request goes to the punycode host; messages and the run keep the URL
-	// as written.
-	resp, err := client.Get(probeURL(url))
+	// as written. A refused host is a config error, and nothing is requested.
+	target, err := probeURL(url)
+	if err != nil {
+		return "", cleanup, exitBadConfig, fmt.Sprintf("config error: base url %s: %v", browser.RedactURL(url), err)
+	}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: probeTransport}
+	resp, err := client.Get(target)
 	if resp != nil {
 		defer resp.Body.Close()
 	}

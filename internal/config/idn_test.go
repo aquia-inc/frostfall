@@ -35,6 +35,9 @@ func TestCanonicalHost(t *testing.T) {
 		{"a_b.café.example", "a_b.xn--caf-dma.example"},
 		{"café。example", "xn--caf-dma.example"},
 		{"\u212a.café.example", "k.xn--caf-dma.example"}, // the Kelvin sign maps to k
+		// An xn-- label spelled in forms that map to the same ASCII is that label.
+		{"ＸＮ--caf-dma.example", "xn--caf-dma.example"},
+		{"XN--CAF-DMA.é.example", "xn--caf-dma.xn--9ca.example"},
 		// Labels empty as written are kept, as the browser keeps them.
 		{"é..example", "xn--9ca..example"},
 		{"é.example.", "xn--9ca.example."},
@@ -64,6 +67,10 @@ func TestCanonicalHost(t *testing.T) {
 		"é.1.2.3", "é.0x1F", "é.0X", "1.2.3.4。", "１２７.0.0.1", "é.123.",
 		// Nothing left after mapping.
 		"\u00ad",
+		// An xn-- label that is not all ASCII, however xn-- is spelled: x/net's
+		// decoder alone would turn each into the real xn--caf-dma.example.
+		"xn--café-.example", "XN--café-.example", "ｘｎ--café-.example", "x\u00adn--café-.example",
+		"xn--caf-dmaé.example", "xn--é.example", "xn--café-.xn--caf-dma.example",
 	} {
 		got, err := CanonicalHost(in)
 		if !errors.Is(err, ErrInvalidIDN) {
@@ -149,6 +156,10 @@ func TestCheckTestOriginsRefusesInvalidIDN(t *testing.T) {
 	for _, tc := range []struct{ base, url string }{
 		{"https://i.xn--zz.example", "https://\u0130.xn--zz.example/x?token=SECRETTOK123"},
 		{"https://k.xn--zz.example", "https://\u212a.xn--zz.example/x"},
+		// A malformed xn-- label is not the real host it would decode to.
+		{"https://xn--caf-dma.example", "https://xn--café-.example/x"},
+		{"https://xn--caf-dma.example", "https://XN--café-.example/x"},
+		{"https://xn--caf-dma.example", "https://ｘｎ--café-.example/x"},
 	} {
 		err := cfg.CheckTestOrigins(tc.base, []Test{{ID: "t", URL: tc.url}})
 		if !errors.Is(err, ErrInvalidIDN) || !strings.Contains(err.Error(), `test "t"`) {
@@ -178,16 +189,25 @@ func TestNormalizeOriginForbiddenAfterMapping(t *testing.T) {
 // A storage-state origin on a host the browser refuses says so, without the
 // value.
 func TestStorageStateInvalidIDNOrigin(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	body := `{"cookies":[],"origins":[{"origin":"http://a` + "\u200d" + `b.example/","localStorage":[{"name":"token","value":"t0k"}]}]}`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
+	for _, origin := range []string{
+		"http://a\u200db.example/",
+		"https://xn--café-.example", "https://XN--café-.example", "https://ｘｎ--café-.example",
+	} {
+		path := filepath.Join(t.TempDir(), "state.json")
+		body := `{"cookies":[],"origins":[{"origin":"` + origin + `","localStorage":[{"name":"token","value":"t0k"}]}]}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadStorageState(path)
+		if !errors.Is(err, ErrInvalidIDN) || !strings.Contains(err.Error(), "origins[0]") || !strings.Contains(err.Error(), "internationalized domain name") {
+			t.Errorf("%s: err = %v, want origins[0] and the IDN reason", origin, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "example") {
+			t.Errorf("%s: the error printed the origin: %v", origin, err)
+		}
 	}
-	_, err := LoadStorageState(path)
-	if !errors.Is(err, ErrInvalidIDN) || !strings.Contains(err.Error(), "origins[0]") || !strings.Contains(err.Error(), "internationalized domain name") {
-		t.Errorf("err = %v, want origins[0] and the IDN reason", err)
-	}
-	if err != nil && strings.Contains(err.Error(), "example") {
-		t.Errorf("the error printed the origin: %v", err)
+	// NormalizeOrigin, which allowedOrigins goes through, refuses it too.
+	if got, err := NormalizeOrigin("https://xn--café-.example"); !errors.Is(err, ErrInvalidIDN) {
+		t.Errorf("NormalizeOrigin(malformed xn--) = %q, %v; want ErrInvalidIDN", got, err)
 	}
 }

@@ -40,6 +40,9 @@ func TestCanonicalHostMatchesChrome(t *testing.T) {
 		"a\u00adb.café.example", "א.example", "א1.example", "é.example.", "\u212a.café.example",
 		// Converted alike: empty labels as written are kept.
 		"é..example", "..é.example", "é.example..",
+		// Converted alike: an xn-- label spelled in other forms that map to the
+		// same ASCII is that label.
+		"ＸＮ--caf-dma.example", "XN--CAF-DMA.é.example",
 		// Refused alike: joiners, U+FFFD, bidi (also after mapping: ℵ is Hebrew alef).
 		"a\u200db.example", "\ufffd.example", "1א.example", "xℵ.example",
 		// Refused alike: invalid punycode next to a Kelvin sign or İ.
@@ -51,6 +54,11 @@ func TestCanonicalHostMatchesChrome(t *testing.T) {
 		// Refused alike: an xn-- label that decodes to nothing, a last label
 		// Chrome's IPv4 parser refuses.
 		"é.xn--.example", "é.1.2.3", "é.0x1g.1", "é.0x", "é.0X1F",
+		// Refused alike: an xn-- label that is not all ASCII, however xn-- is
+		// spelled (x/net's decoder alone turns the first four into
+		// xn--caf-dma.example).
+		"xn--café-.example", "XN--café-.example", "ｘｎ--café-.example", "x\u00adn--café-.example",
+		"xn--caf-dmaé.example", "xn--é.example",
 		// Chrome rewrites these to an IPv4 address; CanonicalHost refuses them
 		// on purpose (see its comment).
 		"1.2.3.4。", "１２７.0.0.1",

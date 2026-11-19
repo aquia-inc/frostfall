@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -58,3 +60,40 @@ func TestProbeDialsThePunycodeHost(t *testing.T) {
 		mu.Unlock()
 	}
 }
+
+// A base URL on a non-ASCII host the browser refuses is a config error before
+// anything is requested, even where Go's client would reach something (it maps
+// a fullwidth 127.0.0.1 to the loopback address).
+func TestProbeRefusesAnInvalidIDNHost(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	probeTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		return nil, errors.New("the probe sent a request")
+	})
+	t.Cleanup(func() { probeTransport = nil })
+	for _, base := range []string{
+		"http://１２７.0.0.1:8080/",
+		"https://user:S3cretBasicPW@xn--café-.example/?token=SECRETTOK123",
+		"http://a‍b.example",
+	} {
+		_, _, code, msg := probeAttach(base, func() {}, false)
+		if code != exitBadConfig || !strings.Contains(msg, "internationalized domain name") || !strings.HasPrefix(msg, "config error: base url ") {
+			t.Errorf("%q: code %d, msg %q; want exit %d and the IDN reason", base, code, msg, exitBadConfig)
+		}
+		if strings.Contains(msg, "S3cretBasicPW") || strings.Contains(msg, "SECRETTOK123") {
+			t.Errorf("%q: the message printed a credential: %q", base, msg)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Errorf("the transport saw %d requests, want none", requests)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
