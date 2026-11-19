@@ -622,14 +622,30 @@ may pass through, an SSO identity provider: their storage is captured. They are 
 for a test. A browser reports `location.origin` lower-cased and in punycode, and capture, seed and
 guard all compare against the normalized form, the base URL's origin included. Every origin goes
 through one helper, `config.CanonicalHost`: an ASCII host is only lower-cased (and an IPv6 literal
-bracketed); a non-ASCII host is converted with `golang.org/x/net/idna` set up as the WHATWG URL
-standard's domain-to-ASCII (UTS #46, non-transitional, bidi and joiner checks, no STD3 or hyphen
-checks), which a test checks against Chrome's own `new URL()`. `idna.Lookup` is stricter than that
-and would refuse hosts Chrome loads (an underscore or a leading hyphen in a label). A non-ASCII
-host that does not convert is an error in `allowedOrigins`, a storage-state origin and the base URL,
-since no browser can load it; anywhere else it is compared as written, which matches nothing the
-browser reports and so fails closed. Discovery's same-origin filter converts a non-ASCII host the
-same way and keeps its plain host:port comparison for ASCII hosts.
+bracketed), byte for byte as before IDN support; a non-ASCII host is converted with
+`golang.org/x/net/idna` set up as the WHATWG URL standard's domain-to-ASCII (UTS #46,
+non-transitional, bidi and joiner checks, no STD3 or hyphen checks). `idna.Lookup` is stricter than
+that and would refuse hosts Chrome loads (an underscore or a leading hyphen in a label). On top of
+the conversion it refuses a non-ASCII host when:
+- the bidi rule fails on the mapped labels. x/net/idna decides whether to run the rule from the runes
+  as written, so ℵ (U+2135, which maps to Hebrew alef) after a Latin letter skipped it; converting
+  the result a second time decodes its punycode labels and applies the rule to them;
+- the result is empty, holds a forbidden domain code point (fullwidth ／, ＠ and ： map to `/`, `@`
+  and `:`, so `：：1` is not `[::1]` and `evil.com＠app.example` is not userinfo), or ends in a number;
+- an `xn--` label decodes to nothing. A label empty as written is kept, as Chrome keeps it.
+
+A test compares every one of these rows with Chrome's own `new URL()`. The one deliberate difference:
+a non-ASCII host whose last label is a number that Chrome rewrites to an IPv4 address
+(`１２７.0.0.1`, `1.2.3.4。`) is refused rather than converted. These are the checks made, not a claim
+to refuse all Chrome refuses; a host refused for another reason converts to a punycode form no page
+reports, which fails closed. A refused host is an error in `allowedOrigins`, a storage-state origin,
+a test's `url:` (`CheckTestOrigins`) and the base URL (`NewAuth`); anywhere else it is kept exactly as
+written. It is non-ASCII, so it matches nothing the browser reports (lower-casing it could not
+promise that: Go maps the Kelvin sign to `k` and `İ` to `i`). Discovery's same-origin filter converts
+a non-ASCII host the same way, dropping its scheme's default port, and keeps its plain host:port
+comparison for ASCII hosts. The base URL's reachability probe (`net/http`) requests the punycode
+host, since Go's client would otherwise apply `idna.Lookup` and dial the raw UTF-8 host for a label
+it refuses.
 
 **Timeouts.** With `reuse: false` the flow runs under its own `defaults.timeout` and the test's
 budget (or discovery's 15s per page) is restarted after it.

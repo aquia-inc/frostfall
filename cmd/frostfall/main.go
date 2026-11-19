@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -1148,9 +1149,37 @@ func resolveServer(cfg *config.Config, baseURLFlag, serveFlag string) (string, f
 	}
 }
 
+// probeTransport is the reachability probe's transport; nil means
+// http.DefaultTransport. A variable only so tests can see what is dialed.
+var probeTransport http.RoundTripper
+
+// probeURL is raw with a non-ASCII host written as the browser will request
+// it, in punycode (config.CanonicalHost), so the probe reaches what the
+// browser will. Go's client converts a host with idna.Lookup, and for one that
+// profile refuses but the browser loads (an underscore or a leading hyphen in
+// a label) it dials the raw UTF-8 host, which no resolver knows. Anything else,
+// a host the browser refuses included, is returned unchanged.
+func probeURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || strings.IndexFunc(u.Host, func(r rune) bool { return r >= utf8.RuneSelf }) < 0 {
+		return raw
+	}
+	h, err := config.CanonicalHost(u.Hostname())
+	if err != nil {
+		return raw
+	}
+	if p := u.Port(); p != "" {
+		h += ":" + p
+	}
+	u.Host = h
+	return u.String()
+}
+
 func probeAttach(url string, cleanup func(), redact bool) (string, func(), int, string) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: probeTransport}
+	// The request goes to the punycode host; messages and the run keep the URL
+	// as written.
+	resp, err := client.Get(probeURL(url))
 	if resp != nil {
 		defer resp.Body.Close()
 	}

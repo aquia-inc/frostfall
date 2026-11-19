@@ -663,7 +663,7 @@ func RouteKey(u *url.URL) string { return config.RouteKey(u) }
 
 // originOf is the scheme://host[:port] a browser reports as location.origin,
 // lower-cased, an IDN host in punycode, with a scheme's default port dropped.
-// A non-ASCII host the browser could not load either is an error: for the
+// A non-ASCII host config.CanonicalHost refuses is an error: for the
 // base URL that is the only place it would be caught before every test failed
 // to load.
 func originOf(raw string) (string, error) {

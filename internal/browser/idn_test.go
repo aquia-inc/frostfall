@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,11 +20,12 @@ import (
 )
 
 // config.CanonicalHost must write a non-ASCII host exactly as Chrome's URL
-// parser does, and refuse what Chrome refuses: every origin comparison the
-// guard makes is between the two. The rows are the ones where IDNA profiles
-// differ (STD3 rules, hyphen checks, transitional processing, joiners):
-// idna.Lookup, for one, refuses the underscore and leading-hyphen rows that
-// Chrome loads, and would turn those hosts into config errors.
+// parser does: every origin comparison the guard makes is between the two.
+// The rows are the ones where IDNA profiles differ (STD3 rules, hyphen
+// checks, transitional processing, joiners), and the checks CanonicalHost
+// makes after the conversion. idna.Lookup, for one, refuses the underscore
+// and leading-hyphen rows that Chrome loads, and would turn those hosts into
+// config errors.
 func TestCanonicalHostMatchesChrome(t *testing.T) {
 	b := launch(t)
 	s, err := b.NewSession("about:blank", config.Viewport{Width: 800, Height: 600}, "load", 0, 10*time.Second)
@@ -32,9 +34,26 @@ func TestCanonicalHostMatchesChrome(t *testing.T) {
 	}
 	defer s.Close()
 	hosts := []string{
+		// Converted alike.
 		"café.example", "CAFÉ.Example", "faß.de", "a_b.café.example", "-café.example", "café-.example",
-		"ab--café.example", "ｃａｆｅ.example", "café。example", "xn--caf-dma.café.example", "a­b.café.example",
-		"a‍b.example", "�.example", "א.example", "א1.example", "1א.example", "é.example.",
+		"ab--café.example", "ｃａｆｅ.example", "café。example", "xn--caf-dma.café.example",
+		"a\u00adb.café.example", "א.example", "א1.example", "é.example.", "\u212a.café.example",
+		// Converted alike: empty labels as written are kept.
+		"é..example", "..é.example", "é.example..",
+		// Refused alike: joiners, U+FFFD, bidi (also after mapping: ℵ is Hebrew alef).
+		"a\u200db.example", "\ufffd.example", "1א.example", "xℵ.example",
+		// Refused alike: invalid punycode next to a Kelvin sign or İ.
+		"\u212a.xn--zz.example", "\u0130.xn--zz.example",
+		// Refused alike: forbidden domain code points after mapping.
+		"：：1", "evil.com＠app.example", "a／b.example", "a％b.example", "a＃b.example",
+		"a＜b.example", "a＾b.example", "a｜b.example", "a︓b.example", "a﹕b.example",
+		"a℀b.example", "a﹟b.example", "a﹤b.example", "a﹪b.example", "a﹨b.example",
+		// Refused alike: an xn-- label that decodes to nothing, a last label
+		// Chrome's IPv4 parser refuses.
+		"é.xn--.example", "é.1.2.3", "é.0x1g.1", "é.0x", "é.0X1F",
+		// Chrome rewrites these to an IPv4 address; CanonicalHost refuses them
+		// on purpose (see its comment).
+		"1.2.3.4。", "１２７.0.0.1",
 	}
 	in, _ := json.Marshal(hosts)
 	raw, err := s.Eval(`(hs) => JSON.stringify(JSON.parse(hs).map(h => { try { return new URL('http://' + h + '/').hostname } catch (e) { return null } }))`, string(in))
@@ -49,16 +68,26 @@ func TestCanonicalHostMatchesChrome(t *testing.T) {
 	if err := json.Unmarshal([]byte(js), &chrome); err != nil {
 		t.Fatal(err)
 	}
+	refusals := 0
 	for i, h := range hosts {
 		got, err := config.CanonicalHost(h)
+		if err != nil {
+			refusals++
+		}
 		switch c := chrome[i]; {
 		case c == nil && err == nil:
 			t.Errorf("%q: Chrome refuses it, CanonicalHost gave %q", h, got)
 		case c != nil && err != nil:
+			if ip := net.ParseIP(*c); ip != nil && ip.To4() != nil {
+				continue // the IPv4 rows, refused on purpose
+			}
 			t.Errorf("%q: Chrome loads it as %q, CanonicalHost refused it: %v", h, *c, err)
 		case c != nil && got != *c:
 			t.Errorf("%q: CanonicalHost = %q, Chrome = %q", h, got, *c)
 		}
+	}
+	if refusals < 25 {
+		t.Errorf("only %d rows refused: the table lost its refused rows", refusals)
 	}
 }
 
@@ -265,7 +294,7 @@ func TestIDNBaseURLAttach(t *testing.T) {
 func TestInvalidIDNBaseURLIsRefused(t *testing.T) {
 	b := launch(t)
 	cfg := loadAuthConfig(t, "http://127.0.0.1:1", "  storageState: "+idnStateFile(t, "http://127.0.0.1:1", "-1")+"\n")
-	_, err := NewAuth(b, cfg, "http://a‍b.example:8080/?token=SECRETTOK123", AuthOptions{})
+	_, err := NewAuth(b, cfg, "http://a\u200db.example:8080/?token=SECRETTOK123", AuthOptions{})
 	if !errors.Is(err, config.ErrInvalidIDN) {
 		t.Errorf("err = %v, want ErrInvalidIDN", err)
 	}

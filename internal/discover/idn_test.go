@@ -27,8 +27,26 @@ func TestFilterLinksIDNBase(t *testing.T) {
 			t.Errorf("base %s: got %v, want %v", raw, got, want)
 		}
 	}
-	// ASCII hosts keep the raw comparison they always had.
-	base, _ := url.Parse("http://localhost:5173")
+	// An IDN base URL's explicit default port is dropped, as the browser drops
+	// it from every href.
+	for _, raw := range []string{"http://café.example:80", "https://café.example:443/app"} {
+		base, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scheme := base.Scheme
+		got := FilterLinks(base, []string{scheme + "://xn--caf-dma.example/menu", scheme + "://xn--caf-dma.example:8080/other-port"}, nil)
+		if want := []string{"/menu"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("base %s: got %v, want %v", raw, got, want)
+		}
+	}
+	// ASCII hosts keep the raw comparison they always had, explicit default
+	// port included.
+	base, _ := url.Parse("http://localhost:80")
+	if got := FilterLinks(base, []string{"http://localhost/a"}, nil); len(got) != 0 {
+		t.Errorf("ASCII base with :80: got %v, want the raw comparison (no match)", got)
+	}
+	base, _ = url.Parse("http://localhost:5173")
 	got := FilterLinks(base, []string{"http://localhost:5173/a", "http://LOCALHOST:5173/b"}, nil)
 	if want := []string{"/a"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ASCII base: got %v, want %v", got, want)

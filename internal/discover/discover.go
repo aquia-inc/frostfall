@@ -266,18 +266,20 @@ func filterLinks(base *url.URL, hrefs []string, excludes []*regexp.Regexp, clean
 }
 
 // hostKey is u's host:port for the same-origin filter. An ASCII host is
-// compared as written, as it always was. A non-ASCII (IDN) host is put in
-// punycode first, since the browser reports every href that way: a base URL
-// of http://café.example must keep http://xn--caf-dma.example/x.
+// compared as written, as it always was. A non-ASCII (IDN) host is written as
+// the browser reports every href, in punycode and without its scheme's
+// default port: a base URL of http://café.example:80 must keep
+// http://xn--caf-dma.example/x.
 func hostKey(u *url.URL) string {
 	if strings.IndexFunc(u.Host, func(r rune) bool { return r >= utf8.RuneSelf }) < 0 {
 		return u.Host
 	}
 	h, _ := config.CanonicalHost(u.Hostname())
-	if p := u.Port(); p != "" {
-		return h + ":" + p
+	p := u.Port()
+	if p == "" || (u.Scheme == "http" && p == "80") || (u.Scheme == "https" && p == "443") {
+		return h
 	}
-	return h
+	return h + ":" + p
 }
 
 var numericSegRe = regexp.MustCompile(`/\d+(/|$)`)
