@@ -11,7 +11,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	"gopkg.in/yaml.v3"
 
 	"github.com/aquia-inc/frostfall/internal/secrets"
@@ -248,6 +250,9 @@ func NormalizeOrigin(raw string) (string, error) {
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("%q has more than an origin (what follows the origin is not shown here): drop the path, query and credentials", secrets.RedactURL(raw))
 	}
+	if _, err := CanonicalHost(u.Hostname()); err != nil {
+		return "", fmt.Errorf("%q: %w", secrets.RedactURL(raw), err)
+	}
 	return originOfURL(u), nil
 }
 
@@ -255,12 +260,56 @@ func NormalizeOrigin(raw string) (string, error) {
 // without requiring u to be a bare origin.
 func OriginOfURL(u *url.URL) string { return originOfURL(u) }
 
-func originOfURL(u *url.URL) string {
-	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Hostname())
+// ErrInvalidIDN is CanonicalHost's error for a non-ASCII host the browser
+// cannot convert to punycode either, so no page can ever load on it.
+var ErrInvalidIDN = errors.New("the host is not a valid internationalized domain name, so the browser cannot load it")
+
+// browserIDNA converts a non-ASCII host as a browser's URL parser does (the
+// WHATWG URL standard's "domain to ASCII"): UTS #46 mapping with
+// non-transitional processing (ß stays ß, xn--zca, instead of becoming ss),
+// the bidi and joiner rules, and no STD3 or hyphen checks, which browsers
+// leave off (an underscore or a leading hyphen in a label loads in Chrome).
+var browserIDNA = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.Transitional(false),
+	idna.StrictDomainName(false), idna.CheckHyphens(false))
+
+// CanonicalHost returns host, as url.URL.Hostname gives it (no port, an IPv6
+// literal without brackets), the way a browser writes it in location.origin
+// and in the URLs it reports: lower-cased, an IPv6 literal in brackets, and a
+// non-ASCII (IDN) host in punycode (café.example is xn--caf-dma.example). An
+// all-ASCII host is only lower-cased and bracketed, exactly as before IDN
+// support. A non-ASCII host that does not convert returns ErrInvalidIDN with
+// the lower-cased host as written, which can never equal an origin a browser
+// reports, so a comparison against it fails closed.
+func CanonicalHost(host string) (string, error) {
+	var err error
+	if !isASCII(host) {
+		var ascii string
+		if ascii, err = browserIDNA.ToASCII(host); err == nil {
+			host = ascii
+		} else {
+			err = ErrInvalidIDN
+		}
+	}
+	host = strings.ToLower(host)
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
+	return host, err
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func originOfURL(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	// An invalid IDN keeps the host as written: see CanonicalHost.
+	host, _ := CanonicalHost(u.Hostname())
 	port := u.Port()
 	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
 		return scheme + "://" + host

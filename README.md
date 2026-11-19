@@ -962,8 +962,9 @@ auth:
   signedIn: "[data-testid=account-menu]"
 ```
 
-Entries are absolute `http(s)` origins (no path); the host is lower-cased and a
-default port dropped. Frostfall captures the storage of the base origin and of
+Entries are absolute `http(s)` origins (no path); the host is lower-cased, an
+internationalized host (`café.example`) written in punycode (`xn--caf-dma.example`)
+as the browser reports it, and a default port dropped. Frostfall captures the storage of the base origin and of
 every allowed origin the flow visited. A setup that ends anywhere but the app's
 origin fails with a message saying where it ended, which also catches a base URL
 that redirects (to `https`, or to `www`): set `baseUrl` to the app's real origin.

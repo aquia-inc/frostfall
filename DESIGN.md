@@ -617,9 +617,19 @@ judge (`CheckTestOrigins`, over the tests the run selects with `--id`/`--path`).
 and at scan time otherwise (`serve:` binds an ephemeral port).
 
 **Allowed origins.** `allowedOrigins` lists absolute http(s) origins (validated; `NormalizeOrigin`
-lower-cases the host and drops a default port) that a *setup flow* may pass through, an SSO identity
-provider: their storage is captured. They are never an exception for a test. A browser reports
-`location.origin` lower-cased, and capture, seed and guard all compare against the normalized form.
+lower-cases the host, writes an IDN host in punycode and drops a default port) that a *setup flow*
+may pass through, an SSO identity provider: their storage is captured. They are never an exception
+for a test. A browser reports `location.origin` lower-cased and in punycode, and capture, seed and
+guard all compare against the normalized form, the base URL's origin included. Every origin goes
+through one helper, `config.CanonicalHost`: an ASCII host is only lower-cased (and an IPv6 literal
+bracketed); a non-ASCII host is converted with `golang.org/x/net/idna` set up as the WHATWG URL
+standard's domain-to-ASCII (UTS #46, non-transitional, bidi and joiner checks, no STD3 or hyphen
+checks), which a test checks against Chrome's own `new URL()`. `idna.Lookup` is stricter than that
+and would refuse hosts Chrome loads (an underscore or a leading hyphen in a label). A non-ASCII
+host that does not convert is an error in `allowedOrigins`, a storage-state origin and the base URL,
+since no browser can load it; anywhere else it is compared as written, which matches nothing the
+browser reports and so fails closed. Discovery's same-origin filter converts a non-ASCII host the
+same way and keeps its plain host:port comparison for ASCII hosts.
 
 **Timeouts.** With `reuse: false` the flow runs under its own `defaults.timeout` and the test's
 budget (or discovery's 15s per page) is restarted after it.
