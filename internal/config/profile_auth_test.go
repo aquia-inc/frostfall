@@ -26,7 +26,7 @@ func stateDir(t *testing.T) string {
 }
 
 // A profile's auth replaces the top-level block as a unit: setup locally,
-// storageState in CI, with no "not both" error and nothing of the base block
+// storageState in CI, with no "exactly one of" error and nothing of the base block
 // left over. The relative path resolves against the config file, as it does
 // at the top level.
 func TestProfileAuthReplacesTopLevel(t *testing.T) {
@@ -99,8 +99,8 @@ func TestProfileAuthValidation(t *testing.T) {
 		want string
 	}{
 		{"missing signedIn", "      storageState: state.json\n", `profile "ci": auth.signedIn: required`},
-		{"both setup and storageState", "      storageState: state.json\n      signedIn: \"#in\"\n      setup:\n        path: /login\n        steps:\n          - click: a\n", `profile "ci": auth: set exactly one of setup and storageState, not both`},
-		{"empty block", "      {}\n", `profile "ci": auth: set exactly one of setup and storageState`},
+		{"both setup and storageState", "      storageState: state.json\n      signedIn: \"#in\"\n      setup:\n        path: /login\n        steps:\n          - click: a\n", `profile "ci": auth: set exactly one of setup, storageState and attach, not setup and storageState`},
+		{"empty block", "      {}\n", `profile "ci": auth: set exactly one of setup, storageState and attach`},
 		{"missing storageState file", "      storageState: nope.json\n      signedIn: \"#in\"\n", `profile "ci": auth.storageState nope.json`},
 		{"bad allowedOrigins", "      storageState: state.json\n      signedIn: \"#in\"\n      allowedOrigins: [\"/sso\"]\n", `profile "ci": auth.allowedOrigins[0]`},
 		{"scan in setup", "      signedIn: \"#in\"\n      setup:\n        path: /login\n        steps:\n          - scan: {}\n", `profile "ci": auth.setup.steps[0]: scan is not allowed`},
@@ -522,7 +522,7 @@ func TestProfileAuthMergeKeys(t *testing.T) {
 			"merged setup under a storageState is both",
 			"version: 1\nserver:\n  baseUrl: http://x\ntests:\n  - id: a\n    path: /\nauth: &base\n" + validSetup + signed +
 				"profiles:\n  ci:\n    auth:\n      <<: *base\n      storageState: state.json\n",
-			`profile "ci": auth: set exactly one of setup and storageState, not both`,
+			`profile "ci": auth: set exactly one of setup, storageState and attach, not setup and storageState`,
 		},
 		{
 			"merged block missing signedIn",

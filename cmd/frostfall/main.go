@@ -10,9 +10,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -48,20 +52,51 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// rodArgRe is how go-rod spots its own options in os.Args, in a package init
+// that runs before main: -rod=... or --rod=..., or -rod/--rod followed by
+// the options as the next argument.
+var rodArgRe = regexp.MustCompile(`^--?rod(=|$)`)
+
+// interrupted is set by the attach-mode signal handler before it closes the
+// browser. From then on the handler's exit is the run's outcome: the main
+// goroutine, whose browser calls now fail, must not print an error or write a
+// report of its own (haltIfInterrupted).
+var interrupted atomic.Bool
+
+// haltIfInterrupted parks the calling goroutine for good once a signal has
+// been handled, so the handler's os.Exit decides how the run ends.
+func haltIfInterrupted() {
+	if interrupted.Load() {
+		select {}
+	}
+}
+
 func run(args []string) int {
+	// go-rod applies -rod options found anywhere in os.Args (cdp logging, a
+	// control URL, a visible browser) before main runs. cdp logging prints
+	// every CDP message, which in attach mode includes every cookie of the
+	// user's profile, HttpOnly ones too. No such argument reaches a browser:
+	// refuse it, even as the value of another flag.
+	for _, a := range args {
+		if rodArgRe.MatchString(a) {
+			fmt.Fprintln(os.Stderr, "refusing an argument that starts with -rod: go-rod reads it as its own debug options (its CDP log would print the browser's cookies), so it is not accepted anywhere on the command line")
+			return exitBadConfig
+		}
+	}
 	if len(args) > 0 && args[0] == "init" {
 		return runInit()
 	}
 	fs := flag.NewFlagSet("frostfall", flag.ContinueOnError)
 	var (
 		configPath     = fs.String("config", "", "config file (default: .frostfall.yml, frostfall.yml)")
-		baseURL        = fs.String("base-url", "", "attach mode: scan an already-running server")
+		baseURL        = fs.String("base-url", "", "running-server mode: scan an already-running server")
 		serveDir       = fs.String("serve", "", "static mode: serve this directory")
 		baselinePath   = fs.String("baseline", "", "baseline file (overrides config)")
 		updateBaseline = fs.Bool("update-baseline", false, "rewrite the baseline to match current results")
 		idFilter       = fs.String("id", "", "filter tests by id (Go regex)")
 		pathFilter     = fs.String("path", "", "filter tests by path (Go regex)")
 		browserPath    = fs.String("browser-path", "", "Chrome/Chromium binary to use")
+		browserURL     = fs.String("browser-url", "", "scan with the session of a Chrome you started with --remote-debugging-port and signed in to, at this DevTools address (http://localhost:9222 or a ws:// browser URL, this machine only); needs auth.attach: true")
 		screenshots    = fs.Bool("screenshots", false, "capture element screenshots of new violations")
 		noScreenshots  = fs.Bool("no-screenshots", false, "disable screenshots even where they default on (CI)")
 		screenshotDir  = fs.String("screenshot-dir", "frostfall-artifacts", "directory for violation screenshots")
@@ -84,6 +119,10 @@ func run(args []string) int {
 		}
 		return exitBadConfig
 	}
+	// Whether a flag was passed at all, asked of the flag set: --browser-url=
+	// is set but empty, which must not read as "not attached".
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
 	// Fail fast on flag mistakes: a bad --format must not burn a full scan
 	// before erroring, and a filtered --update-baseline would silently wipe
 	// baseline entries for every test the filter excluded.
@@ -95,8 +134,7 @@ func run(args []string) int {
 		// A dry run only lists what the crawl finds: it has no scan to dry-run
 		// on its own, and nothing it could write. --format has a default, so
 		// whether it was passed is asked of the flag set, not read off its value.
-		set := map[string]bool{}
-		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		set := given
 		switch {
 		case !*discoverFlag:
 			fmt.Fprintln(os.Stderr, "--dry-run only applies to discovery: pass --discover --dry-run to list the pages a crawl finds")
@@ -143,6 +181,7 @@ func run(args []string) int {
 	// leave their file alone, as they always have, and so does --validate,
 	// which never writes a report.
 	abort := func(code int, message string) int {
+		haltIfInterrupted()
 		fmt.Fprintln(os.Stderr, message)
 		if structured && !*validateOnly {
 			reportFailure(*formatName, *outputPath, cfg, tests, base, profileReq, started, code, &format.RunFailure{Message: message})
@@ -162,6 +201,23 @@ func run(args []string) int {
 		fmt.Printf("frostfall %s (axe-core %s)\n", version, axe.New().Version())
 		return exitOK
 	}
+	// The endpoint is checked before the config is read: a remote host or a
+	// malformed URL is wrong whatever the config says. Errors show it as
+	// scheme://host:port only, since a ws:// path is the browser's control key.
+	var endpoint *browser.Endpoint
+	if given["browser-url"] {
+		if *browserURL == "" {
+			return abort(exitBadConfig, "--browser-url: empty; give the DevTools address of the Chrome to attach to, such as http://localhost:9222")
+		}
+		if *browserPath != "" {
+			return abort(exitBadConfig, "--browser-url attaches to a Chrome that is already running and --browser-path launches one: pass one or the other")
+		}
+		ep, perr := browser.ParseBrowserURL(*browserURL)
+		if perr != nil {
+			return abort(exitBadConfig, perr.Error())
+		}
+		endpoint = ep
+	}
 
 	// No explicit --profile means auto: the "ci" profile applies when running
 	// under CI and defined; --profile none forces the base config.
@@ -175,6 +231,9 @@ func run(args []string) int {
 	}
 	for _, w := range cfg.Warnings {
 		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	if msg := attachMismatch(cfg, endpoint != nil, *validateOnly, profileReq); msg != "" {
+		return abort(exitBadConfig, "config error: "+msg)
 	}
 	if *validateOnly {
 		// The filters are compiled and applied the way a real run would, so a bad
@@ -257,11 +316,34 @@ func run(args []string) int {
 			bl.AxeVersion, eng.Version())
 	}
 
-	b, err := browser.Launch(*browserPath)
+	var b *browser.Browser
+	stopSignals := func() {}
+	if endpoint != nil {
+		b, err = browser.Connect(endpoint)
+	} else {
+		b, err = browser.Launch(*browserPath)
+	}
 	if err != nil {
 		return abort(exitEnvironment, "browser error: "+err.Error())
 	}
+	// Close never quits an attached browser: it removes what Frostfall opened
+	// in it and disconnects. Every return from here on passes through it.
 	defer b.Close()
+	if b.Attached() {
+		b.Warn = func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) }
+		if *verbose {
+			product := b.Version()
+			if product == "" {
+				product = "Chrome"
+			}
+			fmt.Fprintf(os.Stderr, "attached to %s at %s\n", product, b.Endpoint())
+		}
+		// A Ctrl-C skips the deferred Close. The contexts are created to be
+		// disposed when the connection drops, but the tab the session is read
+		// in is not, so an interrupt closes them all before exiting.
+		stopSignals = closeOnSignal(b)
+		defer stopSignals()
+	}
 
 	// Screenshots default on in CI (evidence artifacts), off locally (speed).
 	// --screenshots forces on, --no-screenshots wins over everything: the CI
@@ -275,6 +357,7 @@ func run(args []string) int {
 	// run before any page is scanned signed out.
 	authOpts := browser.AuthOptions{
 		Warn: func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) },
+		Note: func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
 	}
 	if *verbose {
 		authOpts.Log = func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
@@ -323,6 +406,7 @@ func run(args []string) int {
 			fmt.Fprintln(os.Stderr, "warning:", w)
 		}
 		discovered, derr := discoverTests(b, authn, base, cfg, tests)
+		haltIfInterrupted()
 		if derr != nil {
 			return abort(exitEnvironment, "discover error: "+derr.Error())
 		}
@@ -337,6 +421,16 @@ func run(args []string) int {
 	exp, perTest, enforcing := expectContract(cfg, tests)
 
 	res, err := r.Execute(context.Background(), tests)
+	haltIfInterrupted()
+	if b.Attached() {
+		// Nothing after this needs the browser. Releasing the user's Chrome
+		// now means an interrupt while the reports are written is an ordinary
+		// one, as in launch mode, with nothing of Frostfall's left open. Close
+		// first, then stop listening: a signal that came in meanwhile is
+		// honoured by stopSignals (exit 128+n) instead of a report.
+		b.Close()
+		stopSignals()
+	}
 	if err != nil {
 		runErr := "run error: " + err.Error()
 		fmt.Fprintln(os.Stderr, runErr)
@@ -479,6 +573,108 @@ func run(args []string) int {
 	}
 
 	return exitCode
+}
+
+// attachMismatch pairs --browser-url with auth.attach: true, strictly, in the
+// auth block in effect after the profile. The flag with any other block (or
+// none) would scan signed out, or with some other session, in the user's own
+// browser; the key without the flag has no browser to read a session from.
+// --validate checks the config alone, so there the key needs no flag. ""
+// when they agree.
+func attachMismatch(cfg *config.Config, flag, validate bool, profileReq string) string {
+	attach := cfg.Auth != nil && cfg.Auth.Attach
+	where := "the config"
+	if p := activeProfileName(profileReq, cfg); p != "" {
+		where = fmt.Sprintf("the config with profile %q applied", p)
+	}
+	switch {
+	case flag && cfg.Auth == nil:
+		return "--browser-url takes the session from a running, signed-in Chrome, but " + where + " has no auth block: " +
+			"add auth: { attach: true, signedIn: <a selector only signed-in pages render> }"
+	case flag && !attach:
+		return "--browser-url takes the session from a running, signed-in Chrome, but the auth block of " + where + " does not set attach: true: " +
+			"set it in place of setup or storageState (a profile can switch auth sources), or drop --browser-url"
+	case !flag && attach && !validate:
+		return "auth.attach: true takes the session from a Chrome you started and signed in to: pass --browser-url with its DevTools address, " +
+			"such as --browser-url http://localhost:9222 for Chrome started with --remote-debugging-port=9222"
+	}
+	return ""
+}
+
+// closeOnSignal closes b when the run is interrupted (SIGINT, SIGTERM,
+// SIGHUP from a closed terminal, SIGQUIT), then exits the way a process
+// killed by that signal is reported: 128 plus the signal number (130, 143,
+// 129, 131). The returned function stops listening; see guardSignals.
+func closeOnSignal(b *browser.Browser) func() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	return guardSignals(b, sigs, func() { signal.Stop(sigs) }, os.Exit)
+}
+
+// guardSignals waits for a signal on sigs. One sets interrupted first, so the
+// main goroutine, whose browser calls start failing, neither prints an error
+// nor writes a report, then closes b and exits with signalExitCode; a second
+// signal while b closes exits at once, with the same code. The
+// returned function stops it: it unsubscribes, and a signal that arrived
+// before that is still honoured, never dropped, so a run that ends just as
+// the user presses Ctrl-C does not go on to write its report. It returns only
+// when no signal is pending, and is safe to call more than once.
+func guardSignals(b interface{ Close() }, sigs chan os.Signal, unsubscribe func(), exit func(int)) func() {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	handle := func(sig os.Signal) {
+		interrupted.Store(true)
+		fmt.Fprintln(os.Stderr, "interrupted: closing what Frostfall opened in the attached browser (the browser itself stays open; interrupt again to stop at once)")
+		// Close is bounded, but a second interrupt means now: keep listening
+		// while it runs.
+		closed := make(chan struct{})
+		go func() {
+			b.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-sigs:
+		}
+		exit(signalExitCode(sig))
+	}
+	go func() {
+		defer close(finished)
+		select {
+		case sig := <-sigs:
+			handle(sig)
+		case <-done:
+			// Stopped, but a signal may already be waiting: when both are ready
+			// select picks either, so look once more.
+			select {
+			case sig := <-sigs:
+				handle(sig)
+			default:
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			unsubscribe()
+			close(done)
+			<-finished
+		})
+	}
+}
+
+// signalExitCode is 128 plus the signal's number, as a shell reports a
+// process that signal killed.
+func signalExitCode(sig os.Signal) int {
+	switch sig {
+	case syscall.SIGHUP:
+		return 129
+	case syscall.SIGQUIT:
+		return 131
+	case syscall.SIGTERM:
+		return 143
+	}
+	return 130
 }
 
 // expectContract reads the enforcement contract of a run: the default expect,
@@ -799,6 +995,7 @@ func discoverTests(b *browser.Browser, authn *browser.Auth, base string, cfg *co
 // in a normal discovery run.
 func runDryRun(b *browser.Browser, authn *browser.Auth, base string, cfg *config.Config) int {
 	paths, err := newCrawler(b, authn, base, cfg).Run()
+	haltIfInterrupted()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "discover error:", err)
 		return exitEnvironment

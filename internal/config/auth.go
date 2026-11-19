@@ -17,8 +17,8 @@ import (
 	"github.com/aquia-inc/frostfall/internal/secrets"
 )
 
-// Auth is the optional login block (DESIGN.md §7.5). Exactly one of Setup
-// and StorageState supplies the session every test starts with.
+// Auth is the optional login block (DESIGN.md §7.5). Exactly one of Setup,
+// StorageState and Attach supplies the session every test starts with.
 type Auth struct {
 	// Setup is a login flow run through the normal step machinery.
 	Setup *AuthSetup `yaml:"setup"`
@@ -29,6 +29,12 @@ type Auth struct {
 	// StorageState is a Playwright-compatible storage-state file captured
 	// elsewhere. A relative path resolves against the config file.
 	StorageState string `yaml:"storageState"`
+	// Attach takes the session from a Chrome the user already has open and
+	// signed in, reached with --browser-url: the cookies and localStorage of
+	// the app's origin and of AllowedOrigins are read from that browser once
+	// and restored into every test's own context. Local runs only; the flag
+	// and this key must be set together.
+	Attach bool `yaml:"attach"`
 	// SignedIn is a CSS selector that exists on every page a signed-in
 	// session shows and on no login page. Required: a URL comparison alone
 	// cannot tell a signed-out page from a signed-in one (a login rendered in
@@ -142,11 +148,22 @@ func LoadStorageState(path string) (*StorageState, error) {
 // is a config error.
 func (c *Config) validateAuth() error {
 	a := c.Auth
-	switch {
-	case a.Setup != nil && a.StorageState != "":
-		return errors.New("auth: set exactly one of setup and storageState, not both")
-	case a.Setup == nil && a.StorageState == "":
-		return errors.New("auth: set exactly one of setup and storageState")
+	var sources []string
+	if a.Setup != nil {
+		sources = append(sources, "setup")
+	}
+	if a.StorageState != "" {
+		sources = append(sources, "storageState")
+	}
+	if a.Attach {
+		sources = append(sources, "attach")
+	}
+	switch len(sources) {
+	case 0:
+		return errors.New("auth: set exactly one of setup, storageState and attach")
+	case 1:
+	default:
+		return fmt.Errorf("auth: set exactly one of setup, storageState and attach, not %s", strings.Join(sources, " and "))
 	}
 	if a.SignedIn == "" {
 		return errors.New("auth.signedIn: required; a CSS selector that exists on every signed-in page and on no login page " +
@@ -163,6 +180,12 @@ func (c *Config) validateAuth() error {
 		a.AllowedOrigins[i] = norm
 	}
 
+	if a.Attach {
+		if a.Reuse != nil {
+			return errors.New("auth.reuse: only applies to setup; an attached browser's session is read once and restored into every test")
+		}
+		return nil
+	}
 	if a.StorageState != "" {
 		if a.Reuse != nil {
 			return errors.New("auth.reuse: only applies to setup; a storageState file is restored into every test")

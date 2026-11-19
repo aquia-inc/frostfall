@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,11 +22,28 @@ import (
 	"github.com/aquia-inc/frostfall/internal/config"
 )
 
-// Browser owns one Chromium process; each session gets its own incognito
-// context so cookies, storage, and service workers never leak between tests.
+// Browser owns one Chromium process, or is attached to one the user started
+// (Connect); each session gets its own incognito context so cookies,
+// storage, and service workers never leak between tests.
 type Browser struct {
 	rod      *rod.Browser
 	launcher *launcher.Launcher
+
+	// ws is the DevTools connection of an attached browser, nil for a launched
+	// one. Closing it disconnects without quitting the user's Chrome.
+	ws *cdp.WebSocket
+	// endpoint is the attached browser's DevTools endpoint as it may be
+	// printed: scheme://host:port, never the path (a browser GUID).
+	endpoint string
+	// owned is what Frostfall created in an attached browser and must remove
+	// again: its browser contexts and the one tab it opens in the user's own
+	// context. Close disposes whatever is still there.
+	owned     ownedTargets
+	closeOnce sync.Once
+
+	// Warn, when set, receives what Close could not finish in time (a closed
+	// tab still listed). Nothing is printed without it.
+	Warn func(format string, args ...any)
 }
 
 // LaunchOptions adjusts how the browser is started.
@@ -36,6 +55,101 @@ type LaunchOptions struct {
 	// share the page's process. Scans reach frames either way.
 	SiteIsolation bool
 }
+
+// ownedTargets tracks the contexts and tabs Frostfall created in an attached
+// browser. The signed-out probe opens contexts in parallel, hence the lock.
+// Once Close has taken what is there the registry is closed: an add then
+// reports false, and the caller removes what it just created itself, since
+// nothing else would.
+type ownedTargets struct {
+	mu       sync.Mutex
+	closed   bool
+	contexts map[proto.BrowserBrowserContextID]bool
+	targets  map[proto.TargetTargetID]bool
+}
+
+func (o *ownedTargets) addContext(id proto.BrowserBrowserContextID) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return false
+	}
+	if o.contexts == nil {
+		o.contexts = map[proto.BrowserBrowserContextID]bool{}
+	}
+	o.contexts[id] = true
+	return true
+}
+
+func (o *ownedTargets) dropContext(id proto.BrowserBrowserContextID) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.contexts, id)
+}
+
+func (o *ownedTargets) addTarget(id proto.TargetTargetID) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return false
+	}
+	if o.targets == nil {
+		o.targets = map[proto.TargetTargetID]bool{}
+	}
+	o.targets[id] = true
+	return true
+}
+
+// createTarget runs create and registers what it made, all under the lock
+// take also holds: Close either runs before (and nothing is created) or
+// after (and finds it registered), never between the two.
+func (o *ownedTargets) createTarget(create func() (proto.TargetTargetID, error)) (proto.TargetTargetID, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return "", errors.New("the browser connection is closing")
+	}
+	id, err := create()
+	if err != nil {
+		return "", err
+	}
+	if o.targets == nil {
+		o.targets = map[proto.TargetTargetID]bool{}
+	}
+	o.targets[id] = true
+	return id, nil
+}
+
+func (o *ownedTargets) dropTarget(id proto.TargetTargetID) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.targets, id)
+}
+
+// take empties and closes the registry and returns what was in it.
+func (o *ownedTargets) take() ([]proto.BrowserBrowserContextID, []proto.TargetTargetID) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	var cs []proto.BrowserBrowserContextID
+	for id := range o.contexts {
+		cs = append(cs, id)
+	}
+	var ts []proto.TargetTargetID
+	for id := range o.targets {
+		ts = append(ts, id)
+	}
+	o.contexts, o.targets = nil, nil
+	return cs, ts
+}
+
+// Attached reports whether b is a browser the user started, reached with
+// Connect, rather than one Frostfall launched.
+func (b *Browser) Attached() bool { return b.ws != nil }
+
+// Endpoint is an attached browser's DevTools endpoint as scheme://host:port,
+// safe to print; "" for a launched browser.
+func (b *Browser) Endpoint() string { return b.endpoint }
 
 // Launch finds a system Chrome (GitHub runners and most dev machines have
 // one) or lets rod's launcher download a managed Chromium, then connects.
@@ -72,9 +186,67 @@ func LaunchWith(browserPath string, o LaunchOptions) (*Browser, error) {
 	return &Browser{rod: b, launcher: l}, nil
 }
 
+// Close ends the run's use of the browser. A launched browser is quit and its
+// profile removed. An attached one is never quit: Browser.close would end the
+// user's Chrome, every window and tab in it. Instead the contexts and the tab
+// Frostfall created that are still open are removed, and the connection is
+// dropped. Safe to call more than once (a signal and the normal exit can both
+// reach it).
 func (b *Browser) Close() {
-	b.rod.Close()
-	b.launcher.Cleanup()
+	b.closeOnce.Do(func() {
+		if b.ws == nil {
+			b.rod.Close()
+			b.launcher.Cleanup()
+			return
+		}
+		// One budget for all of it, so an interrupt is never held up long by a
+		// browser that has stopped answering.
+		deadline := time.Now().Add(closeBudget)
+		contexts, targets := b.owned.take()
+		for _, id := range targets {
+			b.scrubTab(id, deadline)
+		}
+		r := b.rod.Timeout(time.Until(deadline))
+		for _, id := range targets {
+			_, _ = proto.TargetCloseTarget{TargetID: id}.Call(r)
+		}
+		for _, id := range contexts {
+			_ = proto.TargetDisposeBrowserContext{BrowserContextID: id}.Call(r)
+		}
+		r.CancelTimeout()
+		if !b.waitGone(targets, deadline) && b.Warn != nil {
+			b.Warn("attach: a tab Frostfall closed was still listed by the browser after %s; it should go away on its own", closeBudget)
+		}
+		_ = b.ws.Close()
+	})
+}
+
+// closeBudget bounds Browser.Close in attach mode, waiting included.
+const closeBudget = 5 * time.Second
+
+// waitGone waits, until deadline, for none of ids to be among the browser's
+// targets, and reports whether that happened. Target.closeTarget answers once
+// the close has started, and on a busy machine the tab is still listed for a
+// moment afterwards (seen on a CI runner): Close and the capture tab's own
+// close wait it out, so "closed" means gone when they return. A browser that
+// stops answering counts as gone: there is nothing left to wait on.
+func (b *Browser) waitGone(ids []proto.TargetTargetID, deadline time.Time) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	for {
+		res, err := proto.TargetGetTargets{}.Call(b.rod.Timeout(time.Second))
+		if err != nil {
+			return true
+		}
+		if !slices.ContainsFunc(res.TargetInfos, func(ti *proto.TargetTargetInfo) bool { return slices.Contains(ids, ti.TargetID) }) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Session is one test's page in its own incognito browser context.
@@ -86,6 +258,7 @@ type Session struct {
 	raw     *rod.Page
 	page    *rod.Page
 	ctx     *rod.Browser
+	owner   *Browser
 	timeout time.Duration
 	// seed unregisters the auth storage script; nil when there is none.
 	seed func() error
@@ -120,7 +293,7 @@ func (b *Browser) NewSession(url string, vp config.Viewport, waitFor string, set
 // context and storage through a script that runs before any page script of
 // the first load, so the page sees its session from its very first request.
 func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) (*Session, error) {
-	ctx, err := b.rod.Incognito()
+	ctx, err := b.incognito()
 	if err != nil {
 		return nil, fmt.Errorf("creating browser context: %w", err)
 	}
@@ -143,7 +316,20 @@ func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) 
 		ctx.Close()
 		return nil, err
 	}
-	s := &Session{raw: page, page: page.Timeout(timeout), ctx: ctx, timeout: timeout}
+	if b.Attached() {
+		// The user's Chrome is headed, and a test's window is often not the
+		// focused one (it opens behind the user's own, and only one window has
+		// focus at a time). An unfocused page reports document.hasFocus() false
+		// and draws no focus ring, which the keyboard audit and the screen
+		// reader transcript read. Focus emulation makes the page behave as
+		// focused whatever the window manager does, as a headless page is.
+		if err := (proto.EmulationSetFocusEmulationEnabled{Enabled: true}).Call(page); err != nil {
+			page.Close()
+			ctx.Close()
+			return nil, fmt.Errorf("enabling focus emulation: %w", err)
+		}
+	}
+	s := &Session{raw: page, page: page.Timeout(timeout), ctx: ctx, owner: b, timeout: timeout}
 	if state != nil && len(state.origins) > 0 {
 		src, err := state.seedScript()
 		if err == nil {
@@ -157,11 +343,44 @@ func (b *Browser) open(vp config.Viewport, timeout time.Duration, state *State) 
 	return s, nil
 }
 
+// incognito creates a fresh browser context. In an attached browser it is
+// created with disposeOnDetach, so Chrome removes it, signed-in cookies and
+// all, the moment the connection drops: a crash or a Ctrl-C that skips Close
+// leaves nothing behind in the user's browser. It is recorded so Close can
+// remove it on an ordinary exit too.
+func (b *Browser) incognito() (*rod.Browser, error) {
+	res, err := proto.TargetCreateBrowserContext{DisposeOnDetach: b.Attached()}.Call(b.rod)
+	if err != nil {
+		return nil, err
+	}
+	if res.BrowserContextID == "" {
+		// A context handle with no id is the browser itself, and closing it
+		// would quit the browser.
+		return nil, errors.New("the browser returned no context id")
+	}
+	ctx := b.rod.Context(b.rod.GetContext())
+	ctx.BrowserContextID = res.BrowserContextID
+	if b.Attached() && !b.owned.addContext(res.BrowserContextID) {
+		// Close has already run, so nothing would dispose of this one later.
+		_ = ctx.Close()
+		return nil, errors.New("the browser connection is closing")
+	}
+	return ctx, nil
+}
+
 // Close closes the page and disposes its context, so a signed-in context's
 // cookies do not outlive its test.
 func (s *Session) Close() {
 	s.page.CancelTimeout().Close()
-	s.ctx.Close()
+	// A handle with no context id is the browser itself, and Close on it is
+	// Browser.close. A session's never has one, but the cost of being wrong in
+	// an attached browser is the user's whole Chrome, so it is checked.
+	if id := s.ctx.BrowserContextID; id != "" {
+		// One that could not be disposed stays registered for Browser.Close.
+		if err := s.ctx.Close(); err == nil && s.owner != nil {
+			s.owner.owned.dropContext(id)
+		}
+	}
 	for _, cancel := range s.detach {
 		cancel()
 	}

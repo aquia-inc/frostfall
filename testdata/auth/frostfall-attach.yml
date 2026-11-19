@@ -1,0 +1,27 @@
+# Auth fixture, attached: the session comes from a Chrome the user started
+# with --remote-debugging-port and signed in to, reached with --browser-url.
+# The Go test TestAttachToARunningChrome (cmd/frostfall) starts such a Chrome,
+# plants the ffsession cookie in its own profile, and expects exit 1 (the
+# protected page reached, its planted violation found); without the cookie it
+# expects exit 3 (the login-redirect guard). Compare frostfall.yml, which
+# takes the same cookie from a storage-state file.
+version: 1
+
+server:
+  serve: testdata/auth/site
+
+auth:
+  attach: true
+  loginPath: /login.html
+  # Rendered by protected.html and by no login page: the guard's main signal.
+  signedIn: "[data-testid=app-shell]"
+
+defaults:
+  waitFor: load
+  expect:
+    severity: serious
+    maxViolations: 0
+
+tests:
+  - id: protected
+    path: /protected.html
