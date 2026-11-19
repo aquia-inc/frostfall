@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.12.1](https://github.com/aquia-inc/frostfall/compare/v1.12.0...v1.12.1) (2026-11-19)
+
+### Bug Fixes
+
+* **auth:** compare IDN hosts in punycode form ([#80](https://github.com/aquia-inc/frostfall/issues/80)) ([b6d1e61](https://github.com/aquia-inc/frostfall/commit/b6d1e61fc516927f05db08f9bfbf0b6533a589f9)), closes [#78](https://github.com/aquia-inc/frostfall/issues/78) [#78](https://github.com/aquia-inc/frostfall/issues/78)
+
 ## [1.12.0](https://github.com/aquia-inc/frostfall/compare/v1.11.0...v1.12.0) (2026-11-19)
 
 ### Features
