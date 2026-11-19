@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.12.0](https://github.com/aquia-inc/frostfall/compare/v1.11.0...v1.12.0) (2026-11-19)
+
+### Features
+
+* **auth:** attach to a running, signed-in Chrome with --browser-url ([#77](https://github.com/aquia-inc/frostfall/issues/77)) ([f5da0da](https://github.com/aquia-inc/frostfall/commit/f5da0dab46197f3328cedac6831903238b1198d3)), closes [#71](https://github.com/aquia-inc/frostfall/issues/71)
+
 ## [1.11.0](https://github.com/aquia-inc/frostfall/compare/v1.10.0...v1.11.0) (2026-11-18)
 
 ### Features
