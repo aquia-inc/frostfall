@@ -330,6 +330,7 @@ func run(args []string) int {
 	// in it and disconnects. Every return from here on passes through it.
 	defer b.Close()
 	if b.Attached() {
+		b.Warn = func(f string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+f+"\n", a...) }
 		if *verbose {
 			product := b.Version()
 			if product == "" {
@@ -612,7 +613,8 @@ func closeOnSignal(b *browser.Browser) func() {
 
 // guardSignals waits for a signal on sigs. One sets interrupted first, so the
 // main goroutine, whose browser calls start failing, neither prints an error
-// nor writes a report, then closes b and exits with signalExitCode. The
+// nor writes a report, then closes b and exits with signalExitCode; a second
+// signal while b closes exits at once, with the same code. The
 // returned function stops it: it unsubscribes, and a signal that arrived
 // before that is still honoured, never dropped, so a run that ends just as
 // the user presses Ctrl-C does not go on to write its report. It returns only
@@ -622,8 +624,18 @@ func guardSignals(b interface{ Close() }, sigs chan os.Signal, unsubscribe func(
 	finished := make(chan struct{})
 	handle := func(sig os.Signal) {
 		interrupted.Store(true)
-		fmt.Fprintln(os.Stderr, "interrupted: closing what Frostfall opened in the attached browser (the browser itself stays open)")
-		b.Close()
+		fmt.Fprintln(os.Stderr, "interrupted: closing what Frostfall opened in the attached browser (the browser itself stays open; interrupt again to stop at once)")
+		// Close is bounded, but a second interrupt means now: keep listening
+		// while it runs.
+		closed := make(chan struct{})
+		go func() {
+			b.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-sigs:
+		}
 		exit(signalExitCode(sig))
 	}
 	go func() {

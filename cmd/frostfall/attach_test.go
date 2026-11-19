@@ -494,3 +494,60 @@ func TestStoppingTheGuardHonoursAPendingSignal(t *testing.T) {
 		t.Errorf("a stop with no signal exited %d, closed %d times", exited.Load(), b.n.Load())
 	}
 }
+
+// blockingCloser is a browser whose Close does not return until released.
+type blockingCloser struct{ release chan struct{} }
+
+func (c *blockingCloser) Close() { <-c.release }
+
+// A second interrupt while the browser is being closed exits at once, with
+// the first signal's code, instead of waiting for the close to finish.
+func TestSecondInterruptExitsAtOnce(t *testing.T) {
+	defer interrupted.Store(false)
+	sigs := make(chan os.Signal, 1)
+	b := &blockingCloser{release: make(chan struct{})}
+	defer close(b.release)
+	exited := make(chan int, 1)
+	guardSignals(b, sigs, func() {}, func(code int) { exited <- code })
+	sigs <- syscall.SIGINT
+	select {
+	case code := <-exited:
+		t.Fatalf("exited %d before Close finished or a second signal came", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	sigs <- syscall.SIGTERM
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit = %d, want 130 (the first signal's)", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second interrupt did not exit while Close was still running")
+	}
+}
+
+// The capture failing on the app's own page is exit 3 through the CLI, with
+// the reason. A 1ms budget makes that visit fail; the probe only warns.
+func TestAttachCaptureFailureIsExit3(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>page</body></html>`)
+	}))
+	defer srv.Close()
+	cfg := filepath.Join(t.TempDir(), "frostfall.yml")
+	body := "version: 1\nserver:\n  baseUrl: " + srv.URL + "\ndefaults:\n  timeout: 1ms\nauth:\n  attach: true\n  signedIn: \"#in\"\ntests:\n  - id: t\n    path: /\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := chrometest.Start(t, false)
+	before := sortedPages(t, c)
+	code, stderr := runCaptured(t, "--config", cfg, "--browser-url", c.HTTP(), "--no-screenshots", "--baseline", "none")
+	if code != exitEnvironment || !strings.Contains(stderr, "could not be read from the attached browser") {
+		t.Errorf("exit %d, stderr %s; want exit 3 and the capture failure", code, stderr)
+	}
+	if after := sortedPages(t, c); !slices.Equal(before, after) {
+		t.Errorf("tabs left: %v", after)
+	}
+}

@@ -108,7 +108,7 @@ block entirely (running-server and static mode respectively).
 | 0 | ran to completion, no enforced failures (report-only mode always exits 0; violations may exist but are reported, baselined, or below the enforcement contract) |
 | 1 | new violations breaking a configured `expect` contract |
 | 2 | config invalid (schema error, unknown key, bad regex) |
-| 3 | environment failure (browser launch, server never became ready, page load timeout, step failure) |
+| 3 | environment failure (browser launch, server never became ready, page load timeout, step failure; in attach mode, an endpoint nobody answers on, or a session that could not be read from the app's own page) |
 
 Outside the contract, attach mode only (`--browser-url`, §7.5): an attached run interrupted by
 SIGHUP, SIGINT, SIGQUIT or SIGTERM exits 129, 130, 131 or 143 after closing what it opened in the
@@ -529,16 +529,28 @@ the key without the flag, except under `--validate`, which checks the config alo
   document is fulfilled with an empty, untitled page and anything else failed. Fetch is never
   disabled while the tab is open, since disabling it releases a paused request to the network (a
   test reproduced that too); a request still paused at the end is aborted when the tab closes.
-  The page checks `location.origin` itself before returning storage. The empty page is answered
-  with HTTP 404, which Chrome records as a hidden history row (`hidden=1`, so it is left out of
-  `chrome://history` and the address bar's suggestions; checked on Chrome 154 and 157), and it has
-  no title, so an existing row keeps its own title and stays visible (with a title, Chrome renamed
-  it). An earlier version marked the navigation `auto_subframe` instead, which worked up to Chrome
-  154; Chrome 157 never commits a top-level navigation with that transition, so the visit timed out
-  and the capture came back with no localStorage. A visit to the app's own origin that fails now
-  stops the run (exit 3) with that reason, instead of a warning followed by a scan from a partial
-  session that the guard could only call expired; a failed visit to an allowed origin still warns. On each
-  origin's page, `Network.getCookies` for that URL does the matching, so no other site's cookie
+  The page checks `location.origin` itself before returning storage. Each visit's URL is the one
+  Chrome writes, asked of Chrome's own parser (`new URL()` in the capture tab): the base path in its
+  escaped form, an IDN host in punycode; paused requests are matched by parsed scheme, host and
+  escaped path, never by string. (Built from the decoded path, `/100%25/` became a request the
+  interceptor did not recognize, and the run stopped.) The empty page is answered with HTTP 404,
+  which Chrome records as a hidden history row (`hidden=1`, so it is left out of `chrome://history`
+  and the address bar's suggestions; checked on Chrome 154 and 157), and it has no title, so an
+  existing row keeps its own title and stays visible (with a title, Chrome renamed it). The visit
+  is a link and adds no typed count, with one exception that is Chrome's own: on a host with no
+  public suffix (an IP address, an intranet name) that was never typed, the history backend records
+  the first visit as typed so the omnibox learns the host (measured: `127.0.0.1` on a fresh profile
+  gives `typed_count=1`, `app.example.com` gives 0, and a host with an earlier typed visit gives 0).
+  With history sync on, the hidden visit is synced too; Chromium's history sync has no hidden or 404
+  filter. An earlier version marked the navigation `auto_subframe` instead, which worked up to
+  Chrome 154; Chrome 157 never commits a top-level navigation with that transition, so the visit
+  timed out and the capture came back with no localStorage. A visit to the app's own origin that
+  fails stops the run (exit 3) with the cause (a timeout, or Chrome's `net::ERR_*` code), instead of
+  a warning followed by a scan from a partial session that the guard could only call expired; a
+  failed visit to an allowed origin still warns. Before the tab closes it is navigated to
+  about:blank and its navigation history reset, so the visited origins are in neither
+  `Sessions/Session_*` nor `Sessions/Tabs_*` ("Recently closed" keeps only an about:blank entry). On
+  each origin's page, `Network.getCookies` for that URL does the matching, so no other site's cookie
   enters memory, and `attachedCookies` checks again (RFC 6265 domain match including parent-domain
   cookies and bracketed IPv6 literals, the cookie's path covering the scope's, `Secure` only for
   https, a partitioned cookie only when its partition is the scope's own site). A cookie scoped to
@@ -559,7 +571,10 @@ the key without the flag, except under `--validate`, which checks the config alo
   emulated user-agent instead of the one the user signed in with; the viewport is set per test.
 - *Interrupts.* In attach mode SIGHUP, SIGINT, SIGQUIT and SIGTERM are caught: the handler sets
   an `interrupted` flag, runs `Close`, and exits 129, 130, 131 or 143 (128 plus the signal number,
-  what a shell reports for a process killed by it; see §3). Once the flag is set the main
+  what a shell reports for a process killed by it; see §3). `Close` has one 5 second budget for
+  everything it does (scrubbing and closing the tab, disposing contexts, waiting for the tab to
+  go), so a browser that stops answering cannot hold the exit up; `waitGone` reports a timeout
+  through `Browser.Warn`. A second signal while `Close` runs exits at once with the first's code. Once the flag is set the main
   goroutine's failure paths park instead of printing an error or writing a report, so the
   handler's exit is the outcome. As soon as the tests have run the browser is released and then
   the handler stopped; stopping honours a signal that arrived meanwhile (exit 128+n, no report),

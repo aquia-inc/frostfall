@@ -40,6 +40,10 @@ type Browser struct {
 	// context. Close disposes whatever is still there.
 	owned     ownedTargets
 	closeOnce sync.Once
+
+	// Warn, when set, receives what Close could not finish in time (a closed
+	// tab still listed). Nothing is printed without it.
+	Warn func(format string, args ...any)
 }
 
 // LaunchOptions adjusts how the browser is started.
@@ -195,8 +199,14 @@ func (b *Browser) Close() {
 			b.launcher.Cleanup()
 			return
 		}
+		// One budget for all of it, so an interrupt is never held up long by a
+		// browser that has stopped answering.
+		deadline := time.Now().Add(closeBudget)
 		contexts, targets := b.owned.take()
-		r := b.rod.Timeout(5 * time.Second)
+		for _, id := range targets {
+			b.scrubTab(id, deadline)
+		}
+		r := b.rod.Timeout(time.Until(deadline))
 		for _, id := range targets {
 			_, _ = proto.TargetCloseTarget{TargetID: id}.Call(r)
 		}
@@ -204,28 +214,38 @@ func (b *Browser) Close() {
 			_ = proto.TargetDisposeBrowserContext{BrowserContextID: id}.Call(r)
 		}
 		r.CancelTimeout()
-		b.waitGone(targets)
+		if !b.waitGone(targets, deadline) && b.Warn != nil {
+			b.Warn("attach: a tab Frostfall closed was still listed by the browser after %s; it should go away on its own", closeBudget)
+		}
 		_ = b.ws.Close()
 	})
 }
 
-// waitGone waits, briefly, until none of ids is among the browser's targets.
-// Target.closeTarget answers once the close has started, and on a busy
-// machine the tab is still listed for a moment afterwards (seen on a CI
-// runner): Close and the capture tab's own close wait it out, so "closed"
-// means gone when they return.
-func (b *Browser) waitGone(ids []proto.TargetTargetID) {
+// closeBudget bounds Browser.Close in attach mode, waiting included.
+const closeBudget = 5 * time.Second
+
+// waitGone waits, until deadline, for none of ids to be among the browser's
+// targets, and reports whether that happened. Target.closeTarget answers once
+// the close has started, and on a busy machine the tab is still listed for a
+// moment afterwards (seen on a CI runner): Close and the capture tab's own
+// close wait it out, so "closed" means gone when they return. A browser that
+// stops answering counts as gone: there is nothing left to wait on.
+func (b *Browser) waitGone(ids []proto.TargetTargetID, deadline time.Time) bool {
 	if len(ids) == 0 {
-		return
+		return true
 	}
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+	for {
 		res, err := proto.TargetGetTargets{}.Call(b.rod.Timeout(time.Second))
 		if err != nil {
-			return
+			return true
 		}
 		if !slices.ContainsFunc(res.TargetInfos, func(ti *proto.TargetTargetInfo) bool { return slices.Contains(ids, ti.TargetID) }) {
-			return
+			return true
 		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

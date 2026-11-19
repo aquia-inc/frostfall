@@ -505,7 +505,7 @@ PR checks, the full suite on merge - for example `--id 'smoke-.*'`.
 | 0 | ran to completion, nothing broke the enforcement contract (report-only mode always exits 0) |
 | 1 | new violations broke the configured `expect` contract |
 | 2 | invalid config, including an `auth` block that is wrong (no `signedIn`, more than one of `setup`, `storageState` and `attach`, a missing or malformed storage-state file, a `url:` test off the app's origin without `auth: false`) and an unset `${VAR}`; also a `--browser-url` that is not on this machine, `--browser-url` with `--browser-path`, `--browser-url` without `auth.attach: true` or the reverse, an empty `--browser-url`, and any argument that starts with `-rod` |
-| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, a failed login flow, and a `--browser-url` that nothing answers on |
+| 3 | environment failure (browser, server unreachable, page load, step failure), including the auth guard (a test landed on the login page, another origin, or without the `signedIn` marker), the startup probe, a failed login flow, a `--browser-url` that nothing answers on, and an attached browser whose session could not be read from the app's own page |
 | 129, 130, 131, 143 | attach mode only (`--browser-url`): the run was interrupted by SIGHUP, SIGINT (Ctrl-C), SIGQUIT or SIGTERM, and exited after closing what it had opened in the attached browser. The code is 128 plus the signal number, as a shell reports a process that signal killed; no report is written. A run without `--browser-url` keeps the default signal behavior |
 
 Distinct codes mean CI can tell "the pages are broken" from "the tool couldn't
@@ -1161,7 +1161,10 @@ frostfall --browser-url http://localhost:9222
 
 What happens: Frostfall connects to that Chrome and reads the session once,
 from the browser's own profile, through one background tab that it closes
-afterwards. It never reads, navigates or closes your own tabs.
+afterwards. It never navigates, closes, or reads the content of your own tabs.
+(Any DevTools client, Frostfall included, can see the list of open tabs with
+their addresses and titles; Frostfall compares their ids only, to know which
+tabs are its own.)
 
 - *The visit.* Chrome only reads an origin's storage, and only hands over a
   partitioned cookie, from a page on that origin, so the tab opens the app's
@@ -1170,10 +1173,19 @@ afterwards. It never reads, navigates or closes your own tabs.
   bypasses any service worker the app registered: nothing is sent to the app,
   its code never runs, and nothing can redirect. Chrome still records the
   visit as a hidden history entry, left out of `chrome://history` and the
-  address bar's suggestions; the empty page has no title, so an entry you
-  already have for that URL keeps its name and stays visible. If the app's
-  own page cannot be opened this way, the run stops with exit 3 and says so,
-  rather than scanning with part of the session.
+  address bar's suggestions, and not counted as typed (except on a host with
+  no public suffix, such as `127.0.0.1` or an intranet name, that you never
+  typed: there Chrome itself counts its first visit as typed so the address
+  bar learns the host). The empty page has no title, so an entry you already
+  have for that URL keeps its name and stays visible. Before the tab closes
+  it is returned to a blank page with no history, so the origins it visited
+  do not appear under "Recently closed" or in the profile's session files.
+  If the app's own page cannot be opened, or its storage cannot be read, the
+  run stops with exit 3 and says why, rather than scanning with part of the
+  session.
+- *History sync.* If that Chrome profile syncs history to a Google account,
+  the hidden visit is synced like any other (Chrome's history sync does not
+  leave out hidden or 404 visits). Another reason to use a dedicated profile.
 - *Cookies.* Chrome is asked for the cookies it would send to the base URL
   and to each `allowedOrigins` root, so no other site's cookies are read.
   Frostfall checks them again by domain (a parent-domain cookie such as
@@ -1184,8 +1196,10 @@ afterwards. It never reads, navigates or closes your own tabs.
   for example Keycloak's `KEYCLOAK_IDENTITY` on `/realms/<realm>/`, or an app
   cookie on `/app/api` when the base URL is `/app`. If a session depends on
   one, use `setup` or `storageState`.
-- *localStorage* is read from the same page. If an origin's storage cannot be
-  read, a `warning:` line names it and the run goes on without it.
+- *localStorage* is read from the same page. For the app's own origin a
+  failure stops the run (above). For an `allowedOrigins` entry it is a
+  `warning:` line naming the origin, and the run goes on without that
+  origin's storage.
 
 One line on stderr says what was taken, as counts:
 `attach: using the session for https://app.agency.gov, https://login.agency.gov (5 cookies, 2 localStorage keys) from the browser at http://127.0.0.1:9222`.
@@ -1200,7 +1214,8 @@ so the keyboard audit and `expectFocus` see a focused page either way. Pages
 present that Chrome's own user-agent, the one you signed in with. When the
 tests finish, or when the run is interrupted (Ctrl-C, a closed terminal,
 SIGTERM or SIGQUIT), Frostfall closes the windows and the tab it opened and
-disconnects. Chrome stays open and signed in. An interrupted attached run exits
+disconnects; that cleanup takes at most about 5 seconds, and a second Ctrl-C
+skips it. Chrome stays open and signed in. An interrupted attached run exits
 with 128 plus the signal number (130 for Ctrl-C) and writes no report.
 
 **The rules.** `--browser-url` takes `http://localhost:PORT`,

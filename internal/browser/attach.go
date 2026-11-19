@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -437,19 +438,11 @@ func (a *Auth) captureAttached(b *Browser) (*State, error) {
 	}
 	slices.Sort(allowed)
 	origins = append(origins, allowed...)
-	scopes := make([]cookieScope, len(origins))
-	urls := make([]string, len(origins))
-	for i, o := range origins {
-		path := "/"
-		if i == 0 {
-			path = a.basePath
-		}
-		sc, err := scopeOf(o, path)
-		if err != nil {
-			return nil, fmt.Errorf("auth attach: %w", err)
-		}
-		scopes[i] = sc
-		urls[i] = o + strings.TrimSuffix(sc.path, "/") + "/"
+	// The app's base path in its escaped form, the one Chrome requests and
+	// writes into a cookie's path (/caf%C3%A9, not the decoded /café).
+	basePath := "/"
+	if bu, err := url.Parse(a.baseURL); err == nil {
+		basePath = strings.TrimSuffix(bu.EscapedPath(), "/") + "/"
 	}
 
 	page, closeTab, err := b.openCaptureTab()
@@ -462,6 +455,33 @@ func (a *Auth) captureAttached(b *Browser) (*State, error) {
 	if captureTabOpened != nil {
 		captureTabOpened()
 	}
+	// Each visit's URL and origin as Chrome itself writes them (an IDN host in
+	// punycode, a path percent-encoded), so the interceptor recognizes the
+	// request, the page's origin check matches, and storage is restored under
+	// the origin pages report.
+	urls := make([]string, len(origins))
+	canon := make([]string, len(origins))
+	scopes := make([]cookieScope, len(origins))
+	for i, o := range origins {
+		path := "/"
+		if i == 0 {
+			path = basePath
+		}
+		href, origin, err := canonicalURL(page, o+path)
+		if err != nil {
+			return nil, fmt.Errorf("auth attach: %s is not a URL the browser accepts: the session could not be read from the attached browser", o)
+		}
+		urls[i], canon[i] = href, origin
+		hu, err := url.Parse(href)
+		if err != nil {
+			return nil, fmt.Errorf("auth attach: %s is not a URL the browser accepts: the session could not be read from the attached browser", o)
+		}
+		// The cookie scope's path is the escaped one too: Chrome writes a
+		// cookie's path as it was requested.
+		if scopes[i], err = scopeOf(href, strings.TrimSuffix(hu.EscapedPath(), "/")); err != nil {
+			return nil, fmt.Errorf("auth attach: %w", err)
+		}
+	}
 	stopIntercept, err := interceptCaptureTab(page, urls)
 	if err != nil {
 		return nil, fmt.Errorf("auth attach: %w", err)
@@ -472,7 +492,7 @@ func (a *Auth) captureAttached(b *Browser) (*State, error) {
 	seen := map[string]bool{}
 	keys := 0
 	for i, o := range origins {
-		items, err := a.readOrigin(page, o, urls[i])
+		items, err := a.readOrigin(page, canon[i], urls[i])
 		switch {
 		case err != nil && i == 0:
 			// Without the app's own page neither its localStorage nor a
@@ -483,7 +503,7 @@ func (a *Auth) captureAttached(b *Browser) (*State, error) {
 		case err != nil:
 			a.warnf("auth attach: %v; the session may be missing what %s keeps in localStorage", err, o)
 		case len(items) > 0:
-			st.origins = append(st.origins, originStorage{origin: o, local: items})
+			st.origins = append(st.origins, originStorage{origin: canon[i], local: items})
 			keys += len(items)
 		}
 		// Asked from the origin's own page when it loaded, so a first-party
@@ -531,8 +551,12 @@ func (b *Browser) openCaptureTab() (*rod.Page, func(), error) {
 		return nil, nil, err
 	}
 	closeTab := func() {
-		if _, err := (proto.TargetCloseTarget{TargetID: id}).Call(b.rod.Timeout(5 * time.Second)); err == nil {
-			b.waitGone([]proto.TargetTargetID{id})
+		deadline := time.Now().Add(5 * time.Second)
+		b.scrubTab(id, deadline)
+		if _, err := (proto.TargetCloseTarget{TargetID: id}).Call(b.rod.Timeout(time.Until(deadline))); err == nil {
+			if !b.waitGone([]proto.TargetTargetID{id}, deadline) && b.Warn != nil {
+				b.Warn("attach: the capture tab was still listed by the browser after closing it; it should go away on its own")
+			}
 			b.owned.dropTarget(id)
 		}
 	}
@@ -542,6 +566,54 @@ func (b *Browser) openCaptureTab() (*rod.Page, func(), error) {
 		return nil, nil, err
 	}
 	return page, closeTab, nil
+}
+
+// scrubTab leaves the capture tab on about:blank with no other history
+// before it is closed, so the origins it visited do not end up in the
+// profile's session files (Sessions/Session_*, and Tabs_*, the "Recently
+// closed" list). Best effort, within deadline: the tab is closed either way.
+func (b *Browser) scrubTab(id proto.TargetTargetID, deadline time.Time) {
+	page, err := b.rod.PageFromTarget(id)
+	if err != nil {
+		return
+	}
+	p := page.Timeout(time.Until(deadline))
+	defer p.CancelTimeout()
+	if _, err := (proto.PageNavigate{URL: "about:blank"}).Call(p); err != nil {
+		return
+	}
+	_ = p.WaitLoad()
+	_ = proto.PageResetNavigationHistory{}.Call(p)
+}
+
+// canonicalURL asks Chrome how it writes raw: the href it will request (host
+// in punycode, path percent-encoded) and its origin. Chrome's URL parser is
+// the one whose answer matters, so it is the one asked; the capture tab is on
+// about:blank, and nothing is loaded.
+func canonicalURL(page *rod.Page, raw string) (href, origin string, err error) {
+	res, err := page.Timeout(connectTimeout).Eval(`(u) => { const x = new URL(u); return [x.href, x.origin] }`, raw)
+	if err != nil {
+		return "", "", err
+	}
+	var pair []string
+	if err := json.Unmarshal([]byte(res.Value.JSON("", "")), &pair); err != nil || len(pair) != 2 {
+		return "", "", errors.New("unexpected answer")
+	}
+	return pair[0], pair[1], nil
+}
+
+// sameDocURL reports whether a paused request is for one of docs: the same
+// scheme, host and escaped path, compared parsed rather than as strings.
+func sameDocURL(req string, docs []string) bool {
+	r, err := url.Parse(req)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(docs, func(d string) bool {
+		u, err := url.Parse(d)
+		return err == nil && strings.EqualFold(u.Scheme, r.Scheme) && strings.EqualFold(u.Host, r.Host) &&
+			u.EscapedPath() == r.EscapedPath() && r.RawQuery == "" && u.RawQuery == ""
+	})
 }
 
 // blankDocument is what the capture tab is served in place of the app's page:
@@ -572,7 +644,7 @@ func interceptCaptureTab(page *rod.Page, docs []string) (func(), error) {
 	// Fetch domain for this event type on its own; the explicit enable above
 	// says so outright.)
 	go h.EachEvent(func(e *proto.FetchRequestPaused) {
-		if e.ResourceType == proto.NetworkResourceTypeDocument && slices.Contains(docs, e.Request.URL) {
+		if e.ResourceType == proto.NetworkResourceTypeDocument && sameDocURL(e.Request.URL, docs) {
 			_ = proto.FetchFulfillRequest{
 				RequestID:       e.RequestID,
 				ResponseCode:    http.StatusNotFound, // a hidden history row; see captureAttached
@@ -586,6 +658,19 @@ func interceptCaptureTab(page *rod.Page, docs []string) (func(), error) {
 	return cancel, nil
 }
 
+// netErrorRe is the shape of a Chrome network error code.
+var netErrorRe = regexp.MustCompile(`^net::ERR_[A-Z0-9_]+$`)
+
+// netErrorCode passes a Chrome network error code (net::ERR_UNSAFE_PORT)
+// through, and nothing else: an error text of any other shape could carry
+// what it was about.
+func netErrorCode(text string) string {
+	if netErrorRe.MatchString(text) {
+		return text
+	}
+	return "a navigation error"
+}
+
 // readOrigin loads url (origin's root, already intercepted) in the capture
 // tab and reads the origin's localStorage from the page, but only if the page
 // is on that origin: the check runs in the page, so another origin's storage
@@ -594,11 +679,19 @@ func (a *Auth) readOrigin(page *rod.Page, origin, url string) ([][2]string, erro
 	p := page.Timeout(a.defaults.Timeout.Std())
 	defer p.CancelTimeout()
 	nav, err := proto.PageNavigate{URL: url, TransitionType: proto.PageTransitionTypeLink}.Call(p)
-	if err != nil || nav.ErrorText != "" {
-		return nil, fmt.Errorf("could not open %s in the capture tab", origin)
+	switch {
+	case err != nil && errors.Is(err, context.DeadlineExceeded):
+		return nil, fmt.Errorf("could not open %s in the capture tab (no answer within %s)", origin, a.defaults.Timeout.Std())
+	case err != nil:
+		return nil, fmt.Errorf("could not open %s in the capture tab (the navigation did not start)", origin)
+	case nav.ErrorText != "":
+		return nil, fmt.Errorf("could not open %s in the capture tab (%s)", origin, netErrorCode(nav.ErrorText))
 	}
 	if err := p.WaitLoad(); err != nil {
-		return nil, fmt.Errorf("could not open %s in the capture tab", origin)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("could not open %s in the capture tab (the page did not load within %s)", origin, a.defaults.Timeout.Std())
+		}
+		return nil, fmt.Errorf("could not open %s in the capture tab (the page did not finish loading)", origin)
 	}
 	res, err := p.Eval(`(o) => {
 		if (location.origin !== o) return null;

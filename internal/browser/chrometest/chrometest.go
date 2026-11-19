@@ -110,6 +110,9 @@ func StartWith(t testing.TB, headed bool, extra ...string) *Chrome {
 	return nil
 }
 
+// Process is the browser's main process, for tests that pause it.
+func (c *Chrome) Process() *os.Process { return c.cmd.Process }
+
 // Quit closes the browser the way a user does (Browser.close), so it writes
 // its profile, the History database included, before exiting.
 func (c *Chrome) Quit(t testing.TB) {

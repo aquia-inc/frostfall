@@ -306,7 +306,8 @@ func TestAddAfterCloseRemovesAtOnce(t *testing.T) {
 // Reading the session sends nothing to the app (every request of the capture
 // tab is answered by Frostfall or failed), leaves no tab, and leaves no
 // visible history entry in the user's profile: the empty page is answered
-// with HTTP 404, which Chrome stores as a hidden row.
+// with HTTP 404, which Chrome stores as a hidden row, and the visit is a
+// link, so it adds no typed count.
 func TestCaptureSendsNothingToTheAppAndLeavesNoVisibleHistory(t *testing.T) {
 	var userRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -349,14 +350,19 @@ func TestCaptureSendsNothingToTheAppAndLeavesNoVisibleHistory(t *testing.T) {
 	}
 	c.Quit(t)
 	out, err := exec.Command(sqlite, filepath.Join(c.Dir, "Default", "History"),
-		"select hidden from urls where url = '"+srv.URL+"/'").CombinedOutput()
+		"select hidden, typed_count from urls where url = '"+srv.URL+"/'").CombinedOutput()
 	if err != nil {
 		t.Fatalf("reading History: %v: %s", err, out)
 	}
 	// Hidden rows are left out of chrome://history and of the address bar's
-	// suggestions, whatever their typed count.
-	if row := strings.TrimSpace(string(out)); row != "" && row != "1" {
-		t.Errorf("history row for the app root has hidden = %q, want none or a hidden row (1)", row)
+	// suggestions. The visit is a link, so it is never counted as typed here:
+	// the host already has a typed visit (the /seed page above). On a host with
+	// no public suffix (127.0.0.1, an intranet name) that was never typed,
+	// Chrome itself records the first visit as typed, so that the omnibox
+	// learns the host; TestCaptureHistoryOnAPublicHostname covers a fresh
+	// profile on an ordinary name.
+	if row := strings.TrimSpace(string(out)); row != "" && row != "1|0" {
+		t.Errorf("history row for the app root = %q, want none, or hidden and never typed (1|0)", row)
 	}
 }
 
@@ -726,5 +732,187 @@ func TestCaptureCarriesFirstPartyPartitionedCookies(t *testing.T) {
 	slices.Sort(names)
 	if !slices.Equal(names, []string{"chip", "plain"}) {
 		t.Errorf("captured %v, want [chip plain]", names)
+	}
+}
+
+// historyRows reads url, hidden and typed_count for every row of a quit
+// browser's History database; it skips the test without sqlite3.
+func historyRows(t *testing.T, c *chrometest.Chrome) string {
+	t.Helper()
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		t.Skip("sqlite3 not installed: the history check needs it")
+	}
+	out, err := exec.Command(sqlite, filepath.Join(c.Dir, "Default", "History"), "select url, hidden, typed_count from urls").CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading History: %v: %s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// On a fresh profile and an ordinary host name, the capture's visit is a
+// hidden, never-typed history row.
+func TestCaptureHistoryOnAPublicHostname(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>page</body></html>`)
+	}))
+	defer srv.Close()
+	base := "http://app.example.com:" + srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+	c := chrometest.StartWith(t, false, "--host-resolver-rules=MAP app.example.com 127.0.0.1")
+	b := connectTo(t, c, c.HTTP())
+	cfg := loadAuthConfig(t, base, "  attach: true\n")
+	if _, err := NewAuth(b, cfg, base, logOpts(t)); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	time.Sleep(300 * time.Millisecond)
+	c.Quit(t)
+	if got, want := historyRows(t, c), base+"/|1|0"; got != want {
+		t.Errorf("history = %q, want only %q (hidden, never typed)", got, want)
+	}
+}
+
+// The capture tab is left on about:blank with no other history before it
+// closes, so the origin it visited is in none of the profile's session files
+// (Sessions/Session_*, and Tabs_*, behind "Recently closed").
+func TestCaptureLeavesNoSessionEntry(t *testing.T) {
+	app := newAuthApp(t)
+	c := startChrome(t)
+	b := connectTo(t, c, c.HTTP())
+	cfg := loadAuthConfig(t, app.URL, "  attach: true\n")
+	if _, err := NewAuth(b, cfg, app.URL, logOpts(t)); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	time.Sleep(300 * time.Millisecond)
+	c.Quit(t)
+	host := strings.TrimPrefix(app.URL, "http://")
+	files, _ := filepath.Glob(filepath.Join(c.Dir, "Default", "Sessions", "*"))
+	if len(files) == 0 {
+		t.Fatal("no session files: the check proves nothing")
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), host) {
+			t.Errorf("%s names the captured origin %s", filepath.Base(f), host)
+		}
+	}
+}
+
+// A base URL whose path is percent-encoded (non-ASCII, a space) is captured
+// like any other: the visit is the escaped URL Chrome requests, and a cookie
+// scoped to the escaped base path is kept.
+func TestCaptureEscapedBasePath(t *testing.T) {
+	// "/100%25" decodes to "/100%", which Chrome would request as written:
+	// only the escaped form gives back the path the app is served under.
+	for _, path := range []string{"/caf%C3%A9", "/a%20b", "/100%25"} {
+		t.Run(path, func(t *testing.T) {
+			var userRequests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := r.Cookie("sid"); err == nil {
+					userRequests.Add(1)
+				}
+				fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>page</body></html>`)
+			}))
+			defer srv.Close()
+			c := startChrome(t)
+			ck := chrometest.Cookie("sid", "valid", "127.0.0.1")
+			ck.Path = path
+			c.SetCookies(t, ck)
+			c.SetLocalStorage(t, srv.URL+path+"/seed", "token", "tok-123")
+			userRequests.Store(0)
+			b := connectTo(t, c, c.HTTP())
+			base := srv.URL + path + "/"
+			cfg := loadAuthConfig(t, base, "  attach: true\n")
+			a, err := NewAuth(b, cfg, base, logOpts(t))
+			if err != nil {
+				t.Fatalf("capture failed for base path %s: %v", path, err)
+			}
+			if len(a.state.cookies) != 1 || a.state.cookies[0].Path != path {
+				t.Errorf("cookies = %v, want the one scoped to %s", a.state.cookies, path)
+			}
+			if len(a.state.origins) != 1 || a.state.origins[0].local[0] != [2]string{"token", "tok-123"} {
+				t.Errorf("localStorage = %v", a.state.origins)
+			}
+			if n := userRequests.Load(); n != 0 {
+				t.Errorf("%d request(s) with the user's cookie reached the app", n)
+			}
+		})
+	}
+}
+
+// An internationalized host is visited, matched and stored under the
+// punycode form Chrome uses.
+func TestCaptureIDNHost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("launches a browser")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><title>t</title></head><body>page</body></html>`)
+	}))
+	defer srv.Close()
+	port := srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+	c := chrometest.StartWith(t, false, "--host-resolver-rules=MAP xn--caf-dma.example 127.0.0.1")
+	c.SetLocalStorage(t, "http://xn--caf-dma.example:"+port+"/seed", "token", "tok-123")
+	b := connectTo(t, c, c.HTTP())
+	base := "http://café.example:" + port
+	cfg := loadAuthConfig(t, base, "  attach: true\n")
+	a, err := NewAuth(b, cfg, base, logOpts(t))
+	if err != nil {
+		t.Fatalf("capture failed for an IDN host: %v", err)
+	}
+	if len(a.state.origins) != 1 || a.state.origins[0].origin != "http://xn--caf-dma.example:"+port {
+		t.Errorf("localStorage = %v, want it under the punycode origin", a.state.origins)
+	}
+}
+
+// When the app's own page cannot be opened in the capture tab, the run stops
+// with the reason instead of scanning from part of a session. A 1ms budget
+// is the clean way to make that visit fail here (the probe only warns about
+// its own failed load), and the tab is still removed.
+func TestCaptureVisitFailureIsFatal(t *testing.T) {
+	app := newAuthApp(t)
+	c := startChrome(t)
+	before := pages(t, c)
+	b := connectTo(t, c, c.HTTP())
+	path := filepath.Join(t.TempDir(), "frostfall.yml")
+	body := "version: 1\nserver:\n  baseUrl: " + app.URL + "\ndefaults:\n  timeout: 1ms\ntests:\n  - id: t\n    path: /\nauth:\n  attach: true\n  signedIn: \"#in\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewAuth(b, cfg, app.URL, logOpts(t))
+	if err == nil || !strings.Contains(err.Error(), "could not be read from the attached browser") ||
+		!strings.Contains(err.Error(), "(no answer within 1ms)") {
+		t.Errorf("err = %v, want the capture failure with its cause", err)
+	}
+	if after := pages(t, c); !slices.Equal(before, after) {
+		t.Errorf("tabs left: %v", after)
+	}
+}
+
+// waitGone says when a tab is still there at the deadline.
+func TestWaitGoneReportsATimeout(t *testing.T) {
+	c := startChrome(t)
+	b := connectTo(t, c, c.HTTP())
+	tab := c.OpenTab(t, "about:blank")
+	if b.waitGone([]proto.TargetTargetID{tab}, time.Now().Add(200*time.Millisecond)) {
+		t.Error("waitGone reported an open tab gone")
+	}
+	conn := c.Connect(t)
+	if _, err := (proto.TargetCloseTarget{TargetID: tab}).Call(conn); err != nil {
+		t.Fatal(err)
+	}
+	if !b.waitGone([]proto.TargetTargetID{tab}, time.Now().Add(3*time.Second)) {
+		t.Error("waitGone did not see a closed tab go")
 	}
 }
