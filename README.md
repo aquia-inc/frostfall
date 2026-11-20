@@ -1624,7 +1624,11 @@ and the fix link. Runs are idempotent: a hidden marker in each issue body
 deduplicates across CI runs, so re-running never files duplicates. The
 lifecycle goes both ways - a fixed violation gets a comment and its issue
 closed, a recurrence reopens the old issue instead of filing a new one, and
-filtered runs (`--id`) never close issues for pages they didn't scan. Issues
+filtered runs (`--id`) never close issues for pages they didn't scan. The
+element list in an open issue follows the latest run: when more elements start
+failing, the issue gets a comment naming just the new ones and its body is
+rewritten with the current list; when elements are fixed, the body is updated
+without a comment. If the list is unchanged the issue is left alone. Issues
 without the marker are never touched, so hand-filed accessibility issues are
 safe. Only violations that would fail an enforcing build are filed; baselined
 debt is not. The workflow needs `issues: write` permission. Filing failures

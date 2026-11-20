@@ -139,3 +139,9 @@ func (c *Client) SetState(number int, state string) error {
 	return c.do("PATCH", fmt.Sprintf("/repos/%s/issues/%d", c.Repo, number),
 		map[string]string{"state": state}, nil)
 }
+
+// SetBody replaces an issue's body.
+func (c *Client) SetBody(number int, body string) error {
+	return c.do("PATCH", fmt.Sprintf("/repos/%s/issues/%d", c.Repo, number),
+		map[string]string{"body": body}, nil)
+}
