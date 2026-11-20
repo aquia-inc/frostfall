@@ -44,12 +44,14 @@ func (g Group) Marker() string {
 }
 
 // markerRe matches the marker on a line of its own, tolerating the CRLF a
-// body edited in the web UI can come back with. Anchoring keeps text quoted
-// elsewhere in the body (a rule summary) from standing in for it.
-var markerRe = regexp.MustCompile(`(?m)^<!-- frostfall:v1:rule=([^:\n]+):page=([^\n]+?) -->\r?$`)
+// body edited in the web UI can come back with and stray indentation or
+// trailing blanks from a hand edit (a missed marker would orphan the issue
+// and file a duplicate). Anchoring keeps text quoted elsewhere in the body (a
+// rule summary) from standing in for it.
+var markerRe = regexp.MustCompile(`(?m)^[ \t]*<!-- frostfall:v1:rule=([^:\n]+):page=([^\n]+?) -->[ \t]*\r?$`)
 
 // markerLineRe is markerRe for one already-split line.
-var markerLineRe = regexp.MustCompile(`^<!-- frostfall:v1:rule=[^:]+:page=.+? -->$`)
+var markerLineRe = regexp.MustCompile(`^[ \t]*<!-- frostfall:v1:rule=[^:]+:page=.+? -->[ \t]*$`)
 
 // parseMarker extracts (rule, page) from an issue body, ok=false when the
 // issue was not filed by frostfall. The generated marker is the last line of
@@ -86,7 +88,7 @@ func BuildGroups(results []runner.Result) []Group {
 		if res.ScanLabel != "initial" {
 			el += " (" + res.ScanLabel + ")"
 		}
-		el = oneLine(el) // after the label: a step label can hold a break too
+		el = normElement(el) // after the label: a step label can hold a break too
 		if !slices.Contains(g.Elements, el) {
 			g.Elements = append(g.Elements, el)
 		}
@@ -104,7 +106,7 @@ func (g Group) Title() string {
 }
 
 func (g Group) Body(runContext string) string {
-	els := dedupe(g.Elements)
+	els := normalize(g.Elements)
 	var b strings.Builder
 	fmt.Fprintf(&b, "Frostfall detected **%s** (%s) on **%s**.\n\n", g.Rule, g.Impact, g.Page)
 	// One line, so the summary cannot start a line of its own that reads as
@@ -143,10 +145,45 @@ func oneLine(s string) string {
 	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
-func dedupe(in []string) []string {
+// maxBackticks caps a run of backticks in an element. GitHub's markdown
+// renderer (cmark-gfm) gives up on an opening backtick run longer than 80
+// (MAXBACKTICKS in inlines.c) and prints it as plain text, which would leave
+// the rest of the selector as live markdown, @mentions included. A code span
+// fenced one longer than the longest run inside it therefore needs runs well
+// under 80. Real selectors never come near this, so a longer run is cut down
+// to the cap rather than rendered some other way: both the filed element and
+// the one read back go through normElement, so the cut text is what the
+// issue's set holds and nothing churns.
+const maxBackticks = 16
+
+// normElement makes an element safe to render: one line, backtick runs capped.
+func normElement(s string) string {
+	s = oneLine(s)
+	if !strings.Contains(s, strings.Repeat("`", maxBackticks+1)) {
+		return s
+	}
+	var b strings.Builder
+	run := 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			if run > maxBackticks {
+				continue
+			}
+		} else {
+			run = 0
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// normalize normalizes and deduplicates a list of elements.
+func normalize(in []string) []string {
 	seen := make(map[string]bool, len(in))
 	out := make([]string, 0, len(in))
 	for _, e := range in {
+		e = normElement(e)
 		if !seen[e] {
 			seen[e] = true
 			out = append(out, e)
@@ -246,6 +283,9 @@ type elementList struct {
 	truncated bool
 	total     int
 	sha       string
+	// stale is set when a visible bullet is not rendered the way this version
+	// renders that element.
+	stale bool
 }
 
 // parseElements reads the element list back out of an issue body written by
@@ -293,6 +333,14 @@ func parseElements(body string) elementList {
 		if !good {
 			return elementList{}
 		}
+		el = normElement(el)
+		// A bullet written by an older version (a plain single-backtick span
+		// around a selector that holds a backtick) reads back as the right
+		// element but renders broken. Flag any bullet this version would not
+		// write the same way, so the body gets rewritten once.
+		if "- "+codeSpan(el) != l {
+			out.stale = true
+		}
 		out.els = append(out.els, el)
 	}
 	out.ok = true
@@ -324,7 +372,7 @@ type change struct {
 // body then grows (existing plus new) and never shrinks, because a missing
 // element may be unchecked rather than fixed.
 func diffElements(desired []string, cur elementList, partial bool) change {
-	want := dedupe(desired)
+	want := normalize(desired)
 	if !cur.ok {
 		if partial {
 			// Writing this run's list would put a known-incomplete one in the
@@ -343,7 +391,8 @@ func diffElements(desired []string, cur elementList, partial bool) change {
 		n := len(want)
 		// The digest covers the count; n is kept for the growth/shrink split.
 		if digest(want) == cur.sha {
-			return change{}
+			// Same set. A bullet rendered the old way is rewritten quietly.
+			return change{elements: want, rewrite: cur.stale}
 		}
 		c := change{elements: want, rewrite: true}
 		if n > cur.total {
@@ -373,12 +422,12 @@ func diffElements(desired []string, cur elementList, partial bool) change {
 	}
 	if partial {
 		return change{
-			elements: append(dedupe(cur.els), added...),
+			elements: append(normalize(cur.els), added...),
 			added:    added,
-			rewrite:  len(added) > 0,
+			rewrite:  len(added) > 0 || cur.stale,
 		}
 	}
-	return change{elements: want, added: added, removed: removed, rewrite: len(added) > 0 || removed > 0}
+	return change{elements: want, added: added, removed: removed, rewrite: len(added) > 0 || removed > 0 || cur.stale}
 }
 
 // Action is one planned issue operation, exposed for dry-run output.
@@ -418,9 +467,10 @@ func (a Action) String() string {
 // covered scopes closing: an issue is closed as fixed only when this run
 // actually looked for its rule on its page — a filtered run (--id) must not
 // close issues for pages it never looked at, nor a keyboard-only test close
-// axe issues. partial (nil means never) scopes removals the same way: on a
-// page where a scan left a frame out, elements missing from the results may
-// be unchecked rather than fixed, so the issue's list only grows. covered
+// axe issues. partial (nil means never) scopes removals and closing the same
+// way: on a page where a scan left a frame out, elements missing from the
+// results may be unchecked rather than fixed, so the issue's list only grows
+// and the issue stays open. covered
 // does not catch that case, since another complete scan of the page still
 // covers the rule.
 func Plan(groups []Group, existing []Issue, covered, partial func(page, rule string) bool) []Action {
@@ -453,7 +503,9 @@ func Plan(groups []Group, existing []Issue, covered, partial func(page, rule str
 			}
 			continue
 		}
-		if issue.State == "open" && covered(page, rule) {
+		// A partial scan can lose the very elements that keep the issue open,
+		// so it never closes one.
+		if issue.State == "open" && covered(page, rule) && !(partial != nil && partial(page, rule)) {
 			actions = append(actions, Action{Kind: "close", Title: issue.Title, Number: issue.Number})
 		}
 	}

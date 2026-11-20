@@ -678,6 +678,227 @@ func TestPartialScanLeavesUnreadableListAlone(t *testing.T) {
 	}
 }
 
+// A partial scan can lose the very elements that keep an issue open, so it
+// never closes one; a complete scan of the same page still does.
+func TestPartialScanNeverClosesAnIssue(t *testing.T) {
+	existing := []Issue{{Number: 7, State: "open", Body: grp("#a").Body("")}}
+	cov := func(string, string) bool { return true }
+	if got := Plan(nil, existing, cov, partialPage("home")); len(got) != 0 {
+		t.Errorf("partial scan must not close, got %v", got)
+	}
+	if got := Plan(nil, existing, cov, partialPage("other")); len(got) != 1 || got[0].Kind != "close" {
+		t.Errorf("partial on another page must not block the close, got %v", got)
+	}
+	if got := Plan(nil, existing, cov, nil); len(got) != 1 || got[0].Kind != "close" {
+		t.Errorf("a complete scan closes, got %v", got)
+	}
+}
+
+// --- fences and hand-edited bodies ---
+
+// maxRun is the longest run of backticks in s.
+func maxRun(s string) int {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	return longest
+}
+
+// cmark-gfm (GitHub's renderer) will not open a code span whose opening
+// backtick run is over 80 long: the fence prints as text and the rest of the
+// selector becomes live markdown. parseCodeSpan has no such limit, so only a
+// check on the rendered text sees it.
+func TestHugeBacktickRunStaysInsideAShortFence(t *testing.T) {
+	huge := strings.Repeat("`", 200)
+	sel := `a[x="` + huge + `@everyone` + huge + `"]`
+	norm := normElement(sel)
+	if maxRun(norm) != maxBackticks {
+		t.Fatalf("normElement kept a run of %d, want it capped at %d", maxRun(norm), maxBackticks)
+	}
+	fence := strings.Repeat("`", maxBackticks+1)
+	cases := map[string]Group{
+		"through BuildGroups": BuildGroups([]runner.Result{result("label", "home", "initial", sel)})[0],
+		"literal group":       grp(sel),
+	}
+	for name, g := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := g.Body("ctx.")
+			if n := maxRun(body); n > 80 {
+				t.Fatalf("body has a backtick run of %d, over cmark's limit of 80", n)
+			}
+			var line string
+			for _, l := range strings.Split(body, "\n") {
+				if strings.HasPrefix(l, "- ") {
+					line = l
+				}
+			}
+			if !strings.HasPrefix(line, "- "+fence+`a[x="`) || !strings.HasSuffix(line, `"]`+fence) || !strings.Contains(line, "@everyone") {
+				t.Errorf("the selector is not inside one short code span: %.60q...", line)
+			}
+			got := parseElements(body)
+			if !got.ok || got.stale || !reflect.DeepEqual(got.els, els(norm)) {
+				t.Errorf("round trip = %+v", got)
+			}
+			// Stable: three runs against the body it wrote make no calls.
+			c, calls := fakeGitHub(t, "")
+			existing := []Issue{{Number: 7, State: "open", Body: body}}
+			for run := 0; run < 3; run++ {
+				if _, err := syncOnce(t, c, g, existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantCalls(t, calls(), nil)
+		})
+	}
+
+	// The comment names the element with the same short fence.
+	cur := grp("#a", sel)
+	existing := []Issue{{Number: 7, State: "open", Body: grp("#a").Body("")}}
+	c, calls := fakeGitHub(t, "")
+	if _, err := syncOnce(t, c, cur, existing); err != nil {
+		t.Fatal(err)
+	}
+	got := calls()
+	if len(got) != 2 {
+		t.Fatalf("calls = %+v", got)
+	}
+	if n := maxRun(got[1].Body["body"]); n > 80 {
+		t.Errorf("comment has a backtick run of %d, over cmark's limit of 80", n)
+	}
+	if want := "1 new failing element:\n\n- " + codeSpan(norm) + "\n\nctx."; got[1].Body["body"] != want {
+		t.Errorf("comment = %.80q...", got[1].Body["body"])
+	}
+}
+
+func TestMarkerToleratesHandEditedWhitespace(t *testing.T) {
+	const m = "<!-- frostfall:v1:rule=label:page=home -->"
+	g := grp("#a")
+	for _, edited := range []string{"  " + m, m + "  ", "\t" + m + "\t", "  " + m + " "} {
+		for _, eol := range []string{"\n", "\r\n"} {
+			body := strings.Replace(g.Body("ctx."), m, edited, 1)
+			body = strings.ReplaceAll(body, "\n", eol)
+			rule, page, ok := parseMarker(body)
+			if !ok || rule != "label" || page != "home" {
+				t.Errorf("marker %q with %q eol: %v %q %q (the issue would be orphaned and a duplicate filed)", edited, eol, ok, rule, page)
+			}
+			if got := parseElements(body); !got.ok || !reflect.DeepEqual(got.els, els("#a")) {
+				t.Errorf("marker %q: list = %+v", edited, got)
+			}
+			if actions := plan(t, []Group{g}, []Issue{{Number: 7, State: "open", Body: body}}, "home"); len(actions) != 0 {
+				t.Errorf("marker %q: a hand-edited marker with the same set must plan nothing, got %v", edited, actions)
+			}
+		}
+	}
+}
+
+// Text a human appends after a hand-edited (indented) marker, including a
+// look-alike list, does not replace the list above it.
+func TestListIsAnchoredAtAHandEditedMarker(t *testing.T) {
+	g := grp("#a")
+	for name, edit := range map[string][2]string{
+		"indented": {"<!-- frostfall:v1", "   <!-- frostfall:v1"},
+		"trailing": {"page=home -->", "page=home -->  "},
+	} {
+		body := strings.Replace(g.Body("ctx."), edit[0], edit[1], 1) +
+			"\nnotes\nAffected element(s):\n- `junk`\n"
+		if got := parseElements(body); !got.ok || !reflect.DeepEqual(got.els, els("#a")) {
+			t.Errorf("%s: list = %+v, want #a from above the marker", name, got)
+		}
+		if actions := plan(t, []Group{g}, []Issue{{Number: 7, State: "open", Body: body}}, "home"); len(actions) != 0 {
+			t.Errorf("%s: want no actions, got %v", name, actions)
+		}
+	}
+}
+
+// A body from an older version wrapped every selector in a single-backtick
+// span, which a selector holding a backtick breaks out of. It reads back as
+// the right element, so only the rendering shows it is unsafe: rewrite it
+// once, quietly, and then leave it alone.
+func TestOldUnsafeBulletsAreRewrittenOnceQuietly(t *testing.T) {
+	old := func(bullets string) string {
+		return "Frostfall detected **label** (critical) on **home**.\n\n> s\n\nAffected element(s):\n" + bullets +
+			"\nFiled by Frostfall.\n\n<!-- frostfall:v1:rule=label:page=home -->\n"
+	}
+	cases := map[string]struct {
+		bullets string
+		want    Group
+		unread  bool
+	}{
+		"backtick inside": {"- `a[x=\"`@everyone\"]`\n- `#b`\n", grp("a[x=\"`@everyone\"]", "#b"), false},
+		// Old rendering of a selector ending in a backtick: "`a``".
+		"backtick at the end": {"- `a``\n- `#b`\n", grp("a`", "#b"), true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			existing := []Issue{{Number: 7, State: "open", Body: old(tc.bullets)}}
+			actions := plan(t, []Group{tc.want}, existing, "home")
+			if len(actions) != 1 || actions[0].Kind != "update" || !actions[0].Rewrite ||
+				len(actions[0].Added) != 0 || actions[0].Removed != 0 || actions[0].Unnamed != 0 || actions[0].Unreadable != tc.unread {
+				t.Fatalf("want one quiet rewrite, got %+v", actions)
+			}
+			c, calls := fakeGitHub(t, "")
+			if _, err := syncOnce(t, c, tc.want, existing); err != nil {
+				t.Fatal(err)
+			}
+			got := calls()
+			wantCalls(t, got, []call{bodyPatch(7, tc.want.Body("ctx."))})
+			// What it wrote is stable.
+			again := []Issue{{Number: 7, State: "open", Body: got[0].Body["body"]}}
+			for run := 0; run < 2; run++ {
+				if _, err := syncOnce(t, c, tc.want, again); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(calls()) != 1 {
+				t.Errorf("rewrite did not settle: %+v", calls()[1:])
+			}
+		})
+	}
+	// A bullet filed with a fence over cmark's limit reads back as the capped
+	// element, not as one element gone and another new.
+	huge := `a[x="` + strings.Repeat("`", 200) + `@everyone"]`
+	overlong := []Issue{{Number: 7, State: "open", Body: old("- " + codeSpan(huge) + "\n")}}
+	if got := plan(t, []Group{grp(huge)}, overlong, "home"); len(got) != 1 || !got[0].Rewrite ||
+		len(got[0].Added) != 0 || got[0].Removed != 0 {
+		t.Errorf("an over-long fence must be rewritten quietly, got %+v", got)
+	}
+
+	// The same quiet rewrite for a truncated list whose set is unchanged.
+	big := bigGroup(3000, 0)
+	big.Elements[0] = "a`b" + big.Elements[0][3:]
+	tbody := strings.Replace(big.Body(""), codeSpan(big.Elements[0]), "`"+big.Elements[0]+"`", 1)
+	if tbody == big.Body("") {
+		t.Fatalf("setup: the unsafe bullet was not substituted")
+	}
+	got := plan(t, []Group{big}, []Issue{{Number: 7, State: "open", Body: tbody}}, "home")
+	if len(got) != 1 || !got[0].Rewrite || len(got[0].Added)+got[0].Unnamed+got[0].Removed != 0 {
+		t.Errorf("truncated body with an old bullet and the same set: want a quiet rewrite, got %+v", got)
+	}
+
+	// On a partial page the rewrite keeps every element already listed.
+	partialExisting := []Issue{{Number: 7, State: "open", Body: old("- `a[x=\"`@everyone\"]`\n- `#b`\n")}}
+	got = Plan([]Group{grp("a[x=\"`@everyone\"]")}, partialExisting, func(string, string) bool { return true }, partialPage("home"))
+	if len(got) != 1 || !got[0].Rewrite || len(got[0].Added) != 0 ||
+		!reflect.DeepEqual(got[0].Elements, els("a[x=\"`@everyone\"]", "#b")) {
+		t.Errorf("partial page: want a quiet rewrite keeping #b, got %+v", got)
+	}
+
+	// A reopen takes the quiet rewrite too, without a second comment.
+	existing := []Issue{{Number: 7, State: "closed", Body: old("- `a[x=\"`@everyone\"]`\n")}}
+	g := grp("a[x=\"`@everyone\"]")
+	c, calls := fakeGitHub(t, "")
+	if _, err := syncOnce(t, c, g, existing); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls(t, calls(), []call{bodyPatch(7, g.Body("ctx.")), commentPost(7, "Recurred. ctx."), statePatch(7, "open")})
+}
+
 // --- long lists ---
 
 const maxBody = 65536

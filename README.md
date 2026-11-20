@@ -1634,8 +1634,10 @@ Because the body is regenerated whenever the list changes, put your own notes
 in comments, not the body. A very long list is cut off with a line saying how
 many elements are not shown, and later runs compare against the full set, not
 the visible part. When a scan could not reach a frame of a page, that page's
-issue only gains elements, since the missing ones may be unchecked rather than
-fixed. Issues
+issue only gains elements, and is never closed, since the missing ones may be
+unchecked rather than fixed. An issue created during such a scan lists only
+what that scan saw, so the next complete scan may announce the rest once.
+Issues
 without the marker are never touched, so hand-filed accessibility issues are
 safe. Only violations that would fail an enforcing build are filed; baselined
 debt is not. The workflow needs `issues: write` permission. Filing failures
