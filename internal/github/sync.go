@@ -1,16 +1,29 @@
 package github
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/aquia-inc/frostfall/internal/runner"
 )
 
 const Label = "frostfall"
+
+// GitHub rejects issue bodies and comments over 65536 characters. The
+// budgets cap only the element list (counted in bytes, so never optimistic);
+// the rest of the body (summary, help link, run link, marker) fits in the
+// headroom.
+const (
+	elementBudget = 50000
+	commentBudget = 50000
+)
 
 // Group is one issue-shaped unit: a rule failing on a page. Deliberately
 // coarser than the baseline fingerprint — axe reporting the same defect on
@@ -30,15 +43,23 @@ func (g Group) Marker() string {
 	return fmt.Sprintf("<!-- frostfall:v1:rule=%s:page=%s -->", g.Rule, g.Page)
 }
 
-var markerRe = regexp.MustCompile(`<!-- frostfall:v1:rule=([^:]+):page=(.+?) -->`)
+// markerRe matches the marker on a line of its own, tolerating the CRLF a
+// body edited in the web UI can come back with. Anchoring keeps text quoted
+// elsewhere in the body (a rule summary) from standing in for it.
+var markerRe = regexp.MustCompile(`(?m)^<!-- frostfall:v1:rule=([^:\n]+):page=([^\n]+?) -->\r?$`)
+
+// markerLineRe is markerRe for one already-split line.
+var markerLineRe = regexp.MustCompile(`^<!-- frostfall:v1:rule=[^:]+:page=.+? -->$`)
 
 // parseMarker extracts (rule, page) from an issue body, ok=false when the
-// issue was not filed by frostfall.
+// issue was not filed by frostfall. The generated marker is the last line of
+// the body, so the last match wins.
 func parseMarker(body string) (rule, page string, ok bool) {
-	m := markerRe.FindStringSubmatch(body)
-	if m == nil {
+	all := markerRe.FindAllStringSubmatch(body, -1)
+	if len(all) == 0 {
 		return "", "", false
 	}
+	m := all[len(all)-1]
 	return m[1], m[2], true
 }
 
@@ -61,10 +82,11 @@ func BuildGroups(results []runner.Result) []Group {
 			byKey[key] = g
 			order = append(order, key)
 		}
-		el := oneLine(res.StableTarget)
+		el := res.StableTarget
 		if res.ScanLabel != "initial" {
 			el += " (" + res.ScanLabel + ")"
 		}
+		el = oneLine(el) // after the label: a step label can hold a break too
 		if !slices.Contains(g.Elements, el) {
 			g.Elements = append(g.Elements, el)
 		}
@@ -82,12 +104,28 @@ func (g Group) Title() string {
 }
 
 func (g Group) Body(runContext string) string {
+	els := dedupe(g.Elements)
 	var b strings.Builder
 	fmt.Fprintf(&b, "Frostfall detected **%s** (%s) on **%s**.\n\n", g.Rule, g.Impact, g.Page)
-	fmt.Fprintf(&b, "> %s\n\n", g.Summary)
-	fmt.Fprintf(&b, "Affected element(s):\n")
-	for _, el := range g.Elements {
-		fmt.Fprintf(&b, "- %s\n", codeSpan(el))
+	// One line, so the summary cannot start a line of its own that reads as
+	// the element header or the marker.
+	fmt.Fprintf(&b, "> %s\n\n", oneLine(g.Summary))
+	fmt.Fprintf(&b, "%s\n", elementsHeader)
+	used, shown := 0, 0
+	for _, el := range els {
+		line := "- " + codeSpan(el) + "\n"
+		if used+len(line) > elementBudget {
+			break
+		}
+		used += len(line)
+		shown++
+		b.WriteString(line)
+	}
+	if shown < len(els) {
+		// The visible list is a prefix, so the next run cannot learn the
+		// full set from it. The hidden record carries the count and a digest
+		// of the whole set instead.
+		fmt.Fprintf(&b, "\nand %d more not shown.\n%s\n", len(els)-shown, elementsRecord(els))
 	}
 	if g.HelpURL != "" {
 		fmt.Fprintf(&b, "\n[How to fix %s](%s)\n", g.Rule, g.HelpURL)
@@ -105,13 +143,25 @@ func oneLine(s string) string {
 	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
+func dedupe(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, e := range in {
+		if !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // codeSpan renders s as a markdown code span that cannot be broken out of.
 // Selectors are page-controlled text and can hold backticks (an attribute
 // value like [data-x="a`b"]); a plain single-backtick span would end early
 // and leave the rest as live markdown, including @mentions that notify
 // people. The fence is one backtick longer than the longest run inside s,
-// and s is padded with a space when a backtick or surrounding spaces would
-// otherwise be swallowed by the fence.
+// and s is padded with a space when a backtick at either end, or spaces at
+// both ends, would otherwise be swallowed by the fence.
 func codeSpan(s string) string {
 	longest, run := 0, 0
 	for _, r := range s {
@@ -124,11 +174,17 @@ func codeSpan(s string) string {
 	}
 	fence := strings.Repeat("`", longest+1)
 	pad := ""
-	if s != "" && (strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") ||
-		(strings.HasPrefix(s, " ") && strings.HasSuffix(s, " "))) {
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") || stripsOneSpace(s) {
 		pad = " "
 	}
 	return fence + pad + s + pad + fence
+}
+
+// stripsOneSpace reports whether a code span reader would drop one space from
+// each end of s. CommonMark does that when s starts and ends with a space
+// (U+0020 only) and is not all spaces.
+func stripsOneSpace(s string) bool {
+	return len(s) >= 2 && s[0] == ' ' && s[len(s)-1] == ' ' && strings.Trim(s, " ") != ""
 }
 
 // parseCodeSpan reverses codeSpan for one bullet's text.
@@ -154,8 +210,7 @@ func parseCodeSpan(t string) (string, bool) {
 	if strings.HasPrefix(inner, "`") || strings.HasSuffix(inner, "`") {
 		return "", false // the closing run is longer than the opening one
 	}
-	if len(inner) >= 2 && strings.HasPrefix(inner, " ") && strings.HasSuffix(inner, " ") &&
-		strings.TrimSpace(inner) != "" {
+	if stripsOneSpace(inner) {
 		inner = inner[1 : len(inner)-1]
 	}
 	return inner, true
@@ -163,72 +218,167 @@ func parseCodeSpan(t string) (string, bool) {
 
 const elementsHeader = "Affected element(s):"
 
+// elementsRecordRe is the hidden record of a truncated list: how many
+// elements the full set has and a digest of it.
+var elementsRecordRe = regexp.MustCompile(`^<!-- frostfall:elements:n=(\d+):sha=([0-9a-f]{16}) -->$`)
+
+func elementsRecord(els []string) string {
+	return fmt.Sprintf("<!-- frostfall:elements:n=%d:sha=%s -->", len(els), digest(els))
+}
+
+// digest is a short fingerprint of an element set, independent of order.
+func digest(els []string) string {
+	sorted := slices.Clone(els)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// elementList is what an existing issue body says about its elements.
+type elementList struct {
+	// ok is false when the list is missing or a bullet is not a code span (a
+	// human rewrote it).
+	ok  bool
+	els []string // the visible bullets
+	// truncated is set when the body carries the hidden record: the visible
+	// bullets are then only a prefix of a set with total elements and the
+	// given digest.
+	truncated bool
+	total     int
+	sha       string
+}
+
 // parseElements reads the element list back out of an issue body written by
-// Body. ok=false when the list is missing or a bullet is not a code span
-// (a human rewrote the section), in which case the caller refreshes the body
-// without claiming anything is new.
+// Body. The structure is anchored from the marker, which is the last line of
+// a generated body: the list is the last header line above it, so text a
+// rule summary or a human put earlier cannot stand in for it.
 //
-// The visible list is the record. A second hidden copy would duplicate every
-// selector in the body (GitHub caps bodies at 65536 characters) and would go
-// stale the moment someone edits the visible list, so reading what the issue
-// actually shows is both simpler and honest about it.
-func parseElements(body string) (els []string, ok bool) {
-	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+// The visible list is the record for untruncated bodies (and for those filed
+// by older versions). A second hidden copy of every selector would double the
+// body and go stale when someone edits the visible list.
+func parseElements(body string) elementList {
+	lines := strings.Split(body, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSuffix(lines[i], "\r")
+	}
+	end := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if markerLineRe.MatchString(lines[i]) {
+			end = i
+			break
+		}
+	}
 	start := -1
-	for i, l := range lines {
-		if strings.TrimSpace(l) == elementsHeader {
+	for i := end - 1; i >= 0; i-- {
+		if lines[i] == elementsHeader {
 			start = i + 1
 			break
 		}
 	}
 	if start < 0 {
-		return nil, false
+		return elementList{}
 	}
-	for _, l := range lines[start:] {
-		if strings.TrimSpace(l) == "" {
+	var out elementList
+	i := start
+	for ; i < end; i++ {
+		l := strings.TrimRight(lines[i], " \t")
+		if l == "" {
 			break
 		}
-		rest, found := strings.CutPrefix(strings.TrimRight(l, " \t"), "- ")
+		rest, found := strings.CutPrefix(l, "- ")
 		if !found {
-			return nil, false
+			return elementList{}
 		}
 		el, good := parseCodeSpan(rest)
 		if !good {
-			return nil, false
+			return elementList{}
 		}
-		els = append(els, el)
+		out.els = append(out.els, el)
 	}
-	return els, true
+	out.ok = true
+	for ; i < end; i++ {
+		if m := elementsRecordRe.FindStringSubmatch(lines[i]); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err != nil {
+				return elementList{}
+			}
+			out.truncated, out.total, out.sha = true, n, m[2]
+		}
+	}
+	return out
 }
 
-// diffElements compares the desired element set with the one in an issue
-// body. added keeps desired order; removed counts elements that no longer
-// fail. changed is true when the body needs rewriting. When cur could not be
-// read (known=false) it is always true and nothing counts as added.
-func diffElements(desired, cur []string, known bool) (added []string, removed int, changed bool) {
-	if !known {
-		return nil, 0, true
+// change is what a matched issue needs: the elements its body should list,
+// which of them the comment announces, and what silently dropped out.
+type change struct {
+	elements   []string
+	added      []string // new elements, nameable (the old list was complete)
+	unnamed    int      // growth known only as a count (the old list was truncated)
+	removed    int
+	rewrite    bool
+	unreadable bool // the old list could not be read, so nothing is claimed new
+}
+
+// diffElements compares the desired element set with what an issue body
+// says. partial means this run could not see every frame of the page: the
+// body then grows (existing plus new) and never shrinks, because a missing
+// element may be unchecked rather than fixed.
+func diffElements(desired []string, cur elementList, partial bool) change {
+	want := dedupe(desired)
+	if !cur.ok {
+		if partial {
+			// Writing this run's list would put a known-incomplete one in the
+			// body, and the next complete scan would announce the missing
+			// frame's elements as new. Leave it for a complete scan.
+			return change{}
+		}
+		return change{elements: want, rewrite: true, unreadable: true}
+	}
+	if cur.truncated {
+		if partial {
+			// The hidden part of the old list is unknown, so a union cannot
+			// be written and nothing can be named. Leave it for a full scan.
+			return change{}
+		}
+		n := len(want)
+		// The digest covers the count; n is kept for the growth/shrink split.
+		if digest(want) == cur.sha {
+			return change{}
+		}
+		c := change{elements: want, rewrite: true}
+		if n > cur.total {
+			c.unnamed = n - cur.total
+		} else {
+			c.removed = cur.total - n
+		}
+		return c
 	}
 	have := map[string]bool{}
-	for _, e := range cur {
+	for _, e := range cur.els {
 		have[e] = true
 	}
-	want := map[string]bool{}
-	for _, e := range desired {
-		if want[e] {
-			continue
-		}
-		want[e] = true
+	wantSet := map[string]bool{}
+	var added []string
+	for _, e := range want {
+		wantSet[e] = true
 		if !have[e] {
 			added = append(added, e)
 		}
 	}
+	removed := 0
 	for e := range have {
-		if !want[e] {
+		if !wantSet[e] {
 			removed++
 		}
 	}
-	return added, removed, len(added) > 0 || removed > 0
+	if partial {
+		return change{
+			elements: append(dedupe(cur.els), added...),
+			added:    added,
+			rewrite:  len(added) > 0,
+		}
+	}
+	return change{elements: want, added: added, removed: removed, rewrite: len(added) > 0 || removed > 0}
 }
 
 // Action is one planned issue operation, exposed for dry-run output.
@@ -237,11 +387,15 @@ type Action struct {
 	Title  string
 	Marker string // group identity for create/reopen/update; "" for close
 	Number int    // 0 for create
-	// Set on update and reopen when the issue body lists a different element
-	// set than this run found.
-	Rewrite bool
-	Added   []string // elements newly failing, announced in the comment
-	Removed int      // elements that no longer fail, updated silently
+	// Set on update and reopen when the issue body must be rewritten.
+	Rewrite  bool
+	Elements []string // the elements the rewritten body lists
+	Added    []string // elements newly failing, named in the comment
+	Unnamed  int      // growth known only as a count, announced without names
+	Removed  int      // elements that no longer fail, updated silently
+	// Unreadable: the old list could not be read, so the body is rewritten
+	// and nothing is announced.
+	Unreadable bool
 }
 
 func (a Action) String() string {
@@ -250,10 +404,12 @@ func (a Action) String() string {
 		s = fmt.Sprintf("%s #%d %s", a.Kind, a.Number, a.Title)
 	}
 	switch {
-	case len(a.Added) > 0 || a.Removed > 0:
-		s += fmt.Sprintf(" (+%d -%d elements)", len(a.Added), a.Removed)
+	case a.Unreadable:
+		s += " (rewrite body: element list unreadable)"
+	case len(a.Added)+a.Unnamed > 0 || a.Removed > 0:
+		s += fmt.Sprintf(" (+%d -%d elements)", len(a.Added)+a.Unnamed, a.Removed)
 	case a.Rewrite:
-		s += " (refresh element list)"
+		s += " (rewrite body)"
 	}
 	return s
 }
@@ -262,8 +418,12 @@ func (a Action) String() string {
 // covered scopes closing: an issue is closed as fixed only when this run
 // actually looked for its rule on its page — a filtered run (--id) must not
 // close issues for pages it never looked at, nor a keyboard-only test close
-// axe issues.
-func Plan(groups []Group, existing []Issue, covered func(page, rule string) bool) []Action {
+// axe issues. partial (nil means never) scopes removals the same way: on a
+// page where a scan left a frame out, elements missing from the results may
+// be unchecked rather than fixed, so the issue's list only grows. covered
+// does not catch that case, since another complete scan of the page still
+// covers the rule.
+func Plan(groups []Group, existing []Issue, covered, partial func(page, rule string) bool) []Action {
 	desired := map[string]Group{}
 	for _, g := range groups {
 		desired[g.Marker()] = g
@@ -279,15 +439,17 @@ func Plan(groups []Group, existing []Issue, covered func(page, rule string) bool
 		marker := Group{Rule: rule, Page: page}.Marker()
 		if g, want := desired[marker]; want {
 			handled[marker] = true
-			cur, known := parseElements(issue.Body)
-			added, removed, changed := diffElements(g.Elements, cur, known)
+			ch := diffElements(g.Elements, parseElements(issue.Body), partial != nil && partial(page, rule))
+			base := Action{Title: g.Title(), Marker: marker, Number: issue.Number,
+				Rewrite: ch.rewrite, Elements: ch.elements, Added: ch.added,
+				Unnamed: ch.unnamed, Removed: ch.removed, Unreadable: ch.unreadable}
 			switch {
 			case issue.State == "closed":
-				actions = append(actions, Action{Kind: "reopen", Title: g.Title(), Marker: marker, Number: issue.Number,
-					Rewrite: changed, Added: added, Removed: removed})
-			case changed:
-				actions = append(actions, Action{Kind: "update", Title: g.Title(), Marker: marker, Number: issue.Number,
-					Rewrite: true, Added: added, Removed: removed})
+				base.Kind = "reopen"
+				actions = append(actions, base)
+			case ch.rewrite:
+				base.Kind = "update"
+				actions = append(actions, base)
 			}
 			continue
 		}
@@ -306,12 +468,12 @@ func Plan(groups []Group, existing []Issue, covered func(page, rule string) bool
 // Sync executes a plan. runContext is a one-line provenance note added to
 // bodies and comments (e.g. a link to the CI run). Failures are collected,
 // not fatal: filing issues must never break the scan itself.
-func Sync(c *Client, groups []Group, existing []Issue, covered func(page, rule string) bool, runContext string) ([]Action, error) {
+func Sync(c *Client, groups []Group, existing []Issue, covered, partial func(page, rule string) bool, runContext string) ([]Action, error) {
 	byMarker := map[string]Group{}
 	for _, g := range groups {
 		byMarker[g.Marker()] = g
 	}
-	actions := Plan(groups, existing, covered)
+	actions := Plan(groups, existing, covered, partial)
 	var errs []string
 	for _, a := range actions {
 		var err error
@@ -345,45 +507,89 @@ func Sync(c *Client, groups []Group, existing []Issue, covered func(page, rule s
 	return actions, nil
 }
 
-// syncExisting applies an update or reopen. The comment goes first: if the
-// body edit then fails, the next run re-announces the same elements (a
-// duplicate comment) rather than losing them (a silent gap). One comment per
-// action, so a reopen with new elements folds into "Recurred.".
+// syncExisting applies an update or reopen, body first.
+//
+// Naming new elements in a comment is only honest once the body lists them,
+// and only worth doing once: if the body edit fails (422 on size, a locked
+// issue, a 403, a rate limit) and the comment went out anyway, every later
+// run would repeat it. So the announcement waits for a successful body edit.
+// The cost is the reverse gap: a comment that fails after a good edit is
+// never retried, because the next run finds the body already current.
+//
+// A failed body edit must not keep a recurrence closed, so a reopen still
+// posts its plain "Recurred." comment and sets the state to open (as before
+// body edits existed), and the body error is returned alongside.
 func syncExisting(c *Client, a Action, g Group, runContext string) error {
-	var note string
-	if a.Kind == "reopen" {
-		note = "Recurred."
+	var errs []string
+	bodyOK := true
+	if a.Rewrite {
+		g.Elements = a.Elements
+		if err := c.SetBody(a.Number, g.Body(runContext)); err != nil {
+			bodyOK = false
+			errs = append(errs, "edit body: "+err.Error())
+		}
 	}
-	if len(a.Added) > 0 {
-		noun := "elements"
-		if len(a.Added) == 1 {
-			noun = "element"
-		}
-		var b strings.Builder
-		if note != "" {
-			b.WriteString(note + "\n\n")
-		}
-		fmt.Fprintf(&b, "%d new failing %s:\n\n", len(a.Added), noun)
-		for _, el := range a.Added {
-			fmt.Fprintf(&b, "- %s\n", codeSpan(el))
-		}
-		fmt.Fprintf(&b, "\n%s", runContext)
-		note = b.String()
-	} else if note != "" {
-		note += " " + runContext
+	var news string
+	if bodyOK {
+		news = announcement(a)
+	}
+	var note string
+	switch {
+	case a.Kind == "reopen" && news != "":
+		note = "Recurred.\n\n" + news + "\n\n" + runContext
+	case news != "":
+		note = news + "\n\n" + runContext
+	case a.Kind == "reopen":
+		note = "Recurred. " + runContext
 	}
 	if note != "" {
 		if err := c.Comment(a.Number, note); err != nil {
-			return err
-		}
-	}
-	if a.Rewrite {
-		if err := c.SetBody(a.Number, g.Body(runContext)); err != nil {
-			return err
+			errs = append(errs, "comment: "+err.Error())
+			return errors.New(strings.Join(errs, "; "))
 		}
 	}
 	if a.Kind == "reopen" {
-		return c.SetState(a.Number, "open")
+		if err := c.SetState(a.Number, "open"); err != nil {
+			errs = append(errs, "reopen: "+err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// announcement is the comment text for newly failing elements, "" when there
+// are none. It names them when it can (within commentBudget) and gives only a
+// count when the old list was truncated, since then nothing says which
+// elements are new.
+func announcement(a Action) string {
+	plural := func(n int) string {
+		if n == 1 {
+			return "element"
+		}
+		return "elements"
+	}
+	if len(a.Added) > 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d new failing %s:\n\n", len(a.Added), plural(len(a.Added)))
+		used, shown := 0, 0
+		for _, el := range a.Added {
+			line := "- " + codeSpan(el) + "\n"
+			if used+len(line) > commentBudget {
+				break
+			}
+			used += len(line)
+			shown++
+			b.WriteString(line)
+		}
+		if shown < len(a.Added) {
+			fmt.Fprintf(&b, "\nand %d more not shown.\n", len(a.Added)-shown)
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
+	if a.Unnamed > 0 {
+		return fmt.Sprintf("%d more failing %s (list truncated; see the issue body).", a.Unnamed, plural(a.Unnamed))
+	}
+	return ""
 }

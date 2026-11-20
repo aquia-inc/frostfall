@@ -164,6 +164,16 @@ func (r *Run) Covered(testID, ruleID string) bool {
 	return c.runs[check]-c.partial[check] > c.off[ruleID]
 }
 
+// Partial reports whether any scan of ruleID's check on test's page had to
+// leave a frame out. Covered stays true when another scan of the page was
+// complete, so a caller that edits what it knows about the page (an issue's
+// element list) uses this to avoid reading a missing frame's findings as
+// fixed.
+func (r *Run) Partial(testID, ruleID string) bool {
+	c := r.ran[testID]
+	return c != nil && c.partial[checkFor(ruleID)] > 0
+}
+
 // Checks lists, sorted, the checks (axe, keyboard, expectFocus) that ran on
 // testID's page.
 func (r *Run) Checks(testID string) []string {

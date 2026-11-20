@@ -2,6 +2,7 @@ package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -57,7 +58,7 @@ func plan(t *testing.T, groups []Group, existing []Issue, ran ...string) []Actio
 	for _, id := range ran {
 		testsRun[id] = true
 	}
-	return Plan(groups, existing, func(page, _ string) bool { return testsRun[page] })
+	return Plan(groups, existing, func(page, _ string) bool { return testsRun[page] }, nil)
 }
 
 func TestPlanCreatesOnlyMissing(t *testing.T) {
@@ -108,30 +109,47 @@ func TestPlanIgnoresHumanIssues(t *testing.T) {
 	}
 }
 
-// call is one request the fake GitHub API received.
+// call is one write the fake GitHub API received.
 type call struct {
 	Method string
 	Path   string
 	Body   map[string]string
 }
 
-// fakeGitHub records every write Sync makes. A PATCH to failPath answers 500.
-func fakeGitHub(t *testing.T, failPath string) (*Client, func() []call) {
+// fakeAPI configures the fake GitHub server.
+type fakeAPI struct {
+	failBody bool             // a PATCH that carries a body answers 422
+	failPath string           // a PATCH to this path answers 500
+	issues   []map[string]any // served by GET /repos/org/repo/issues
+}
+
+// newFake serves the issue API and records every write (not reads), in order.
+func newFake(t *testing.T, f fakeAPI) (*Client, func() []call) {
 	t.Helper()
 	var mu sync.Mutex
 	var calls []call
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			_ = json.NewEncoder(w).Encode(f.issues)
+			return
+		}
 		raw, _ := io.ReadAll(r.Body)
 		c := call{Method: r.Method, Path: r.URL.Path, Body: map[string]string{}}
 		_ = json.Unmarshal(raw, &c.Body)
 		mu.Lock()
 		calls = append(calls, c)
 		mu.Unlock()
-		if failPath != "" && r.URL.Path == failPath && r.Method == "PATCH" {
-			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
-			return
+		_, hasBody := c.Body["body"]
+		switch {
+		case r.Method == "PATCH" && f.failBody && hasBody:
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message":"body too long"}`))
+		case r.Method == "PATCH" && f.failPath != "" && r.URL.Path == f.failPath:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"boom"}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
 		}
-		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(srv.Close)
 	c := NewClient("tok", "org/repo")
@@ -143,6 +161,23 @@ func fakeGitHub(t *testing.T, failPath string) (*Client, func() []call) {
 	}
 }
 
+func fakeGitHub(t *testing.T, failPath string) (*Client, func() []call) {
+	t.Helper()
+	return newFake(t, fakeAPI{failPath: failPath})
+}
+
+func ipath(n int) string { return fmt.Sprintf("/repos/org/repo/issues/%d", n) }
+
+func bodyPatch(n int, body string) call {
+	return call{"PATCH", ipath(n), map[string]string{"body": body}}
+}
+func commentPost(n int, body string) call {
+	return call{"POST", ipath(n) + "/comments", map[string]string{"body": body}}
+}
+func statePatch(n int, state string) call {
+	return call{"PATCH", ipath(n), map[string]string{"state": state}}
+}
+
 func els(e ...string) []string { return e }
 
 func grp(elements ...string) Group {
@@ -151,12 +186,22 @@ func grp(elements ...string) Group {
 
 func syncOnce(t *testing.T, c *Client, g Group, existing []Issue) ([]Action, error) {
 	t.Helper()
-	return Sync(c, []Group{g}, existing, func(string, string) bool { return true }, "ctx.")
+	return Sync(c, []Group{g}, existing, func(string, string) bool { return true }, nil, "ctx.")
+}
+
+func wantCalls(t *testing.T, got, want []call) {
+	t.Helper()
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("calls differ\n got: %+v\nwant: %+v", got, want)
+	}
 }
 
 const issuePath = "/repos/org/repo/issues/7"
 
-func TestSyncGrownSetUpdatesBodyAndCommentsNewOnly(t *testing.T) {
+func TestSyncGrownSetUpdatesBodyThenCommentsNewOnly(t *testing.T) {
 	old := grp("#a", "#b")
 	cur := grp("#a", "#b", "#c", "#d")
 	existing := []Issue{{Number: 7, State: "open", Body: old.Body("old run.")}}
@@ -174,23 +219,11 @@ func TestSyncGrownSetUpdatesBodyAndCommentsNewOnly(t *testing.T) {
 	if _, err := syncOnce(t, c, cur, existing); err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(got) != 2 {
-		t.Fatalf("want comment + body patch, got %+v", got)
-	}
-	wantComment := "2 new failing elements:\n\n- `#c`\n- `#d`\n\nctx."
-	if got[0].Path != issuePath+"/comments" || got[0].Body["body"] != wantComment {
-		t.Errorf("comment = %+v, want body %q", got[0], wantComment)
-	}
-	if strings.Contains(got[0].Body["body"], "#a") {
-		t.Errorf("comment must list only new elements: %q", got[0].Body["body"])
-	}
-	if got[1].Method != "PATCH" || got[1].Path != issuePath || got[1].Body["body"] != cur.Body("ctx.") {
-		t.Errorf("body patch = %+v", got[1])
-	}
-	if _, has := got[1].Body["state"]; has {
-		t.Errorf("update must not touch state: %+v", got[1])
-	}
+	// Body first, then the comment naming only the new elements.
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, cur.Body("ctx.")),
+		commentPost(7, "2 new failing elements:\n\n- `#c`\n- `#d`\n\nctx."),
+	})
 }
 
 func TestSyncSingleNewElementIsSingular(t *testing.T) {
@@ -199,8 +232,9 @@ func TestSyncSingleNewElementIsSingular(t *testing.T) {
 	if _, err := syncOnce(t, c, grp("#a", "#b"), existing); err != nil {
 		t.Fatal(err)
 	}
-	if b := calls()[0].Body["body"]; !strings.HasPrefix(b, "1 new failing element:\n") {
-		t.Errorf("comment = %q", b)
+	got := calls()
+	if len(got) != 2 || !strings.HasPrefix(got[1].Body["body"], "1 new failing element:\n") {
+		t.Errorf("calls = %+v", got)
 	}
 }
 
@@ -215,13 +249,8 @@ func TestSyncShrunkSetUpdatesBodySilently(t *testing.T) {
 	if _, err := syncOnce(t, c, cur, existing); err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(got) != 1 || got[0].Method != "PATCH" || got[0].Path != issuePath {
-		t.Fatalf("want one body patch and no comment, got %+v", got)
-	}
-	if strings.Contains(got[0].Body["body"], "#b") {
-		t.Errorf("removed element still in body: %q", got[0].Body["body"])
-	}
+	// Only the body PATCH: no comment POST, no state change.
+	wantCalls(t, calls(), []call{bodyPatch(7, cur.Body("ctx."))})
 }
 
 func TestSyncIdenticalSetDoesNothing(t *testing.T) {
@@ -233,9 +262,10 @@ func TestSyncIdenticalSetDoesNothing(t *testing.T) {
 	}
 	c, calls := fakeGitHub(t, "")
 	actions, err := syncOnce(t, c, g, existing)
-	if err != nil || len(actions) != 0 || len(calls()) != 0 {
-		t.Errorf("identical set: actions=%v err=%v calls=%v", actions, err, calls())
+	if err != nil || len(actions) != 0 {
+		t.Errorf("identical set: actions=%v err=%v", actions, err)
 	}
+	wantCalls(t, calls(), nil)
 }
 
 func TestSyncReopenWithNewElementsIsOneComment(t *testing.T) {
@@ -253,20 +283,11 @@ func TestSyncReopenWithNewElementsIsOneComment(t *testing.T) {
 	if _, err := syncOnce(t, c, cur, existing); err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(got) != 3 {
-		t.Fatalf("want comment, body patch, state patch, got %+v", got)
-	}
-	if got[0].Path != issuePath+"/comments" ||
-		got[0].Body["body"] != "Recurred.\n\n1 new failing element:\n\n- `#b`\n\nctx." {
-		t.Errorf("comment = %+v", got[0])
-	}
-	if got[1].Body["body"] != cur.Body("ctx.") {
-		t.Errorf("body patch = %+v", got[1])
-	}
-	if got[2].Body["state"] != "open" {
-		t.Errorf("state patch = %+v", got[2])
-	}
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, cur.Body("ctx.")),
+		commentPost(7, "Recurred.\n\n1 new failing element:\n\n- `#b`\n\nctx."),
+		statePatch(7, "open"),
+	})
 }
 
 func TestSyncReopenSameElementsKeepsOldBehavior(t *testing.T) {
@@ -276,10 +297,7 @@ func TestSyncReopenSameElementsKeepsOldBehavior(t *testing.T) {
 	if _, err := syncOnce(t, c, g, existing); err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(got) != 2 || got[0].Body["body"] != "Recurred. ctx." || got[1].Body["state"] != "open" {
-		t.Errorf("want Recurred comment then reopen, got %+v", got)
-	}
+	wantCalls(t, calls(), []call{commentPost(7, "Recurred. ctx."), statePatch(7, "open")})
 }
 
 func TestSyncReopenWithOnlyRemovalsIsSilentBodyUpdate(t *testing.T) {
@@ -288,10 +306,51 @@ func TestSyncReopenWithOnlyRemovalsIsSilentBodyUpdate(t *testing.T) {
 	if _, err := syncOnce(t, c, grp("#a"), existing); err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(got) != 3 || got[0].Body["body"] != "Recurred. ctx." || got[1].Body["body"] != grp("#a").Body("ctx.") ||
-		got[2].Body["state"] != "open" {
-		t.Errorf("got %+v", got)
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, grp("#a").Body("ctx.")),
+		commentPost(7, "Recurred. ctx."),
+		statePatch(7, "open"),
+	})
+}
+
+// A body edit GitHub always rejects (too long, locked issue, 403, rate limit)
+// must not make every run repeat the same "new failing elements" comment, and
+// must not keep a recurrence closed.
+func TestSyncRejectedBodyEditNeverAnnouncesAndStillReopens(t *testing.T) {
+	openOld := Group{Rule: "label", Page: "home", Impact: "critical", Summary: "s", Elements: els("#a")}
+	openNew := openOld
+	openNew.Elements = els("#a", "#b")
+	closedOld := openOld
+	closedOld.Page = "other"
+	closedNew := openNew
+	closedNew.Page = "other"
+	existing := []Issue{
+		{Number: 7, State: "open", Body: openOld.Body("")},
+		{Number: 8, State: "closed", Body: closedOld.Body("")},
+	}
+	c, calls := newFake(t, fakeAPI{failBody: true})
+	cov := func(string, string) bool { return true }
+
+	for run := 1; run <= 3; run++ {
+		before := len(calls())
+		_, err := Sync(c, []Group{openNew, closedNew}, existing, cov, nil, "ctx.")
+		if err == nil || !strings.Contains(err.Error(), "#7") || !strings.Contains(err.Error(), "#8") ||
+			!strings.Contains(err.Error(), "edit body: github api: 422") {
+			t.Fatalf("run %d: want the body errors collected, got %v", run, err)
+		}
+		// Open #7: the rejected body edit and nothing else. Closed #8: the
+		// rejected edit, the plain Recurred comment, then the reopen.
+		wantCalls(t, calls()[before:], []call{
+			bodyPatch(7, openNew.Body("ctx.")),
+			bodyPatch(8, closedNew.Body("ctx.")),
+			commentPost(8, "Recurred. ctx."),
+			statePatch(8, "open"),
+		})
+	}
+	for _, cl := range calls() {
+		if strings.Contains(cl.Body["body"], "new failing") {
+			t.Fatalf("announced elements the body does not list: %+v", cl)
+		}
 	}
 }
 
@@ -302,9 +361,9 @@ func TestParseElementsOldFormatBody(t *testing.T) {
 		"Affected element(s):\n- `#a`\n- `input[name=\"q\"] (after-open)`\n\n" +
 		"[How to fix label](https://example.test)\n\nFiled by Frostfall.\n\n" +
 		"<!-- frostfall:v1:rule=label:page=home -->\n"
-	got, ok := parseElements(body)
-	if !ok || !reflect.DeepEqual(got, els("#a", `input[name="q"] (after-open)`)) {
-		t.Fatalf("parseElements = %v, %v", got, ok)
+	got := parseElements(body)
+	if !got.ok || got.truncated || !reflect.DeepEqual(got.els, els("#a", `input[name="q"] (after-open)`)) {
+		t.Fatalf("parseElements = %+v", got)
 	}
 	existing := []Issue{{Number: 7, State: "open", Body: body}}
 	same := grp("#a", `input[name="q"] (after-open)`)
@@ -318,7 +377,7 @@ func TestParseElementsOldFormatBody(t *testing.T) {
 	}
 }
 
-func TestSyncUnreadableListRefreshesBodyWithoutClaimingNewElements(t *testing.T) {
+func TestSyncUnreadableListRewritesBodyWithoutClaimingNewElements(t *testing.T) {
 	body := "Frostfall detected something.\n\nSee notes below.\n\n<!-- frostfall:v1:rule=label:page=home -->\n"
 	existing := []Issue{{Number: 7, State: "open", Body: body}}
 	c, calls := fakeGitHub(t, "")
@@ -326,11 +385,11 @@ func TestSyncUnreadableListRefreshesBodyWithoutClaimingNewElements(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := calls()
-	if len(actions) != 1 || actions[0].Kind != "update" || len(got) != 1 || got[0].Method != "PATCH" {
-		t.Fatalf("want a silent body refresh, got actions=%v calls=%+v", actions, got)
+	wantCalls(t, calls(), []call{bodyPatch(7, grp("#a").Body("ctx."))})
+	if len(actions) != 1 || actions[0].Kind != "update" {
+		t.Fatalf("actions = %v", actions)
 	}
-	if s := actions[0].String(); s != "update #7 Accessibility: label on home (refresh element list)" {
+	if s := actions[0].String(); s != "update #7 Accessibility: label on home (rewrite body: element list unreadable)" {
 		t.Errorf("String() = %q", s)
 	}
 }
@@ -343,22 +402,20 @@ func TestSyncFailuresAreCollectedNotFatal(t *testing.T) {
 		{Number: 8, State: "open", Body: Group{Rule: "image-alt", Page: "home", Elements: els("#x")}.Body("")},
 	}
 	c, calls := fakeGitHub(t, issuePath)
-	actions, err := Sync(c, []Group{g1, g2}, existing, func(string, string) bool { return true }, "ctx.")
-	if err == nil || !strings.Contains(err.Error(), "#7") || strings.Contains(err.Error(), "#8 ") {
-		t.Errorf("want error naming only #7, got %v", err)
+	actions, err := Sync(c, []Group{g1, g2}, existing, func(string, string) bool { return true }, nil, "ctx.")
+	want := `update #7 Accessibility: label on home (+1 -0 elements): edit body: github api: 500: {"message":"boom"}`
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want exactly %q", err, want)
 	}
 	if len(actions) != 2 {
 		t.Fatalf("want both actions planned, got %v", actions)
 	}
-	var patched8 bool
-	for _, cl := range calls() {
-		if cl.Method == "PATCH" && cl.Path == "/repos/org/repo/issues/8" {
-			patched8 = true
-		}
-	}
-	if !patched8 {
-		t.Errorf("a failure on #7 must not stop #8: %+v", calls())
-	}
+	// #7 failed on its body edit and posted nothing; #8 was unaffected.
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, g1.Body("ctx.")),
+		bodyPatch(8, g2.Body("ctx.")),
+		commentPost(8, "1 new failing element:\n\n- `#y`\n\nctx."),
+	})
 }
 
 func TestCodeSpanRoundTripAndContainment(t *testing.T) {
@@ -370,6 +427,9 @@ func TestCodeSpanRoundTripAndContainment(t *testing.T) {
 		"trailing`",
 		"``",
 		" padded ",
+		" ",
+		"   ",
+		"",
 		"@octocat and `code` @team/name",
 	} {
 		span := codeSpan(el)
@@ -393,25 +453,59 @@ func TestCodeSpanRoundTripAndContainment(t *testing.T) {
 	}
 }
 
+// CommonMark strips one space from each end of a span only when it is not
+// all spaces, and only U+0020 counts. Padding or stripping all-space content
+// (or a tab or NBSP) would corrupt it.
+func TestCodeSpanWhitespaceMatchesCommonMark(t *testing.T) {
+	for _, s := range []string{" ", "  ", "   "} {
+		if got := codeSpan(s); got != "`"+s+"`" {
+			t.Errorf("codeSpan(%q) = %q: all-space content must not be padded", s, got)
+		}
+	}
+	if got := codeSpan(" a "); got != "`  a  `" {
+		t.Errorf("codeSpan(\" a \") = %q", got)
+	}
+	// Not all spaces, so a reader strips one space from each end.
+	if got := codeSpan(" \t "); got != "`  \t  `" {
+		t.Errorf("codeSpan(space tab space) = %q", got)
+	}
+	for _, s := range []string{"\t", "\ta\t", " x ", " \t "} {
+		got, ok := parseCodeSpan(codeSpan(s))
+		if !ok || got != s {
+			t.Errorf("%q round trip = %q, %v", s, got, ok)
+		}
+	}
+	if got, _ := parseCodeSpan("` \t`"); got != " \t" {
+		t.Errorf("a tab is not a space to strip: got %q", got)
+	}
+	if got, _ := parseCodeSpan("`   `"); got != "   " {
+		t.Errorf("all-space content must not be stripped: got %q", got)
+	}
+}
+
 func TestBodyKeepsBacktickSelectorInsideCodeSpan(t *testing.T) {
 	g := grp("a[title=\"`@everyone`\"]")
 	body := g.Body("")
 	if !strings.Contains(body, "- ``a[title=\"`@everyone`\"]``\n") {
 		t.Errorf("selector not fenced safely:\n%s", body)
 	}
-	got, ok := parseElements(body)
-	if !ok || !reflect.DeepEqual(got, g.Elements) {
-		t.Errorf("fenced element did not round-trip: %v %v", got, ok)
+	got := parseElements(body)
+	if !got.ok || !reflect.DeepEqual(got.els, g.Elements) {
+		t.Errorf("fenced element did not round-trip: %+v", got)
 	}
 }
 
-func TestBuildGroupsFlattensLineBreaksInSelectors(t *testing.T) {
-	groups := BuildGroups([]runner.Result{result("label", "home", "initial", "a[x=\"1\n2\"]")})
-	if len(groups) != 1 || groups[0].Elements[0] != "a[x=\"1 2\"]" {
-		t.Fatalf("got %+v", groups)
+func TestBuildGroupsFlattensLineBreaksInSelectorsAndLabels(t *testing.T) {
+	groups := BuildGroups([]runner.Result{
+		result("label", "home", "initial", "a[x=\"1\n2\"]"),
+		result("label", "home", "after\nopen", "#b"),
+	})
+	want := els("a[x=\"1 2\"]", "#b (after open)")
+	if len(groups) != 1 || !reflect.DeepEqual(groups[0].Elements, want) {
+		t.Fatalf("got %+v, want elements %q", groups, want)
 	}
-	if got, ok := parseElements(groups[0].Body("")); !ok || !reflect.DeepEqual(got, groups[0].Elements) {
-		t.Errorf("round trip failed: %v %v", got, ok)
+	if got := parseElements(groups[0].Body("")); !got.ok || !reflect.DeepEqual(got.els, groups[0].Elements) {
+		t.Errorf("round trip failed: %+v", got)
 	}
 }
 
@@ -425,10 +519,359 @@ func TestActionStringStyle(t *testing.T) {
 		{Action{Kind: "reopen", Title: "T", Number: 3}, "reopen #3 T"},
 		{Action{Kind: "update", Title: "T", Number: 3, Rewrite: true, Added: els("x"), Removed: 2}, "update #3 T (+1 -2 elements)"},
 		{Action{Kind: "update", Title: "T", Number: 3, Rewrite: true, Removed: 1}, "update #3 T (+0 -1 elements)"},
+		{Action{Kind: "update", Title: "T", Number: 3, Rewrite: true, Unnamed: 5}, "update #3 T (+5 -0 elements)"},
+		{Action{Kind: "reopen", Title: "T", Number: 3, Rewrite: true, Unreadable: true}, "reopen #3 T (rewrite body: element list unreadable)"},
 	}
 	for _, c := range cases {
 		if got := c.a.String(); got != c.want {
 			t.Errorf("String() = %q, want %q", got, c.want)
 		}
 	}
+}
+
+// --- marker and list parsing ---
+
+func crlf(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }
+
+func TestParseCRLFBodies(t *testing.T) {
+	g := grp("#a", "a``b")
+	body := crlf(g.Body("ctx."))
+	rule, page, ok := parseMarker(body)
+	if !ok || rule != "label" || page != "home" {
+		t.Errorf("CRLF marker = %v %q %q: web-edited issues would be orphaned", ok, rule, page)
+	}
+	got := parseElements(body)
+	if !got.ok || !reflect.DeepEqual(got.els, g.Elements) {
+		t.Errorf("CRLF list = %+v", got)
+	}
+	if actions := plan(t, []Group{g}, []Issue{{Number: 7, State: "open", Body: body}}, "home"); len(actions) != 0 {
+		t.Errorf("a CRLF body with the same set must be a no-op (no duplicate, no rewrite), got %v", actions)
+	}
+	// A truncated body keeps its record through CRLF too.
+	big := bigGroup(3000, 0)
+	tr := parseElements(crlf(big.Body("ctx.")))
+	if !tr.ok || !tr.truncated || tr.total != 3000 {
+		t.Errorf("CRLF truncated record = %+v", tr)
+	}
+}
+
+func TestMarkerAndListCannotBeSpoofedByTheSummary(t *testing.T) {
+	g := Group{Rule: "label", Page: "home", Impact: "critical", Elements: els("#a"),
+		Summary: "bad <!-- frostfall:v1:rule=other:page=elsewhere -->\nAffected element(s):\n- `x`\n" +
+			"<!-- frostfall:v1:rule=other:page=elsewhere -->"}
+	body := g.Body("ctx.")
+	// Besides the parser's anchoring, the summary must not be able to put a
+	// header or a marker on a line of its own at all.
+	var headers, markers int
+	for _, l := range strings.Split(body, "\n") {
+		if l == elementsHeader {
+			headers++
+		}
+		if markerLineRe.MatchString(l) {
+			markers++
+		}
+	}
+	if headers != 1 || markers != 1 {
+		t.Errorf("body has %d header lines and %d marker lines, want 1 and 1:\n%s", headers, markers, body)
+	}
+	if rule, page, ok := parseMarker(body); !ok || rule != "label" || page != "home" {
+		t.Errorf("summary hijacked the marker: %v %q %q", ok, rule, page)
+	}
+	if got := parseElements(body); !got.ok || !reflect.DeepEqual(got.els, els("#a")) {
+		t.Errorf("summary hijacked the list: %+v", got)
+	}
+	existing := []Issue{{Number: 7, State: "open", Body: body}}
+	c, calls := fakeGitHub(t, "")
+	for run := 0; run < 3; run++ {
+		if _, err := syncOnce(t, c, g, existing); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantCalls(t, calls(), nil)
+}
+
+// Earlier text that happens to look like the generated structure (a human's
+// note above a pasted body, say) loses to the structure anchored at the
+// marker.
+func TestLastMarkerAndNearestHeaderWin(t *testing.T) {
+	g := grp("#a")
+	body := "<!-- frostfall:v1:rule=other:page=elsewhere -->\nAffected element(s):\n- `x`\n\n" + g.Body("ctx.")
+	if rule, page, ok := parseMarker(body); !ok || rule != "label" || page != "home" {
+		t.Errorf("marker = %v %q %q, want the last", ok, rule, page)
+	}
+	if got := parseElements(body); !got.ok || !reflect.DeepEqual(got.els, els("#a")) {
+		t.Errorf("list = %+v, want the one above the marker", got)
+	}
+}
+
+func TestMarkerMustBeOnItsOwnLine(t *testing.T) {
+	if _, _, ok := parseMarker("quoted: <!-- frostfall:v1:rule=a:page=b --> in prose"); ok {
+		t.Errorf("an inline marker must not match")
+	}
+	if _, _, ok := parseMarker("> <!-- frostfall:v1:rule=a:page=b -->\n"); ok {
+		t.Errorf("a quoted marker must not match")
+	}
+}
+
+// --- partial scans ---
+
+func partialPage(page string) func(string, string) bool {
+	return func(p, _ string) bool { return p == page }
+}
+
+func TestPartialScanGrowsListButNeverShrinksIt(t *testing.T) {
+	existing := []Issue{{Number: 7, State: "open", Body: grp("#a", "#b", "#c").Body("")}}
+	cur := grp("#a", "#d")
+	cov := func(string, string) bool { return true }
+
+	// Complete scan: #b and #c are fixed.
+	full := Plan([]Group{cur}, existing, cov, nil)
+	if len(full) != 1 || full[0].Removed != 2 || !reflect.DeepEqual(full[0].Elements, els("#a", "#d")) {
+		t.Fatalf("complete scan: %+v", full)
+	}
+
+	// A frame was missed: #b and #c may just be unchecked.
+	part := Plan([]Group{cur}, existing, cov, partialPage("home"))
+	if len(part) != 1 || part[0].Removed != 0 || !reflect.DeepEqual(part[0].Added, els("#d")) ||
+		!reflect.DeepEqual(part[0].Elements, els("#a", "#b", "#c", "#d")) {
+		t.Fatalf("partial scan must write existing plus new: %+v", part)
+	}
+	c, calls := fakeGitHub(t, "")
+	if _, err := Sync(c, []Group{cur}, existing, cov, partialPage("home"), "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, grp("#a", "#b", "#c", "#d").Body("ctx.")),
+		commentPost(7, "1 new failing element:\n\n- `#d`\n\nctx."),
+	})
+
+	// Only losses on a partial page: nothing to do.
+	if got := Plan([]Group{grp("#a")}, existing, cov, partialPage("home")); len(got) != 0 {
+		t.Errorf("partial scan with only missing elements must plan nothing, got %v", got)
+	}
+	// Partial elsewhere does not protect this page.
+	if got := Plan([]Group{grp("#a")}, existing, cov, partialPage("other")); len(got) != 1 {
+		t.Errorf("partial on another page must not block removals, got %v", got)
+	}
+}
+
+func TestPartialScanLeavesTruncatedListAlone(t *testing.T) {
+	existing := []Issue{{Number: 7, State: "open", Body: bigGroup(3000, 0).Body("")}}
+	got := Plan([]Group{bigGroup(100, 0)}, existing, func(string, string) bool { return true }, partialPage("home"))
+	if len(got) != 0 {
+		t.Errorf("the hidden part of a truncated list is unknown, so a partial scan must not rewrite it: %v", got)
+	}
+}
+
+// An unreadable list rewritten from a partial scan would leave a
+// known-incomplete list that the next complete scan reads cleanly and
+// announces as new elements.
+func TestPartialScanLeavesUnreadableListAlone(t *testing.T) {
+	body := "Frostfall detected something.\n\n<!-- frostfall:v1:rule=label:page=home -->\n"
+	existing := []Issue{{Number: 7, State: "open", Body: body}}
+	cov := func(string, string) bool { return true }
+	if got := Plan([]Group{grp("#a")}, existing, cov, partialPage("home")); len(got) != 0 {
+		t.Errorf("partial scan must not rewrite an unreadable list, got %v", got)
+	}
+	if got := Plan([]Group{grp("#a")}, existing, cov, nil); len(got) != 1 {
+		t.Errorf("a complete scan still rewrites it, got %v", got)
+	}
+}
+
+// --- long lists ---
+
+const maxBody = 65536
+
+// bigGroup has n 120-character elements numbered from first.
+func bigGroup(n, first int) Group {
+	g := grp()
+	for i := first; i < first+n; i++ {
+		el := fmt.Sprintf("#el-%05d-", i)
+		g.Elements = append(g.Elements, el+strings.Repeat("x", 120-len(el)))
+	}
+	return g
+}
+
+func TestOversizedListIsCappedAndReadBackAsTruncated(t *testing.T) {
+	g := bigGroup(3000, 0)
+	body := g.Body("ctx.")
+	if len(body) > maxBody {
+		t.Fatalf("body is %d bytes, GitHub rejects over %d", len(body), maxBody)
+	}
+	got := parseElements(body)
+	if !got.ok || !got.truncated || got.total != 3000 || got.sha != digest(g.Elements) || len(got.els) >= 3000 {
+		t.Fatalf("parse = total %d sha %q visible %d ok=%v trunc=%v", got.total, got.sha, len(got.els), got.ok, got.truncated)
+	}
+	if !strings.Contains(body, fmt.Sprintf("and %d more not shown.", 3000-len(got.els))) {
+		t.Errorf("body does not say how many are not shown")
+	}
+	// The record appears only when there is something hidden.
+	if small := grp("#a").Body(""); strings.Contains(small, "frostfall:elements") || strings.Contains(small, "more not shown") {
+		t.Errorf("an untruncated body must not carry the record:\n%s", small)
+	}
+}
+
+func TestUnchangedOversizedSetMakesNoCalls(t *testing.T) {
+	g := bigGroup(3000, 0)
+	c, calls := fakeGitHub(t, "")
+	// Run 1 files it.
+	cov := func(string, string) bool { return true }
+	if _, err := Sync(c, []Group{g}, nil, cov, nil, "run 1."); err != nil {
+		t.Fatal(err)
+	}
+	created := calls()
+	if len(created) != 1 || created[0].Method != "POST" || len(created[0].Body["body"]) > maxBody {
+		t.Fatalf("create = %+v", created)
+	}
+	existing := []Issue{{Number: 7, State: "open", Body: created[0].Body["body"]}}
+	// Runs 2 and 3 find the same set: nothing to do, though the visible list
+	// is only a prefix of it.
+	for run := 2; run <= 3; run++ {
+		if _, err := Sync(c, []Group{g}, existing, cov, nil, fmt.Sprintf("run %d.", run)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(calls()) != 1 {
+		t.Errorf("runs 2 and 3 made calls: %+v", calls()[1:])
+	}
+}
+
+func TestOversizedGrowthCommentsOnceWithoutNames(t *testing.T) {
+	old := bigGroup(3000, 0)
+	cur := bigGroup(3005, 0)
+	cov := func(string, string) bool { return true }
+	existing := []Issue{{Number: 7, State: "open", Body: old.Body("run 1.")}}
+	c, calls := fakeGitHub(t, "")
+	if _, err := Sync(c, []Group{cur}, existing, cov, nil, "run 2."); err != nil {
+		t.Fatal(err)
+	}
+	got := calls()
+	if len(got) != 2 || got[0].Method != "PATCH" || got[1].Path != ipath(7)+"/comments" {
+		t.Fatalf("want one body edit then one comment, got %+v", got)
+	}
+	if len(got[0].Body["body"]) > maxBody {
+		t.Errorf("body is %d bytes", len(got[0].Body["body"]))
+	}
+	if want := "5 more failing elements (list truncated; see the issue body).\n\nrun 2."; got[1].Body["body"] != want {
+		t.Errorf("comment = %q, want %q", got[1].Body["body"], want)
+	}
+	// Fed back, the new body is stable.
+	again := []Issue{{Number: 7, State: "open", Body: got[0].Body["body"]}}
+	if _, err := Sync(c, []Group{cur}, again, cov, nil, "run 3."); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls()) != 2 {
+		t.Errorf("a settled oversized issue must not be touched again: %+v", calls()[2:])
+	}
+}
+
+// The digest is over the sorted set, so the order results arrive in does not
+// make an unchanged oversized set look changed.
+func TestOversizedSetInADifferentOrderIsUnchanged(t *testing.T) {
+	g := bigGroup(3000, 0)
+	reordered := g
+	reordered.Elements = nil
+	for i := len(g.Elements) - 1; i >= 0; i-- {
+		reordered.Elements = append(reordered.Elements, g.Elements[i])
+	}
+	existing := []Issue{{Number: 7, State: "open", Body: g.Body("")}}
+	if got := plan(t, []Group{reordered}, existing, "home"); len(got) != 0 {
+		t.Errorf("reordered but identical set must plan nothing, got %v", got)
+	}
+}
+
+func TestOversizedShrinkAndSwapAreSilent(t *testing.T) {
+	cov := func(string, string) bool { return true }
+	old := bigGroup(3000, 0)
+	existing := []Issue{{Number: 7, State: "open", Body: old.Body("")}}
+
+	// Same count, different elements: a rewrite and no comment.
+	c, calls := fakeGitHub(t, "")
+	swapped := bigGroup(3000, 10)
+	if _, err := Sync(c, []Group{swapped}, existing, cov, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls(); len(got) != 1 || got[0].Method != "PATCH" {
+		t.Errorf("swap: want a body edit only, got %+v", got)
+	}
+
+	// Shrinks to a set that fits: back to the plain visible form, silently,
+	// and stable afterwards.
+	c, calls = fakeGitHub(t, "")
+	small := bigGroup(10, 0)
+	if _, err := Sync(c, []Group{small}, existing, cov, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	got := calls()
+	if len(got) != 1 || got[0].Method != "PATCH" || strings.Contains(got[0].Body["body"], "frostfall:elements") {
+		t.Fatalf("shrink: want a plain body edit only, got %+v", got)
+	}
+	again := []Issue{{Number: 7, State: "open", Body: got[0].Body["body"]}}
+	if _, err := Sync(c, []Group{small}, again, cov, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls()) != 1 {
+		t.Errorf("settled: %+v", calls()[1:])
+	}
+}
+
+func TestListThatOutgrowsTheBudgetNamesWhatFitsAndSettles(t *testing.T) {
+	cov := func(string, string) bool { return true }
+	old := bigGroup(10, 0)
+	cur := bigGroup(3000, 0)
+	existing := []Issue{{Number: 7, State: "open", Body: old.Body("")}}
+	c, calls := fakeGitHub(t, "")
+	if _, err := Sync(c, []Group{cur}, existing, cov, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	got := calls()
+	if len(got) != 2 || got[0].Method != "PATCH" || got[1].Path != ipath(7)+"/comments" {
+		t.Fatalf("calls = %+v", got)
+	}
+	comment := got[1].Body["body"]
+	if len(got[0].Body["body"]) > maxBody || len(comment) > maxBody {
+		t.Errorf("body %d, comment %d bytes: GitHub rejects over %d", len(got[0].Body["body"]), len(comment), maxBody)
+	}
+	if !strings.HasPrefix(comment, "2990 new failing elements:\n") || !strings.Contains(comment, "more not shown.") {
+		t.Errorf("comment = %.120q...", comment)
+	}
+	again := []Issue{{Number: 7, State: "open", Body: got[0].Body["body"]}}
+	if _, err := Sync(c, []Group{cur}, again, cov, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls()) != 2 {
+		t.Errorf("settled: %+v", calls()[2:])
+	}
+}
+
+// --- list -> plan -> sync ---
+
+func TestListPlanSyncEndToEnd(t *testing.T) {
+	old := grp("#a")
+	stale := Group{Rule: "image-alt", Page: "home", Impact: "critical", Summary: "s", Elements: els("#z")}
+	issues := []map[string]any{
+		// A web-edited (CRLF) body: must still match and gain #b.
+		{"number": 7, "state": "open", "title": old.Title(), "body": crlf(old.Body("old."))},
+		// A pull request carrying the label is not ours: it is neither
+		// closed nor updated, though its marker names a group that is gone.
+		{"number": 9, "state": "open", "title": stale.Title(), "body": stale.Body("old."), "pull_request": map[string]any{}},
+		// A human's issue.
+		{"number": 3, "state": "open", "title": "hand filed", "body": "keyboard nav is slow"},
+	}
+	c, calls := newFake(t, fakeAPI{issues: issues})
+	listed, err := c.ListLabeled(Label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || listed[0].Number != 7 || listed[1].Number != 3 {
+		t.Fatalf("listed = %+v, want #7 and #3 (the pull request skipped)", listed)
+	}
+	cur := grp("#a", "#b")
+	if _, err := Sync(c, []Group{cur}, listed, func(string, string) bool { return true }, nil, "ctx."); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls(t, calls(), []call{
+		bodyPatch(7, cur.Body("ctx.")),
+		commentPost(7, "1 new failing element:\n\n- `#b`\n\nctx."),
+	})
 }

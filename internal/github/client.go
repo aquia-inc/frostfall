@@ -38,6 +38,9 @@ type Issue struct {
 	Title  string `json:"title"`
 	Body   string `json:"body"`
 	State  string `json:"state"`
+	// PullRequest is set when the "issue" is a pull request: the issues
+	// endpoint lists both, and a PR carrying the label is not ours to edit.
+	PullRequest *struct{} `json:"pull_request,omitempty"`
 }
 
 func (c *Client) do(method, path string, in, out any) error {
@@ -101,7 +104,11 @@ func (c *Client) ListLabeled(label string) ([]Issue, error) {
 		if err := c.do("GET", path, nil, &batch); err != nil {
 			return nil, err
 		}
-		all = append(all, batch...)
+		for _, it := range batch {
+			if it.PullRequest == nil {
+				all = append(all, it)
+			}
+		}
 		if len(batch) < 100 {
 			return all, nil
 		}

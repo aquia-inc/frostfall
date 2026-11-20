@@ -845,7 +845,7 @@ func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) 
 	if dryRun {
 		// Without credentials we cannot see existing issues, so a dry run
 		// plans against an empty set: it shows the full desired state.
-		for _, a := range github.Plan(groups, nil, covered) {
+		for _, a := range github.Plan(groups, nil, covered, res.Partial) {
 			fmt.Println("gh-issues (dry-run):", a)
 		}
 		return nil
@@ -867,7 +867,7 @@ func syncIssues(res *runner.Run, flagged func(runner.Result) bool, dryRun bool) 
 	if server, run := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_RUN_ID"); server != "" && run != "" {
 		runContext = fmt.Sprintf("Filed by Frostfall ([run](%s/%s/actions/runs/%s)).", server, repo, run)
 	}
-	actions, err := github.Sync(client, groups, existing, covered, runContext)
+	actions, err := github.Sync(client, groups, existing, covered, res.Partial, runContext)
 	for _, a := range actions {
 		fmt.Println("gh-issues:", a)
 	}

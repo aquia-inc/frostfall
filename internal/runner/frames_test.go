@@ -40,6 +40,32 @@ func TestPartialScanDoesNotCover(t *testing.T) {
 	}
 }
 
+// Covered stays true when one scan of a page was complete, even if another
+// left a frame out, so Partial is the signal that the page's findings may be
+// missing some. It is per check: a partial axe scan says nothing about the
+// keyboard check.
+func TestPartialReportsAnyIncompleteScanOfTheCheck(t *testing.T) {
+	cov := newCoverage()
+	cov.record(checkAxe, nil)
+	run := &Run{ran: map[string]*coverage{"page": cov}}
+	if run.Partial("page", "label") {
+		t.Errorf("a complete scan is not partial")
+	}
+	cov.recordPartial(checkAxe)
+	if !run.Covered("page", "label") {
+		t.Fatalf("setup: a full scan plus a partial one still covers the rule")
+	}
+	if !run.Partial("page", "label") {
+		t.Errorf("a page with a partial axe scan must report partial")
+	}
+	if run.Partial("page", "frostfall/keyboard-trap") {
+		t.Errorf("a partial axe scan must not mark the keyboard check partial")
+	}
+	if run.Partial("other", "label") {
+		t.Errorf("an unscanned page is not partial")
+	}
+}
+
 // A frame that could not be scanned is a warning, printed whether or not the
 // run is verbose. A signed-in test names it with attribute values dropped. A
 // run with auth configured leaves the error out for every test, auth: false
