@@ -103,11 +103,15 @@ type coverage struct {
 	runs    map[string]int
 	off     map[string]int
 	partial map[string]int
-	points  []ScanPoint
+	// unjudged counts, per rule, the audits that could not fully evaluate it
+	// (see keyboard.Result.Unchecked). Unlike a rule switched off in the
+	// config, which is the same on every run, that depends on the page.
+	unjudged map[string]int
+	points   []ScanPoint
 }
 
 func newCoverage() *coverage {
-	return &coverage{runs: map[string]int{}, off: map[string]int{}, partial: map[string]int{}}
+	return &coverage{runs: map[string]int{}, off: map[string]int{}, partial: map[string]int{}, unjudged: map[string]int{}}
 }
 
 // point notes that a check ran at label, once per label.
@@ -133,6 +137,16 @@ func (c *coverage) record(check string, rules map[string]bool) {
 func (c *coverage) recordPartial(check string) {
 	c.runs[check]++
 	c.partial[check]++
+}
+
+// recordAudit notes a keyboard audit that ran with rules, and could not fully
+// evaluate the unchecked ones: coverage treats those like rules switched off,
+// and Partial treats them as possibly incomplete.
+func (c *coverage) recordAudit(rules map[string]bool, unchecked []string) {
+	c.record(checkKeyboard, withUnchecked(rules, unchecked))
+	for _, id := range unchecked {
+		c.unjudged[id]++
+	}
 }
 
 // The checks that produce findings. axe owns every rule id outside the
@@ -162,6 +176,24 @@ func (r *Run) Covered(testID, ruleID string) bool {
 	}
 	check := checkFor(ruleID)
 	return c.runs[check]-c.partial[check] > c.off[ruleID]
+}
+
+// Partial reports whether some of what ruleID would find on test's page may
+// be missing from the results: a scan of its check had to leave a frame out,
+// or an audit could not fully evaluate the rule. Covered stays true when
+// another scan of the page was complete, so a caller that edits what it knows
+// about the page (an issue's element list) uses this to avoid reading
+// missing findings as fixed.
+//
+// A step's scan cannot be skipped while the run goes on: a step that fails
+// (a click that finds nothing, a navigation into the login page) ends the
+// whole run with an error, and scan:false is the same on every run. The ways
+// a scan comes back incomplete are the two above. A rule switched off in the
+// config is not counted: it is the same on every run, so its elements are
+// absent consistently, not flapping.
+func (r *Run) Partial(testID, ruleID string) bool {
+	c := r.ran[testID]
+	return c != nil && (c.partial[checkFor(ruleID)] > 0 || c.unjudged[ruleID] > 0)
 }
 
 // Checks lists, sorted, the checks (axe, keyboard, expectFocus) that ran on
@@ -487,7 +519,7 @@ func (r *Runner) keyboard(ctx context.Context, session *browser.Session, t confi
 	if err := r.recheck(session, fmt.Sprintf("keyboard audit %q", label)); err != nil {
 		return nil, err
 	}
-	cov.record(checkKeyboard, withUnchecked(rules, audit.Unchecked))
+	cov.recordAudit(rules, audit.Unchecked)
 	cov.point(label, url)
 	return r.results(session, t, url, label, audit.Violations), nil
 }
