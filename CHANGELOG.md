@@ -2,6 +2,12 @@
 
 All notable changes to Frostfall will be documented in this file.
 
+## [1.12.2](https://github.com/aquia-inc/frostfall/compare/v1.12.1...v1.12.2) (2026-11-20)
+
+### Bug Fixes
+
+* **gh-issues:** update issue bodies when the failing elements change ([#82](https://github.com/aquia-inc/frostfall/issues/82)) ([a333253](https://github.com/aquia-inc/frostfall/commit/a33325363cbf018d5183743997bc133c1e5e6255)), closes [#11](https://github.com/aquia-inc/frostfall/issues/11) [#11](https://github.com/aquia-inc/frostfall/issues/11) [#11](https://github.com/aquia-inc/frostfall/issues/11)
+
 ## [1.12.1](https://github.com/aquia-inc/frostfall/compare/v1.12.0...v1.12.1) (2026-11-19)
 
 ### Bug Fixes
